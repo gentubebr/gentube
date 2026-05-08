@@ -233,6 +233,7 @@ Variaveis em `.env`:
 
 - `CLAUDE_API_KEY`
 - `ELEVENLABS_API_KEY`
+- `ELEVENLABS_VOICE_ID` (opcional): voice padrao quando `--voice-id` nao e passado no CLI
 
 Diretrizes:
 

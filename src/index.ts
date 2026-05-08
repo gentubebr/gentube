@@ -5,7 +5,7 @@ import { Command } from "commander";
 import { confirm, input, number, password, select } from "@inquirer/prompts";
 import chalk from "chalk";
 import ora from "ora";
-import { DEFAULT_BLOCKS, VIDEOS_DIR } from "./config.js";
+import { DEFAULT_BLOCKS, ELEVENLABS_VOICE_ID, VIDEOS_DIR } from "./config.js";
 import { getDb } from "./db.js";
 import {
   addProjectLog,
@@ -143,7 +143,7 @@ program
       await executeRoteiro(project);
       return;
     }
-    const voiceId = options.voiceId ?? (await password({ message: "Informe voice_id da ElevenLabs:", mask: "*" }));
+    const voiceId = await resolveVoiceId(options.voiceId);
     await executeNarracao(project, voiceId);
   });
 
@@ -155,7 +155,7 @@ program
   .action(async (options: { project: string; voiceId?: string }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
-    const voiceId = options.voiceId ?? (await password({ message: "Informe voice_id da ElevenLabs:", mask: "*" }));
+    const voiceId = await resolveVoiceId(options.voiceId);
     await executeAll(project, voiceId);
   });
 
@@ -220,7 +220,7 @@ program
         return;
       }
 
-      const voiceId = options.voiceId ?? (await password({ message: "Informe voice_id da ElevenLabs:", mask: "*" }));
+      const voiceId = await resolveVoiceId(options.voiceId);
       if (blockNumber !== undefined) {
         await executeNarracaoBlock(project, voiceId, blockNumber);
       } else {
@@ -275,11 +275,18 @@ async function executeNarracaoBlock(project: ProjectRow, voiceId: string, blockN
 
 async function executeAll(project: ProjectRow, voiceIdFromArg?: string): Promise<void> {
   await executeRoteiro(project);
-  const voiceId = voiceIdFromArg ?? (await password({ message: "Informe voice_id da ElevenLabs:", mask: "*" }));
+  const voiceId = await resolveVoiceId(voiceIdFromArg);
   const updatedProject = getProjectByIdOrSlug(String(project.id));
   if (!updatedProject) throw new Error("Projeto nao encontrado apos etapa de roteiro");
   await executeNarracao(updatedProject, voiceId);
   addProjectLog(Number(project.id), "pipeline", "info", "Execucao sequencial finalizada");
+}
+
+async function resolveVoiceId(cliVoiceId?: string): Promise<string> {
+  const fromCli = cliVoiceId?.trim();
+  if (fromCli) return fromCli;
+  if (ELEVENLABS_VOICE_ID) return ELEVENLABS_VOICE_ID;
+  return password({ message: "Informe voice_id da ElevenLabs:", mask: "*" });
 }
 
 program.parseAsync(process.argv).catch((error: unknown) => {

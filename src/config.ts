@@ -12,5 +12,7 @@ export const DB_PATH = path.join(DATA_DIR, "gentube.db");
 
 export const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY ?? "";
 export const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY ?? "";
+/** Voice ID padrao quando --voice-id nao e passado no CLI */
+export const ELEVENLABS_VOICE_ID = (process.env.ELEVENLABS_VOICE_ID ?? "").trim();
 
 export const DEFAULT_BLOCKS = 8;
