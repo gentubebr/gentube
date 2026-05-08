@@ -24,6 +24,12 @@ cd gentube
 npm install
 ```
 
+Se ao rodar o CLI aparecer erro do tipo **NODE_MODULE_VERSION** com `better-sqlite3`, a versão do Node mudou desde o `npm install`. Recompile o addon:
+
+```bash
+npm rebuild better-sqlite3
+```
+
 ## Configuração rápida
 
 1. Copie o exemplo de ambiente e preencha as chaves:
@@ -72,8 +78,17 @@ npm run gentube -- channel:create
 # 2) Listar canais e anotar o id, se precisar
 npm run gentube -- channel:list
 
-# 3) Criar projeto de vídeo (menus interativos)
+# 3) Criar projeto de vídeo (interativo ou com flags)
 npm run gentube -- create-video
+
+# Exemplo com referência de outro vídeo (estrutura / mensagens-chave — arquivo UTF-8)
+npm run gentube -- create-video --channel 1 \
+  --title "Meu título" \
+  --niche "finanças pessoais" \
+  --audience "adultos EUA 30+" \
+  --blocks 8 \
+  --transcript-file ./Docs/referencia-video.txt \
+  --mode iterativo
 
 # 4) Só roteiro ou só narração (use id numérico ou slug da pasta do projeto)
 npm run gentube -- run-step --project 1 --step roteiro

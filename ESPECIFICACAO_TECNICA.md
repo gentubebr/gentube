@@ -183,7 +183,15 @@ O CLI deve ser amigavel, visual e objetivo:
 
 - `gentube create-video`
   - cria projeto vinculado a um canal existente e coleta entradas obrigatorias
-  - permite escolher `iterativo` ou `sequencial`
+  - permite escolher `iterativo` ou `sequencial` (ou `--mode`)
+  - flags opcionais (omita para prompts interativos):
+    - `--channel <id>` — ID do canal (`channel:list`)
+    - `--title`, `--niche`, `--audience`
+    - `--blocks <n>` — total de blocos (1–64)
+    - `--transcript-file <caminho>` — arquivo UTF-8 com transcricao ou notas de video de referencia (estrutura e mensagens-chave; o modelo e instruido a nao copiar texto)
+    - `--transcript-text <texto>` — mesmo papel em uma linha (textos longos: usar arquivo)
+    - nao usar `transcript-file` e `transcript-text` juntos
+    - `--mode iterativo|sequencial`
 
 - `gentube channel:create`
   - cadastra um novo canal para organizar os videos

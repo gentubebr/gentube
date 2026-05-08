@@ -97,37 +97,121 @@ program
     });
   });
 
+type CreateVideoCliOptions = {
+  channel?: string;
+  title?: string;
+  niche?: string;
+  audience?: string;
+  blocks?: string;
+  transcriptFile?: string;
+  transcriptText?: string;
+  mode?: string;
+};
+
 program
   .command("create-video")
   .description(
-    "Fluxo interativo: escolhe canal, titulo, nicho, publico, blocos e gera pasta do projeto; depois iterativo ou sequencial"
+    "Cria projeto de video: interativo, ou preencha com flags (--channel, --title, --transcript-file, etc.)"
   )
-  .action(async () => {
+  .option("--channel <id>", "ID do canal (channel:list). Sem flag, abre menu")
+  .option("--title <texto>", "Titulo do video")
+  .option("--niche <texto>", "Nicho ([NOME DO NICHO] no matriz.md)")
+  .option("--audience <texto>", "Publico alvo ([PUBLICO])")
+  .option("--blocks <n>", `Quantidade de blocos (1-64; padrao interativo: ${DEFAULT_BLOCKS})`)
+  .option(
+    "--transcript-file <caminho>",
+    "Arquivo UTF-8: transcricao ou notas de um video de referencia (estrutura e mensagens-chave; o roteiro nao deve copiar o texto)"
+  )
+  .option(
+    "--transcript-text <texto>",
+    "Mesmo papel de --transcript-file, em uma linha (textos longos: prefira arquivo)"
+  )
+  .option("--mode <modo>", "Apos criar: iterativo | sequencial (sem flag, pergunta)")
+  .action(async (opts: CreateVideoCliOptions) => {
     const channels = listChannels();
     if (channels.length === 0) {
       console.log(chalk.red("Nao existe canal cadastrado. Rode primeiro: gentube channel:create"));
       return;
     }
 
-    const channelId = await select<number>({
-      message: "Escolha o canal:",
-      choices: channels.map((channel) => ({ value: channel.id, name: `[${channel.id}] ${channel.nome_canal}` })),
-    });
-    const selectedChannel = channels.find((c) => c.id === channelId);
-    if (!selectedChannel) {
-      throw new Error("Canal selecionado nao encontrado");
+    let selectedChannel: (typeof channels)[0];
+    if (opts.channel !== undefined && opts.channel !== "") {
+      const id = parseInt(opts.channel, 10);
+      if (Number.isNaN(id)) {
+        throw new Error("--channel deve ser um ID numerico (veja channel:list)");
+      }
+      const found = channels.find((c) => c.id === id);
+      if (!found) {
+        throw new Error(`Canal id=${id} nao encontrado. Use channel:list`);
+      }
+      selectedChannel = found;
+    } else {
+      const channelId = await select<number>({
+        message: "Escolha o canal:",
+        choices: channels.map((channel) => ({ value: channel.id, name: `[${channel.id}] ${channel.nome_canal}` })),
+      });
+      const found = channels.find((c) => c.id === channelId);
+      if (!found) {
+        throw new Error("Canal selecionado nao encontrado");
+      }
+      selectedChannel = found;
     }
 
-    const titulo = await input({ message: "Titulo do video:", validate: (v) => (!!v.trim() ? true : "Informe o titulo") });
-    const niche = await input({ message: "Nome do nicho ([NOME DO NICHO]):", validate: (v) => (!!v.trim() ? true : "Informe o nicho") });
-    const audience = await input({ message: "Publico alvo ([PUBLICO]):", validate: (v) => (!!v.trim() ? true : "Informe o publico") });
-    const customBlocks = await confirm({ message: `Deseja alterar a quantidade de blocos? (padrao ${DEFAULT_BLOCKS})`, default: false });
-    const totalBlocosInput = customBlocks
-      ? await number({ message: "Nova quantidade de blocos:", min: 1, max: 64, default: DEFAULT_BLOCKS })
-      : DEFAULT_BLOCKS;
-    const totalBlocos = totalBlocosInput ?? DEFAULT_BLOCKS;
-    const hasTranscript = await confirm({ message: "Deseja informar transcricao opcional?", default: false });
-    const transcript = hasTranscript ? await input({ message: "Cole a transcricao (texto livre):" }) : undefined;
+    const titulo =
+      opts.title?.trim() ||
+      (await input({ message: "Titulo do video:", validate: (v) => (!!v.trim() ? true : "Informe o titulo") }));
+    const niche =
+      opts.niche?.trim() ||
+      (await input({ message: "Nome do nicho ([NOME DO NICHO]):", validate: (v) => (!!v.trim() ? true : "Informe o nicho") }));
+    const audience =
+      opts.audience?.trim() ||
+      (await input({ message: "Publico alvo ([PUBLICO]):", validate: (v) => (!!v.trim() ? true : "Informe o publico") }));
+
+    let totalBlocos: number;
+    if (opts.blocks !== undefined && opts.blocks !== "") {
+      const n = parseInt(opts.blocks, 10);
+      if (Number.isNaN(n) || n < 1 || n > 64) {
+        throw new Error("--blocks deve ser um inteiro entre 1 e 64");
+      }
+      totalBlocos = n;
+    } else {
+      const customBlocks = await confirm({
+        message: `Deseja alterar a quantidade de blocos? (padrao ${DEFAULT_BLOCKS})`,
+        default: false,
+      });
+      const totalBlocosInput = customBlocks
+        ? await number({ message: "Nova quantidade de blocos:", min: 1, max: 64, default: DEFAULT_BLOCKS })
+        : DEFAULT_BLOCKS;
+      totalBlocos = totalBlocosInput ?? DEFAULT_BLOCKS;
+    }
+
+    let transcript: string | undefined;
+    if (opts.transcriptFile && opts.transcriptText) {
+      throw new Error("Use apenas uma opcao: --transcript-file ou --transcript-text");
+    }
+    if (opts.transcriptFile) {
+      const abs = path.resolve(process.cwd(), opts.transcriptFile);
+      transcript = await fs.readFile(abs, "utf-8");
+      if (!transcript.trim()) {
+        throw new Error(`Arquivo vazio ou so espacos: ${abs}`);
+      }
+    } else if (opts.transcriptText !== undefined && opts.transcriptText !== "") {
+      transcript = opts.transcriptText;
+    } else {
+      const hasTranscript = await confirm({
+        message:
+          "Deseja informar transcricao / notas de um video de referencia (estrutura e mensagens-chave, sem copiar)?",
+        default: false,
+      });
+      transcript = hasTranscript
+        ? await input({
+            message: "Cole o texto de referencia (ou cancele e rode de novo com --transcript-file):",
+          })
+        : undefined;
+      if (transcript !== undefined && !transcript.trim()) {
+        transcript = undefined;
+      }
+    }
 
     const dataProjeto = formatDateYYYYMMDD();
     const videoSlug = toSlug(titulo);
@@ -138,7 +222,7 @@ program
     await ensureTemplateStructure(projectPath);
 
     const projectId = createProject({
-      channelId,
+      channelId: selectedChannel.id,
       titulo,
       slug: folderName,
       dataProjeto,
@@ -150,13 +234,24 @@ program
     });
 
     console.log(chalk.green(`Projeto criado com sucesso (id: ${projectId}) em ${projectPath}`));
-    const mode = await select<"iterativo" | "sequencial">({
-      message: "Modo de execucao:",
-      choices: [
-        { value: "iterativo", name: "Iterativo (executar etapa por etapa)" },
-        { value: "sequencial", name: "Sequencial (roteiro + narracao de uma vez)" },
-      ],
-    });
+
+    let mode: "iterativo" | "sequencial";
+    const modeFlag = opts.mode?.trim().toLowerCase();
+    if (modeFlag) {
+      if (modeFlag === "iterativo" || modeFlag === "sequencial") {
+        mode = modeFlag;
+      } else {
+        throw new Error('--mode deve ser "iterativo" ou "sequencial"');
+      }
+    } else {
+      mode = await select<"iterativo" | "sequencial">({
+        message: "Modo de execucao:",
+        choices: [
+          { value: "iterativo", name: "Iterativo (executar etapa por etapa)" },
+          { value: "sequencial", name: "Sequencial (roteiro + narracao de uma vez)" },
+        ],
+      });
+    }
 
     const project = getProjectByIdOrSlug(String(projectId));
     if (!project) throw new Error("Projeto recem-criado nao encontrado");

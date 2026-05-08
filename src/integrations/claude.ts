@@ -28,6 +28,15 @@ export async function generateScriptBlock(input: {
     .replaceAll("[NOME DO NICHO]", input.niche)
     .replaceAll("[PUBLICO]", input.audience);
 
+  const referenceBlock = input.transcript
+    ? `
+REFERENCIA (video ou transcricao similar — use apenas estrutura, ritmo e mensagens-chave; NAO copie frases nem paragrafos; reescreva com voz original do roteiro):
+---
+${input.transcript}
+---
+`.trim()
+    : "";
+
   const userPrompt = `
 ${formattedPrompt}
 
@@ -35,7 +44,7 @@ Titulo do video: ${input.title}
 Quantidade total de blocos: ${input.totalBlocks}
 Gere apenas o bloco ${input.blockNumber} de ${input.totalBlocks}.
 Retorne apenas o texto do bloco em markdown, sem explicacoes extras.
-${input.transcript ? `Transcricao de referencia:\n${input.transcript}` : ""}
+${referenceBlock ? `${referenceBlock}` : ""}
 `.trim();
 
   const response = await anthropic.messages.create({
