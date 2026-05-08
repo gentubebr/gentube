@@ -3,3 +3,9 @@ node_modules/
 dist/
 *.log
 .DS_Store
+data/
+
+# Artefatos gerados por projetos de video
+Videos/**/02 - Narracao/*.mp3
+Videos/**/03 - Imagens e Videos/*
+Videos/**/04 - Thumbnails/*

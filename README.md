@@ -175,14 +175,17 @@ O CLI deve ser amigavel, visual e objetivo:
 
 ## 9) Operacoes de CLI (contrato funcional)
 
+- `gentube init`
+  - configuracao guiada: `.env`, pastas, opcao de informar API keys e cadastrar primeiro canal
+
 - `gentube create-video`
   - cria projeto vinculado a um canal existente e coleta entradas obrigatorias
   - permite escolher `iterativo` ou `sequencial`
 
-- `gentube channel create`
+- `gentube channel:create`
   - cadastra um novo canal para organizar os videos
 
-- `gentube channel list`
+- `gentube channel:list`
   - lista canais cadastrados
 
 - `gentube run-step --project <id|slug> --step <roteiro|narracao>`
@@ -191,8 +194,9 @@ O CLI deve ser amigavel, visual e objetivo:
 - `gentube run-all --project <id|slug>`
   - executa pipeline completo (etapas disponiveis)
 
-- `gentube retry --project <id|slug> --stage <roteiro|narracao> [--block N]`
-  - reprocessa etapa inteira ou bloco especifico
+- `gentube retry --project <id|slug> --stage <roteiro|narracao> [--block N] [--voice-id ...]`
+  - sem `--block`: reprocessa a etapa inteira
+  - com `--block N` (1-based): reprocessa apenas o bloco N (roteiro ou narracao)
 
 - `gentube status --project <id|slug>`
   - mostra status consolidado e detalhado por bloco
@@ -283,3 +287,32 @@ Diretrizes:
 - Etapa 3: Imagens ou Videos
 - Etapa 4: Thumbnails
 - Definicao de providers, prompts e formatos de saida dessas etapas
+
+## 16) Status atual da implementacao
+
+Implementado no codigo em `src/`:
+
+- Base do CLI com comandos:
+  - `init` (setup guiado)
+  - `channel:create`
+  - `channel:list`
+  - `create-video`
+  - `run-step`
+  - `run-all`
+  - `status`
+  - `delete-project`
+  - `retry` (etapa inteira ou `--block N`; apos cada bloco, `status_roteiro` / `status_narracao` e recalculado no SQLite)
+- Banco SQLite local com tabelas:
+  - `channels`
+  - `video_projects`
+  - `script_blocks`
+  - `narration_blocks`
+  - `project_logs`
+- Pipeline funcional:
+  - Geracao de roteiro com Claude (bloco a bloco, salvando `blockXX.md`)
+  - Geracao de narracao com ElevenLabs (salvando `blockXX.mp3`)
+- Estrutura de projeto por canal em:
+  - `Videos/<canal>/<YYYYMMDD-video>/...`
+- Exclusao de projeto:
+  - remove arquivos do projeto
+  - remove registros relacionados no SQLite
