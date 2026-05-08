@@ -223,8 +223,8 @@ O CLI deve ser amigavel, visual e objetivo:
 - `gentube status --project <id|slug>`
   - mostra status consolidado e detalhado por bloco
 
-- `gentube delete-project --project <id|slug>`
-  - remove projeto completo com confirmacao dupla
+- `gentube delete-project --project <id|slug> [-y|--yes]`
+  - remove projeto completo; sem `--yes`, pede confirmacao dupla; com `--yes`, remove direto (cuidado em producao)
 
 Observacao:
 

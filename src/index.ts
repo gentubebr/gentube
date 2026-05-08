@@ -317,13 +317,16 @@ program
   .command("delete-project")
   .description("Remove a pasta do projeto e os registros no banco (dupla confirmacao). Nao remove o canal")
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto a apagar")
-  .action(async (options: { project: string }) => {
+  .option("-y, --yes", "Confirma sem perguntar (uso em scripts / CI)")
+  .action(async (options: { project: string; yes?: boolean }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
-    const confirm1 = await confirm({ message: `Confirma exclusao do projeto "${project.titulo}"?`, default: false });
-    if (!confirm1) return;
-    const confirm2 = await confirm({ message: "Tem certeza absoluta? Esta acao e irreversivel.", default: false });
-    if (!confirm2) return;
+    if (!options.yes) {
+      const confirm1 = await confirm({ message: `Confirma exclusao do projeto "${project.titulo}"?`, default: false });
+      if (!confirm1) return;
+      const confirm2 = await confirm({ message: "Tem certeza absoluta? Esta acao e irreversivel.", default: false });
+      if (!confirm2) return;
+    }
 
     await fs.rm(String(project.project_path), { recursive: true, force: true });
     deleteProject(Number(project.id));

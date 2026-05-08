@@ -87,8 +87,11 @@ npm run gentube -- create-video --channel 1 \
   --niche "finanças pessoais" \
   --audience "adultos EUA 30+" \
   --blocks 8 \
-  --transcript-file ./Docs/referencia-video.txt \
+  --transcript-file Transcripts/transcript.txt \
   --mode iterativo
+
+# Apagar um projeto sem prompts (scripts)
+npm run gentube -- delete-project --project 2 --yes
 
 # 4) Só roteiro ou só narração (use id numérico ou slug da pasta do projeto)
 npm run gentube -- run-step --project 1 --step roteiro
