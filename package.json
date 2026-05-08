@@ -1,7 +1,7 @@
 {
   "name": "gentube",
   "version": "1.0.0",
-  "description": "Este documento e a fonte unica de verdade para o desenvolvimento do **GenTube CLI**. Ele combina requisitos funcionais e especificacao tecnica em um unico `.md`.",
+  "description": "CLI para gerar roteiro (Claude) e narracao (ElevenLabs) em projetos de video por canal (YouTube).",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

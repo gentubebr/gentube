@@ -1,7 +1,10 @@
-# GenTube CLI (Node.js) - Especificacao Unificada (Funcional + Tecnica)
+# GenTube — Especificacao tecnica
 
-Este documento e a fonte unica de verdade para o desenvolvimento do **GenTube CLI**.
-Ele combina requisitos funcionais e especificacao tecnica em um unico `.md`.
+Documento de **requisitos, arquitetura e implementacao** do GenTube CLI (Node.js).
+
+Para instalação, exemplos de uso e visão geral voltada a quem só quer rodar o projeto, use o **[README.md](README.md)**.
+
+Este arquivo concentra o que é **funcional + tecnico** para manutenção e evolucao do codigo.
 
 ## 1) Objetivo
 
@@ -317,3 +320,15 @@ Implementado no codigo em `src/`:
 - Exclusao de projeto:
   - remove arquivos do projeto
   - remove registros relacionados no SQLite
+
+## 17) Ajuda do CLI (UX)
+
+Comportamento implementado em `src/index.ts`:
+
+- **Sem argumentos** (`npm run gentube --`): imprime banner, dica `init`, `--help` e lista de comandos (`outputHelp`).
+- **`--help` / `-h`**: ajuda geral em portugues (descricoes longas por subcomando).
+- **`help [comando]`**: ajuda do Commander para um subcomando (ex.: `help run-step`).
+- Apos **erro de opcao obrigatoria** ou comando invalido: mensagem extra sugerindo `--help` ou `help <comando>` (`showHelpAfterError`).
+- Bloco **Exemplos** e referencia a `README.md` / `ESPECIFICACAO_TECNICA.md` no rodape da ajuda (`addHelpText('after', ...)`).
+- **`configureHelp({ sortSubcommands: true })`**: comandos listados em ordem alfabetica na ajuda.
+- **Versao**: lida de `package.json` via `src/version.ts` (`-V, --version`).

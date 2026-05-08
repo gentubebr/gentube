@@ -6,6 +6,7 @@ import { confirm, input, number, password, select } from "@inquirer/prompts";
 import chalk from "chalk";
 import ora from "ora";
 import { DEFAULT_BLOCKS, ELEVENLABS_VOICE_ID, VIDEOS_DIR } from "./config.js";
+import { getPackageVersion } from "./version.js";
 import { getDb } from "./db.js";
 import {
   addProjectLog,
@@ -23,19 +24,55 @@ type ProjectRow = Record<string, unknown>;
 
 getDb();
 
+const VERSION = getPackageVersion();
+
 const program = new Command();
-program.name("gentube").description("CLI para geracao de projetos de video do GenTube").version("0.1.0");
+program
+  .name("gentube")
+  .description(
+    "Organiza projetos de video por canal, gera roteiro (Claude) e narracao (ElevenLabs), " +
+      "com status no SQLite. Veja o README.md para o fluxo completo."
+  )
+  .version(VERSION, "-V, --version", "Exibe a versao e encerra")
+  .helpOption("-h, --help", "Exibe ajuda geral (ou use: help <comando>)");
+
+program.configureHelp({ sortSubcommands: true });
+
+program.helpCommand(
+  "help [comando]",
+  "Mostra esta ajuda ou a ajuda de um subcomando (ex.: help run-step)"
+);
+
+program.addHelpText(
+  "after",
+  `
+${chalk.bold("Exemplos")}
+  npm run gentube -- init
+  npm run gentube -- channel:list
+  npm run gentube -- create-video
+  npm run gentube -- run-step --project 1 --step roteiro
+  npm run gentube -- run-all --project 1
+  npm run gentube -- status --project 20260508-meu-video
+  npm run gentube -- retry --project 1 --stage narracao --block 2
+
+${chalk.bold("Documentacao")}  README.md  ·  ESPECIFICACAO_TECNICA.md
+`.trimStart()
+);
+
+program.showHelpAfterError(chalk.dim("(use --help ou help <comando> para mais detalhes)"));
 
 program
   .command("init")
-  .description("Configuracao guiada inicial (.env, pastas, canal opcional)")
+  .description(
+    "Primeira vez no projeto: cria .env a partir do exemplo, pastas, opcao de chaves API e cadastro de canal"
+  )
   .action(async () => {
     await runInit();
   });
 
 program
   .command("channel:create")
-  .description("Cadastra um novo canal")
+  .description("Cadastra um canal (pasta em Videos/<slug>). Canais nao podem ser removidos pelo CLI")
   .action(async () => {
     const nomeCanal = await input({ message: "Nome do canal:", validate: (v) => (!!v.trim() ? true : "Informe o nome do canal") });
     const slugCanal = toSlug(nomeCanal);
@@ -47,7 +84,7 @@ program
 
 program
   .command("channel:list")
-  .description("Lista canais cadastrados")
+  .description("Lista canais com id, slug e caminho (use o id em create-video ou em --project quando for o caso)")
   .action(() => {
     const channels = listChannels();
     if (channels.length === 0) {
@@ -62,7 +99,9 @@ program
 
 program
   .command("create-video")
-  .description("Cria um projeto de video e permite executar as etapas")
+  .description(
+    "Fluxo interativo: escolhe canal, titulo, nicho, publico, blocos e gera pasta do projeto; depois iterativo ou sequencial"
+  )
   .action(async () => {
     const channels = listChannels();
     if (channels.length === 0) {
@@ -131,10 +170,10 @@ program
 
 program
   .command("run-step")
-  .description("Executa uma etapa especifica")
-  .requiredOption("--project <idOrSlug>", "ID ou slug do projeto")
-  .requiredOption("--step <roteiro|narracao>", "Etapa a executar")
-  .option("--voice-id <voiceId>", "Voice ID da ElevenLabs para narracao")
+  .description("Roda apenas roteiro ou apenas narracao de um projeto ja criado")
+  .requiredOption("--project <idOuSlug>", "ID numerico (ex.: 1) ou slug da pasta (ex.: 20260508-meu-titulo)")
+  .requiredOption("--step <etapa>", "roteiro | narracao (narração exige roteiro completo com sucesso)")
+  .option("--voice-id <id>", "Voice ElevenLabs; se omitido, usa ELEVENLABS_VOICE_ID do .env ou pede no terminal")
   .action(async (options: { project: string; step: "roteiro" | "narracao"; voiceId?: string }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
@@ -149,9 +188,9 @@ program
 
 program
   .command("run-all")
-  .description("Executa roteiro e narracao em sequencia")
-  .requiredOption("--project <idOrSlug>", "ID ou slug do projeto")
-  .option("--voice-id <voiceId>", "Voice ID da ElevenLabs para narracao")
+  .description("Pipeline completo: roteiro todos os blocos, depois narracao (mesma ordem que create-video sequencial)")
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto em video_projects")
+  .option("--voice-id <id>", "Voice ElevenLabs (ou .env ELEVENLABS_VOICE_ID)")
   .action(async (options: { project: string; voiceId?: string }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
@@ -161,8 +200,8 @@ program
 
 program
   .command("status")
-  .description("Mostra o status consolidado de um projeto")
-  .requiredOption("--project <idOrSlug>", "ID ou slug do projeto")
+  .description("Resumo das etapas (roteiro, narracao, etc.) e caminho da pasta do projeto")
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
   .action(async (options: { project: string }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
@@ -176,8 +215,8 @@ program
 
 program
   .command("delete-project")
-  .description("Apaga projeto de video (arquivos + SQLite)")
-  .requiredOption("--project <idOrSlug>", "ID ou slug do projeto")
+  .description("Remove a pasta do projeto e os registros no banco (dupla confirmacao). Nao remove o canal")
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto a apagar")
   .action(async (options: { project: string }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
@@ -193,11 +232,11 @@ program
 
 program
   .command("retry")
-  .description("Reprocessa etapa inteira ou um bloco especifico (--block N)")
-  .requiredOption("--project <idOrSlug>", "ID ou slug do projeto")
-  .requiredOption("--stage <roteiro|narracao>", "Etapa")
-  .option("--block <number>", "Numero do bloco (1-based); omita para reprocessar toda a etapa")
-  .option("--voice-id <voiceId>", "Voice ID da ElevenLabs para narracao")
+  .description("Gera de novo roteiro ou narracao (etapa inteira ou so um bloco com --block)")
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .requiredOption("--stage <etapa>", "roteiro | narracao")
+  .option("--block <N>", "Somente o bloco N (base 1). Sem esta opcao, refaz todos os blocos da etapa")
+  .option("--voice-id <id>", "Obrigatorio implicitamente para narracao: .env ou flag")
   .action(
     async (options: { project: string; stage: "roteiro" | "narracao"; block?: string; voiceId?: string }) => {
       const project = getProjectByIdOrSlug(options.project);
@@ -287,6 +326,20 @@ async function resolveVoiceId(cliVoiceId?: string): Promise<string> {
   if (fromCli) return fromCli;
   if (ELEVENLABS_VOICE_ID) return ELEVENLABS_VOICE_ID;
   return password({ message: "Informe voice_id da ElevenLabs:", mask: "*" });
+}
+
+const argv = process.argv.slice(2);
+if (argv.length === 0) {
+  console.log(chalk.cyan.bold("GenTube CLI ") + chalk.dim(`v${VERSION}`));
+  console.log(
+    chalk.white(
+      "Roteiro (Claude) + narracao (ElevenLabs), um projeto por pasta em Videos/<canal>/<data>-<titulo>/."
+    )
+  );
+  console.log(chalk.dim("\nComece com: ") + chalk.green.bold("npm run gentube -- init"));
+  console.log(chalk.dim("Ajuda: ") + chalk.green("npm run gentube -- --help") + chalk.dim(" ou ") + chalk.green("npm run gentube -- help\n"));
+  program.outputHelp();
+  process.exit(0);
 }
 
 program.parseAsync(process.argv).catch((error: unknown) => {

@@ -101,4 +101,6 @@ export async function runInit(): Promise<void> {
   console.log(chalk.cyan("\nProximos passos:"));
   console.log("  npm run gentube -- channel:list");
   console.log("  npm run gentube -- create-video");
+  console.log(chalk.dim("  npm run gentube -- --help   ") + chalk.dim("# lista todos os comandos"));
+  console.log(chalk.dim("  npm run gentube -- help run-step   ") + chalk.dim("# ajuda de um comando"));
 }
