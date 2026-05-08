@@ -24,11 +24,15 @@ cd gentube
 npm install
 ```
 
-Se ao rodar o CLI aparecer erro do tipo **NODE_MODULE_VERSION** com `better-sqlite3`, a versão do Node mudou desde o `npm install`. Recompile o addon:
+Se ao rodar o CLI aparecer erro do tipo **NODE_MODULE_VERSION** com `better-sqlite3`, o binário nativo foi compilado para **outra versão** do Node (ex.: módulo 115 = Node 20, módulo 131 = Node 23). Isso acontece ao trocar de Node depois do `npm install`. Recompile:
 
 ```bash
+npm run rebuild:native
+# equivalente a:
 npm rebuild better-sqlite3
 ```
+
+**Dica:** use a mesma linha de Node (ex. **LTS 22** ou **20**) em todas as máquinas, ou rode `rebuild:native` sempre que mudar o major do Node.
 
 ## Configuração rápida
 
