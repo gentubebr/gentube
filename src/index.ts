@@ -18,7 +18,7 @@ import {
 } from "./repository.js";
 import { runInit } from "./init-setup.js";
 import { runNarracao, runNarracaoBlock, runRoteiro, runRoteiroBlock } from "./services/pipeline.js";
-import { ensureDir, ensureTemplateStructure, formatDateYYYYMMDD, toSlug } from "./utils/fs.js";
+import { ensureDir, ensureTemplateStructure, formatDateYYYYMMDD, toSlug, writeModelagemTranscript } from "./utils/fs.js";
 
 type ProjectRow = Record<string, unknown>;
 
@@ -220,6 +220,11 @@ program
 
     await ensureDir(projectPath);
     await ensureTemplateStructure(projectPath);
+
+    if (transcript?.trim()) {
+      const transcriptPath = await writeModelagemTranscript(projectPath, transcript.trim());
+      console.log(chalk.dim(`Referencia salva em: ${transcriptPath}`));
+    }
 
     const projectId = createProject({
       channelId: selectedChannel.id,

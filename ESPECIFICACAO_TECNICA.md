@@ -47,6 +47,7 @@ Cada projeto deve conter:
 - `02 - Narracao/`
 - `03 - Imagens e Videos/`
 - `04 - Thumbnails/`
+- `05 - Modelagem/` — arquivos de apoio (ex.: `transcript.txt` da transcricao usada como referencia de outro canal; gravado na criacao do projeto quando houver transcricao)
 
 ### 2.4 Estrutura de referencia do template
 
@@ -56,6 +57,7 @@ O template atual referencia o canal explicitamente:
 - `Template/[Nome do Canal]/02 - Narracao/`
 - `Template/[Nome do Canal]/03 - Imagens e Videos/`
 - `Template/[Nome do Canal]/04 - Thumbnails/`
+- `Template/[Nome do Canal]/05 - Modelagem/`
 
 ## 3) Experiencia do CLI (bonito e funcional)
 
@@ -128,6 +130,15 @@ O CLI deve ser amigavel, visual e objetivo:
 ### 6.4 Regra de avancar etapa
 
 - Etapa 2 so inicia se 100% dos blocos da etapa 1 estiverem `success`
+
+### 6.5 Conteudo salvo em `blockXX.md`
+
+- Apenas texto narrado (voz alta). Sem cabecalho tipo `# Block N`.
+- Sem perguntas meta ao usuario (ex.: continuar, digitar ok) — o `matriz.md` e interativo; o CLI instrui o modelo e aplica `sanitizeScriptBlockContent` pos-resposta em `src/utils/sanitize-script-block.ts`.
+
+### 6.6 Transcricao de referencia em disco
+
+- Quando o projeto e criado com transcricao (interativo, `--transcript-file` ou `--transcript-text`), alem do campo no SQLite, o texto e gravado em `05 - Modelagem/transcript.txt`.
 
 ## 7) Etapa 2 - Narracao (ElevenLabs API)
 

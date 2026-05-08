@@ -115,10 +115,11 @@ npm start -- --help
 ## Onde ficam os arquivos
 
 - Projetos gerados: `Videos/<slug-do-canal>/<YYYYMMDD-slug-do-titulo>/`
-  - `01 - Roteiro/` — `blockXX.md`
+  - `01 - Roteiro/` — `blockXX.md` (só texto narrado; sem cabeçalho de bloco nem pergunta de “continuar”)
   - `02 - Narracao/` — `blockXX.mp3`
   - `03 - Imagens e Videos/` — futuro
   - `04 - Thumbnails/` — futuro
+  - `05 - Modelagem/` — ex.: `transcript.txt` quando você informa transcricao de referência na criação do projeto
 - Banco local: `data/gentube.db` (ignorado pelo Git)
 - Template de referência: `Template/[Nome do Canal]/`
 

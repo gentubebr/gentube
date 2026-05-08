@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { CLAUDE_API_KEY } from "../config.js";
+import { sanitizeScriptBlockContent } from "../utils/sanitize-script-block.js";
 
 let client: Anthropic | null = null;
 
@@ -30,12 +31,21 @@ export async function generateScriptBlock(input: {
 
   const referenceBlock = input.transcript
     ? `
-REFERENCIA (video ou transcricao similar — use apenas estrutura, ritmo e mensagens-chave; NAO copie frases nem paragrafos; reescreva com voz original do roteiro):
+REFERENCIA (video ou transcricao similar — use apenas estrutura, ritmo e mensagens-chave; NAO copie frases nem paragrafos; utilize-o como modelagem apenas; caso seja necessario, reescreva com voz, tom e estilo original do roteiro):
 ---
 ${input.transcript}
 ---
 `.trim()
     : "";
+
+  const formatRules = `
+FORMATO OBRIGATORIO DA RESPOSTA (o pipeline e automatico; nao simule chat):
+- Entregue SOMENTE o texto narrado deste bloco (o que sera lido em voz alta).
+- NAO escreva cabecalhos de bloco como "# Block 1", "## Bloco 2", etc.
+- NAO faca perguntas ao usuario, pedidos de "ok", "digite ok", nem convites para continuar o roteiro.
+- NAO inclua notas ao roteirista ou meta-dialogo; nenhuma linha final perguntando se deseja o proximo bloco.
+- Markdown leve no corpo e permitido (negrito, listas) quando fizer sentido na narracao.
+`.trim();
 
   const userPrompt = `
 ${formattedPrompt}
@@ -43,7 +53,8 @@ ${formattedPrompt}
 Titulo do video: ${input.title}
 Quantidade total de blocos: ${input.totalBlocks}
 Gere apenas o bloco ${input.blockNumber} de ${input.totalBlocks}.
-Retorne apenas o texto do bloco em markdown, sem explicacoes extras.
+
+${formatRules}
 ${referenceBlock ? `${referenceBlock}` : ""}
 `.trim();
 
@@ -64,5 +75,10 @@ ${referenceBlock ? `${referenceBlock}` : ""}
     throw new Error(`Claude retornou conteudo vazio para bloco ${input.blockNumber}`);
   }
 
-  return textChunks;
+  const cleaned = sanitizeScriptBlockContent(textChunks);
+  if (!cleaned) {
+    throw new Error(`Apos limpeza, o bloco ${input.blockNumber} ficou vazio; ajuste o prompt ou regenere`);
+  }
+
+  return cleaned;
 }
