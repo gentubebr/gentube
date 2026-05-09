@@ -129,6 +129,38 @@ export function runHiggsfieldCli(hfArgv: string[]): Promise<number> {
   });
 }
 
+/** Mesmo binario que `runHiggsfieldCli`, mas captura stdout/stderr (ex.: `--json` no step 3). */
+export function runHiggsfieldCliCaptured(
+  hfArgv: string[]
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const bin = resolveHiggsfieldCliBinary();
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, hfArgv, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+      shell: false,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => {
+      if (signal) {
+        reject(new Error(`Higgsfield CLI encerrado por sinal: ${signal}`));
+        return;
+      }
+      resolve({ code: code ?? 1, stdout, stderr });
+    });
+  });
+}
+
 export function loadHiggsfieldCliCredentials(): HiggsfieldCliCredentials {
   const file = higgsfieldCliCredentialsPath();
   const raw = fs.readFileSync(file, "utf8");

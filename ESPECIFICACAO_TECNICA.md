@@ -450,6 +450,6 @@ Uso:
 
 ### 18.8 Resumo da integracao Higgsfield (levantamento)
 
-- Fluxo assinc: submit -> polling/status -> completed/failed.
-- Modelos e parametros base para este projeto definidos acima.
-- Compatibilizacao de payload sera feita por modelo (enviar apenas campos aceitos).
+- **Step 3 (producao)**: executa o **CLI oficial** (`higgsfield` / `hf`) com `generate create`, `--wait` e `--json`, usando os mesmos creditos da conta web. Autenticacao: `higgsfield auth login` e `~/.config/higgsfield/credentials.json` (ou `HIGGSFIELD_CREDENTIALS_PATH`). Binario: PATH ou `HIGGSFIELD_CLI_PATH`. Timeout de espera opcional: `HIGGSFIELD_CLI_WAIT_TIMEOUT` (padrao interno `15m`).
+- **Modulo legado** `src/integrations/higgsfield.ts`: HTTP em `platform.higgsfield.ai` com `HIGGSFIELD_API_KEY_ID` / `SECRET` (nao e mais usado pelo pipeline do step 3).
+- Modelos e parametros base para este projeto definidos na secao 18.4; o CLI aplica apenas flags suportadas pelo `job_set_type` (ex.: `kling3_0` sem `resolution` no schema publicado).

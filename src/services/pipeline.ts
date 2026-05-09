@@ -3,7 +3,10 @@ import path from "node:path";
 import { PROMPT_MATRIX_PATH, PROMPT_MATRIX02_PATH } from "../config.js";
 import { generateAssetsPlanJson, generateScriptBlock } from "../integrations/claude.js";
 import { textToSpeechMp3 } from "../integrations/elevenlabs.js";
-import { generateImageWithDefaults, generateVideoWithDefaults } from "../integrations/higgsfield.js";
+import {
+  generateImageWithDefaultsCli,
+  generateVideoWithDefaultsCli,
+} from "../integrations/higgsfield-cli.js";
 import {
   addProjectLog,
   countBlocksByStatus,
@@ -251,11 +254,17 @@ async function generateAndRenderShot(params: {
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       if (params.type === "image") {
-        const out = await generateImageWithDefaults({ prompt: params.prompt, referenceImageUrl: params.referenceImageUrl });
+        const out = await generateImageWithDefaultsCli({
+          prompt: params.prompt,
+          referenceImageUrl: params.referenceImageUrl,
+        });
         const localPath = await downloadMedia(out.mediaUrl, params.outPathNoExt, ".png");
         return { localPath, mediaUrl: out.mediaUrl };
       }
-      const out = await generateVideoWithDefaults({ prompt: params.prompt, referenceImageUrl: params.referenceImageUrl ?? "" });
+      const out = await generateVideoWithDefaultsCli({
+        prompt: params.prompt,
+        referenceImageUrl: params.referenceImageUrl ?? "",
+      });
       const localPath = await downloadMedia(out.mediaUrl, params.outPathNoExt, ".mp4");
       return { localPath, mediaUrl: out.mediaUrl };
     } catch (error) {
@@ -315,9 +324,14 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
       await fs.mkdir(rendersDir, { recursive: true });
       let done = 0;
       let lastImageUrl: string | undefined;
-      const avatarUrl = avatarPath && /^https?:\/\//.test(avatarPath) ? avatarPath : undefined;
+      const avatarRef =
+        avatarPath && String(avatarPath).trim()
+          ? /^https?:\/\//i.test(String(avatarPath))
+            ? String(avatarPath).trim()
+            : path.resolve(String(avatarPath))
+          : undefined;
       for (const shot of plan.shots) {
-        let referenceImageUrl = shot.character_required ? avatarUrl : undefined;
+        let referenceImageUrl = shot.character_required ? avatarRef : undefined;
 
         if (shot.type === "video" && !referenceImageUrl) {
           referenceImageUrl = lastImageUrl;
@@ -327,7 +341,7 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
             type: "image",
             prompt: shot.description,
             outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
-            referenceImageUrl: avatarUrl,
+            referenceImageUrl: avatarRef,
           });
           lastImageUrl = bootstrap.mediaUrl;
           referenceImageUrl = bootstrap.mediaUrl;
@@ -418,9 +432,14 @@ export async function runImagensVideosBlock(project: ProjectRow, blockNumber: nu
     await fs.mkdir(rendersDir, { recursive: true });
     let done = 0;
     let lastImageUrl: string | undefined;
-    const avatarUrl = avatarPath && /^https?:\/\//.test(avatarPath) ? avatarPath : undefined;
+    const avatarRef =
+      avatarPath && String(avatarPath).trim()
+        ? /^https?:\/\//i.test(String(avatarPath))
+          ? String(avatarPath).trim()
+          : path.resolve(String(avatarPath))
+        : undefined;
     for (const shot of plan.shots) {
-      let referenceImageUrl = shot.character_required ? avatarUrl : undefined;
+      let referenceImageUrl = shot.character_required ? avatarRef : undefined;
       if (shot.type === "video" && !referenceImageUrl) {
         referenceImageUrl = lastImageUrl;
       }
@@ -429,7 +448,7 @@ export async function runImagensVideosBlock(project: ProjectRow, blockNumber: nu
           type: "image",
           prompt: shot.description,
           outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
-          referenceImageUrl: avatarUrl,
+          referenceImageUrl: avatarRef,
         });
         lastImageUrl = bootstrap.mediaUrl;
         referenceImageUrl = bootstrap.mediaUrl;

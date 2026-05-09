@@ -1,3 +1,7 @@
+/**
+ * Cliente HTTP para `platform.higgsfield.ai` (API Key).
+ * O step 3 do GenTube usa `higgsfield-cli.ts` + binario oficial; este modulo permanece para referencia ou uso futuro.
+ */
 import { HIGGSFIELD_API_KEY_ID, HIGGSFIELD_API_KEY_SECRET } from "../config.js";
 
 const BASE_URL = "https://platform.higgsfield.ai";
