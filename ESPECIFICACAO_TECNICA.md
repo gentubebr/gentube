@@ -351,3 +351,105 @@ Comportamento implementado em `src/index.ts`:
 - Bloco **Exemplos** e referencia a `README.md` / `ESPECIFICACAO_TECNICA.md` no rodape da ajuda (`addHelpText('after', ...)`).
 - **`configureHelp({ sortSubcommands: true })`**: comandos listados em ordem alfabetica na ajuda.
 - **Versao**: lida de `package.json` via `src/version.ts` (`-V, --version`).
+
+## 18) Politica aprovada — Step 3 (Imagens e Videos)
+
+Este step sera implementado em duas tarefas internas por bloco:
+
+1. **Direcao (Claude)**: ler `01 - Roteiro/blockXX.md` e gerar `03 - Imagens e Videos/blockXX.assets.json`.
+2. **Producao (Higgsfield)**: ler `blockXX.assets.json` e gerar arquivos de imagem/video locais em `03 - Imagens e Videos/`.
+
+### 18.1 Objetivo
+
+- Produzir plano visual coerente com o texto do bloco.
+- Executar renders com controle de custo (mais videos no bloco 1; mais imagens nos blocos seguintes).
+- Permitir retry por etapa sem reprocessar roteiro/narracao.
+
+### 18.2 Regras criativas por bloco
+
+- **Bloco 1**:
+  - e o bloco de maior impacto/retencao.
+  - usar maior frequencia de videos (intercalados com imagens estaticas).
+  - cenas humanas e de cotidiano do publico para gerar identificacao.
+- **Blocos 2..N**:
+  - priorizar imagens estaticas.
+  - usar poucos videos, apenas quando houver ganho claro de atencao.
+  - manter quantidade de imagens maior que de videos.
+
+### 18.2.1 Limites maximos por bloco (aprovado)
+
+- **Bloco 1**:
+  - max videos: **4**
+  - max imagens: **6**
+- **Blocos 2..N**:
+  - max videos: **2**
+  - max imagens: **6**
+  - regra adicional: max imagens deve ser maior que max videos.
+
+Esses limites sao defaults e podem ser sobrescritos no CLI do step 3.
+
+### 18.3 Regras de duracao e IP
+
+- Duracao de video padrao: ate **7s**.
+- Para referencias com risco de propriedade intelectual (personalidades, marcas, ativos protegidos): limitar a **5s**.
+- Preferir descricoes genericas e evitar logos/marcas explicitas.
+
+### 18.4 Defaults tecnicos aprovados
+
+- **Imagem (default)**:
+  - `model`: `nano_banana_flash`
+  - `aspect_ratio`: `16:9`
+  - `resolution`: `1k`
+- **Video (default)**:
+  - `model`: `kling3_0`
+  - `duration`: `5`
+  - `aspect_ratio`: `16:9`
+  - `resolution`: `720p` (politica interna)
+  - `mode`: `std`
+  - `sound`: `off`
+
+Observacao tecnica:
+
+- No schema publicado de `kling3_0`, `resolution` pode nao estar disponivel como argumento formal.
+- Regra do executor: enviar apenas campos suportados pelo modelo e ignorar campos nao suportados para evitar falha de request.
+
+### 18.5 Retry aprovado para producao de shots
+
+Para cada shot de imagem/video:
+
+1. tentativa inicial;
+2. **1o retry**: mesmo payload (reenvio);
+3. **2o retry**: igual ao 1o retry (sem trocar modelo, modo ou prompt);
+4. se falhar novamente: marcar shot como `error` e seguir politica de status do bloco/projeto.
+
+### 18.6 Consistencia visual com avatar opcional
+
+- Parametro opcional: `--avatar-file <caminho>` (ex.: `Avatars/lou01.jpeg`).
+- Com avatar:
+  - ativar modo de consistencia de personagem entre shots.
+  - usar o avatar como referencia quando suportado pelo modelo.
+- Sem avatar:
+  - usar consistencia por estilo textual (modo generico).
+
+### 18.7 Entregaveis por bloco no step 3
+
+- `03 - Imagens e Videos/blockXX.assets.json` (direcao aprovada para producao)
+- arquivos renderizados locais de imagem/video (nomenclatura a ser definida na implementacao)
+
+### 18.7.1 Flags de limite no CLI (step imagens)
+
+- `--max-videos-block1 <n>`
+- `--max-images-block1 <n>`
+- `--max-videos-other <n>`
+- `--max-images-other <n>`
+
+Uso:
+
+- disponiveis em `run-step --step imagens` e `retry --stage imagens`.
+- quando omitidas, usam os defaults aprovados.
+
+### 18.8 Resumo da integracao Higgsfield (levantamento)
+
+- Fluxo assinc: submit -> polling/status -> completed/failed.
+- Modelos e parametros base para este projeto definidos acima.
+- Compatibilizacao de payload sera feita por modelo (enviar apenas campos aceitos).

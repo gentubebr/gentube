@@ -5,7 +5,15 @@ import { Command } from "commander";
 import { confirm, input, number, password, select } from "@inquirer/prompts";
 import chalk from "chalk";
 import ora from "ora";
-import { DEFAULT_BLOCKS, ELEVENLABS_VOICE_ID, VIDEOS_DIR } from "./config.js";
+import {
+  DEFAULT_BLOCKS,
+  DEFAULT_MAX_IMAGES_BLOCK1,
+  DEFAULT_MAX_IMAGES_OTHER_BLOCKS,
+  DEFAULT_MAX_VIDEOS_BLOCK1,
+  DEFAULT_MAX_VIDEOS_OTHER_BLOCKS,
+  ELEVENLABS_VOICE_ID,
+  VIDEOS_DIR,
+} from "./config.js";
 import { getPackageVersion } from "./version.js";
 import { getDb } from "./db.js";
 import {
@@ -17,10 +25,33 @@ import {
   listChannels,
 } from "./repository.js";
 import { runInit } from "./init-setup.js";
-import { runNarracao, runNarracaoBlock, runRoteiro, runRoteiroBlock } from "./services/pipeline.js";
+import {
+  runImagensVideos,
+  runImagensVideosBlock,
+  runNarracao,
+  runNarracaoBlock,
+  runRoteiro,
+  runRoteiroBlock,
+} from "./services/pipeline.js";
 import { ensureDir, ensureTemplateStructure, formatDateYYYYMMDD, toSlug, writeModelagemTranscript } from "./utils/fs.js";
+import { Step3Limits } from "./types/step3-limits.js";
+import {
+  fetchAccountStatus,
+  forwardArgvAfterSubcommand,
+  runHiggsfieldCli,
+} from "./integrations/higgsfield-agents.js";
 
 type ProjectRow = Record<string, unknown>;
+
+function maskEmail(email: string): string {
+  const at = email.indexOf("@");
+  if (at <= 0) return "***";
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (!domain) return "***";
+  if (local.length <= 1) return `*@${domain}`;
+  return `${local[0]}***@${domain}`;
+}
 
 getDb();
 
@@ -54,6 +85,8 @@ ${chalk.bold("Exemplos")}
   npm run gentube -- run-all --project 1
   npm run gentube -- status --project 20260508-meu-video
   npm run gentube -- retry --project 1 --stage narracao --block 2
+  npm run gentube -- higgsfield:status
+  npm run gentube -- higgsfield:generate nano_banana_flash --prompt "..." --aspect_ratio 16:9 --resolution 1k --wait
 
 ${chalk.bold("Documentacao")}  README.md  ·  ESPECIFICACAO_TECNICA.md
 `.trimStart()
@@ -270,16 +303,35 @@ program
 
 program
   .command("run-step")
-  .description("Roda apenas roteiro ou apenas narracao de um projeto ja criado")
+  .description("Roda uma etapa do projeto: roteiro, narracao ou imagens")
   .requiredOption("--project <idOuSlug>", "ID numerico (ex.: 1) ou slug da pasta (ex.: 20260508-meu-titulo)")
-  .requiredOption("--step <etapa>", "roteiro | narracao (narração exige roteiro completo com sucesso)")
+  .requiredOption("--step <etapa>", "roteiro | narracao | imagens")
   .option("--voice-id <id>", "Voice ElevenLabs; se omitido, usa ELEVENLABS_VOICE_ID do .env ou pede no terminal")
-  .action(async (options: { project: string; step: "roteiro" | "narracao"; voiceId?: string }) => {
+  .option("--avatar-file <caminho>", "Opcional no step imagens: avatar para consistencia visual")
+  .option("--max-videos-block1 <n>", `Max videos bloco 1 (padrao ${DEFAULT_MAX_VIDEOS_BLOCK1})`)
+  .option("--max-images-block1 <n>", `Max imagens bloco 1 (padrao ${DEFAULT_MAX_IMAGES_BLOCK1})`)
+  .option("--max-videos-other <n>", `Max videos blocos 2..N (padrao ${DEFAULT_MAX_VIDEOS_OTHER_BLOCKS})`)
+  .option("--max-images-other <n>", `Max imagens blocos 2..N (padrao ${DEFAULT_MAX_IMAGES_OTHER_BLOCKS})`)
+  .action(async (options: {
+    project: string;
+    step: "roteiro" | "narracao" | "imagens";
+    voiceId?: string;
+    avatarFile?: string;
+    maxVideosBlock1?: string;
+    maxImagesBlock1?: string;
+    maxVideosOther?: string;
+    maxImagesOther?: string;
+  }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
 
     if (options.step === "roteiro") {
       await executeRoteiro(project);
+      return;
+    }
+    if (options.step === "imagens") {
+      const limits = parseStep3Limits(options);
+      await executeImagens(project, options.avatarFile, limits);
       return;
     }
     const voiceId = await resolveVoiceId(options.voiceId);
@@ -314,6 +366,67 @@ program
   });
 
 program
+  .command("higgsfield:status")
+  .description(
+    "Conta Higgsfield (CLI): creditos e plano via credentials.json (email mascarado; use --json para saida completa)"
+  )
+  .option("--json", "Imprime JSON bruto (email completo; evite logs compartilhados)")
+  .action(async (options: { json?: boolean }) => {
+    const s = await fetchAccountStatus();
+    if (options.json) {
+      console.log(
+        JSON.stringify({
+          email: s.email,
+          credits: s.credits,
+          subscription_plan_type: s.subscription_plan_type,
+        })
+      );
+      return;
+    }
+    console.log(
+      chalk.cyan(
+        `${maskEmail(s.email)} — ${s.subscription_plan_type} plan, ${s.credits} credits`
+      )
+    );
+  });
+
+program
+  .command("higgsfield:generate")
+  .description(
+    "Encapsula `hf generate create`: repassa argumentos apos o comando (use hf no PATH ou HIGGSFIELD_CLI_PATH)"
+  )
+  // Flags como --prompt sao do hf, nao do gentube; sem isso o Commander acusa "unknown option".
+  .allowUnknownOption(true)
+  .allowExcessArguments(true)
+  .addHelpText(
+    "after",
+    `
+${chalk.bold("Exemplo")}
+  npx tsx src/index.ts higgsfield:generate nano_banana_flash \\
+    --prompt "modern architecture, glass facade, golden hour light" \\
+    --aspect_ratio 16:9 --resolution 1k --wait
+
+${chalk.dim("Com npm run, use aspas no --prompt para o shell nao partir o texto em varias palavras.")}
+Credenciais: ~/.config/higgsfield/credentials.json (ou HIGGSFIELD_CREDENTIALS_PATH).
+`.trim()
+  )
+  .action(async () => {
+    const forwarded = forwardArgvAfterSubcommand("higgsfield:generate");
+    if (forwarded.length === 0) {
+      console.error(
+        chalk.yellow(
+          "Informe o job_set_type e flags do hf apos higgsfield:generate (ex.: nano_banana_flash --prompt \"...\" --wait)."
+        )
+      );
+      console.error(chalk.dim("Ajuda do hf: hf generate create --help"));
+      process.exitCode = 1;
+      return;
+    }
+    const code = await runHiggsfieldCli(["generate", "create", ...forwarded]);
+    process.exitCode = code;
+  });
+
+program
   .command("delete-project")
   .description("Remove a pasta do projeto e os registros no banco (dupla confirmacao). Nao remove o canal")
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto a apagar")
@@ -335,13 +448,28 @@ program
 
 program
   .command("retry")
-  .description("Gera de novo roteiro ou narracao (etapa inteira ou so um bloco com --block)")
+  .description("Gera de novo roteiro, narracao ou imagens (etapa inteira ou so um bloco com --block)")
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
-  .requiredOption("--stage <etapa>", "roteiro | narracao")
+  .requiredOption("--stage <etapa>", "roteiro | narracao | imagens")
   .option("--block <N>", "Somente o bloco N (base 1). Sem esta opcao, refaz todos os blocos da etapa")
   .option("--voice-id <id>", "Obrigatorio implicitamente para narracao: .env ou flag")
+  .option("--avatar-file <caminho>", "Opcional para stage imagens: avatar de consistencia")
+  .option("--max-videos-block1 <n>", `Max videos bloco 1 (padrao ${DEFAULT_MAX_VIDEOS_BLOCK1})`)
+  .option("--max-images-block1 <n>", `Max imagens bloco 1 (padrao ${DEFAULT_MAX_IMAGES_BLOCK1})`)
+  .option("--max-videos-other <n>", `Max videos blocos 2..N (padrao ${DEFAULT_MAX_VIDEOS_OTHER_BLOCKS})`)
+  .option("--max-images-other <n>", `Max imagens blocos 2..N (padrao ${DEFAULT_MAX_IMAGES_OTHER_BLOCKS})`)
   .action(
-    async (options: { project: string; stage: "roteiro" | "narracao"; block?: string; voiceId?: string }) => {
+    async (options: {
+      project: string;
+      stage: "roteiro" | "narracao" | "imagens";
+      block?: string;
+      voiceId?: string;
+      avatarFile?: string;
+      maxVideosBlock1?: string;
+      maxImagesBlock1?: string;
+      maxVideosOther?: string;
+      maxImagesOther?: string;
+    }) => {
       const project = getProjectByIdOrSlug(options.project);
       if (!project) throw new Error("Projeto nao encontrado");
 
@@ -358,6 +486,15 @@ program
           await executeRoteiroBlock(project, blockNumber);
         } else {
           await executeRoteiro(project);
+        }
+        return;
+      }
+      if (options.stage === "imagens") {
+        const limits = parseStep3Limits(options);
+        if (blockNumber !== undefined) {
+          await executeImagensBlock(project, blockNumber, options.avatarFile, limits);
+        } else {
+          await executeImagens(project, options.avatarFile, limits);
         }
         return;
       }
@@ -393,6 +530,18 @@ async function executeNarracao(project: ProjectRow, voiceId: string): Promise<vo
   }
 }
 
+async function executeImagens(project: ProjectRow, avatarFile?: string, limits?: Step3Limits): Promise<void> {
+  const spinner = ora("Gerando direcao e renders de imagens/videos...").start();
+  try {
+    const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
+    await runImagensVideos(project, avatarAbs, limits);
+    spinner.succeed("Step 3 (imagens/videos) concluido com sucesso.");
+  } catch (error) {
+    spinner.fail("Falha no step 3 (imagens/videos).");
+    throw error;
+  }
+}
+
 async function executeRoteiroBlock(project: ProjectRow, blockNumber: number): Promise<void> {
   const spinner = ora(`Gerando roteiro — bloco ${blockNumber}...`).start();
   try {
@@ -413,6 +562,45 @@ async function executeNarracaoBlock(project: ProjectRow, voiceId: string, blockN
     spinner.fail(`Falha no audio do bloco ${blockNumber}.`);
     throw error;
   }
+}
+
+async function executeImagensBlock(project: ProjectRow, blockNumber: number, avatarFile?: string, limits?: Step3Limits): Promise<void> {
+  const spinner = ora(`Gerando imagens/videos — bloco ${blockNumber}...`).start();
+  try {
+    const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
+    await runImagensVideosBlock(project, blockNumber, avatarAbs, limits);
+    spinner.succeed(`Step 3 do bloco ${blockNumber} concluido.`);
+  } catch (error) {
+    spinner.fail(`Falha no step 3 do bloco ${blockNumber}.`);
+    throw error;
+  }
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number, flagName: string): number {
+  if (value === undefined || value === "") return fallback;
+  const n = parseInt(value, 10);
+  if (Number.isNaN(n) || n < 0) {
+    throw new Error(`${flagName} deve ser inteiro >= 0`);
+  }
+  return n;
+}
+
+function parseStep3Limits(options: {
+  maxVideosBlock1?: string;
+  maxImagesBlock1?: string;
+  maxVideosOther?: string;
+  maxImagesOther?: string;
+}): Step3Limits {
+  const parsed: Step3Limits = {
+    maxVideosBlock1: parsePositiveInt(options.maxVideosBlock1, DEFAULT_MAX_VIDEOS_BLOCK1, "--max-videos-block1"),
+    maxImagesBlock1: parsePositiveInt(options.maxImagesBlock1, DEFAULT_MAX_IMAGES_BLOCK1, "--max-images-block1"),
+    maxVideosOtherBlocks: parsePositiveInt(options.maxVideosOther, DEFAULT_MAX_VIDEOS_OTHER_BLOCKS, "--max-videos-other"),
+    maxImagesOtherBlocks: parsePositiveInt(options.maxImagesOther, DEFAULT_MAX_IMAGES_OTHER_BLOCKS, "--max-images-other"),
+  };
+  if (parsed.maxImagesOtherBlocks <= parsed.maxVideosOtherBlocks) {
+    throw new Error("Politica invalida: --max-images-other deve ser maior que --max-videos-other");
+  }
+  return parsed;
 }
 
 async function executeAll(project: ProjectRow, voiceIdFromArg?: string): Promise<void> {

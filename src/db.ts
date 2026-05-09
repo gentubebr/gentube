@@ -83,6 +83,24 @@ export function getDb(): Database.Database {
       created_at TEXT NOT NULL,
       FOREIGN KEY(project_id) REFERENCES video_projects(id)
     );
+
+    CREATE TABLE IF NOT EXISTS media_blocks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      block_number INTEGER NOT NULL,
+      assets_json_path TEXT,
+      plan_status TEXT NOT NULL DEFAULT 'pending',
+      plan_error TEXT,
+      renders_status TEXT NOT NULL DEFAULT 'pending',
+      renders_done_count INTEGER NOT NULL DEFAULT 0,
+      renders_total_count INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT,
+      finished_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(project_id, block_number),
+      FOREIGN KEY(project_id) REFERENCES video_projects(id)
+    );
   `);
 
   return db;

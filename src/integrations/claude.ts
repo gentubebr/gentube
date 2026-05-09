@@ -82,3 +82,54 @@ ${referenceBlock ? `${referenceBlock}` : ""}
 
   return cleaned;
 }
+
+export async function generateAssetsPlanJson(input: {
+  promptBase: string;
+  blockNumber: number;
+  totalBlocks: number;
+  scriptText: string;
+  audience: string;
+  avatarPath?: string;
+  maxVideos: number;
+  maxImages: number;
+}): Promise<string> {
+  const anthropic = getClient();
+
+  const userPrompt = `
+${input.promptBase}
+
+Context:
+- block_number: ${input.blockNumber}
+- total_blocks: ${input.totalBlocks}
+- audience: ${input.audience}
+- avatar_reference_optional: ${input.avatarPath ? input.avatarPath : "none"}
+- max_videos_for_this_block: ${input.maxVideos}
+- max_images_for_this_block: ${input.maxImages}
+
+Script block to analyze:
+---
+${input.scriptText}
+---
+
+Return ONLY JSON for this block, following the schema in the prompt.
+Do not exceed max_videos_for_this_block and max_images_for_this_block.
+`.trim();
+
+  const response = await anthropic.messages.create({
+    model: "claude-opus-4-1-20250805",
+    max_tokens: 4096,
+    temperature: 0.4,
+    messages: [{ role: "user", content: userPrompt }],
+  });
+
+  const text = response.content
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+
+  if (!text) {
+    throw new Error(`Claude retornou plano vazio para bloco ${input.blockNumber}`);
+  }
+  return text;
+}

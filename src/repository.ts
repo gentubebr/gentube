@@ -83,6 +83,15 @@ export function updateProjectStageStatus(projectId: number, stage: "status_rotei
   db.prepare(`UPDATE video_projects SET ${stage} = ?, updated_at = ? WHERE id = ?`).run(status, nowIso(), projectId);
 }
 
+export function updateProjectAnyStageStatus(
+  projectId: number,
+  stage: "status_roteiro" | "status_narracao" | "status_imagens_videos",
+  status: BlockStatus
+): void {
+  const db = getDb();
+  db.prepare(`UPDATE video_projects SET ${stage} = ?, updated_at = ? WHERE id = ?`).run(status, nowIso(), projectId);
+}
+
 export function upsertScriptBlock(projectId: number, blockNumber: number, payload: Record<string, string | null>): void {
   const db = getDb();
   const now = nowIso();
@@ -123,6 +132,29 @@ export function countBlocksByStatus(table: "script_blocks" | "narration_blocks",
   return row.total;
 }
 
+export function upsertMediaBlock(projectId: number, blockNumber: number, payload: Record<string, string | number | null>): void {
+  const db = getDb();
+  const now = nowIso();
+  db.prepare(`
+    INSERT INTO media_blocks (project_id, block_number, created_at, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(project_id, block_number) DO UPDATE SET updated_at = excluded.updated_at
+  `).run(projectId, blockNumber, now, now);
+
+  const fields = Object.keys(payload);
+  if (fields.length === 0) return;
+  const setClause = [...fields.map((f) => `${f} = ?`), "updated_at = ?"].join(", ");
+  const values = [...fields.map((f) => payload[f] ?? null), now, projectId, blockNumber];
+  db.prepare(`UPDATE media_blocks SET ${setClause} WHERE project_id = ? AND block_number = ?`).run(...values);
+}
+
+export function listMediaBlocks(projectId: number): Array<{ block_number: number; plan_status: string; renders_status: string }> {
+  const db = getDb();
+  return db
+    .prepare("SELECT block_number, plan_status, renders_status FROM media_blocks WHERE project_id = ? ORDER BY block_number")
+    .all(projectId) as Array<{ block_number: number; plan_status: string; renders_status: string }>;
+}
+
 export function listScriptBlocks(projectId: number): Array<{ block_number: number; file_path_md: string | null; status: string }> {
   const db = getDb();
   return db
@@ -142,6 +174,7 @@ export function deleteProject(projectId: number): void {
   const db = getDb();
   const tx = db.transaction(() => {
     db.prepare("DELETE FROM project_logs WHERE project_id = ?").run(projectId);
+    db.prepare("DELETE FROM media_blocks WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM narration_blocks WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM script_blocks WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM video_projects WHERE id = ?").run(projectId);
@@ -186,4 +219,38 @@ export function recomputeStageFromBlocks(
   }
 
   updateProjectStageStatus(projectId, stageColumn, status);
+}
+
+export function recomputeImagensVideosStage(projectId: number, totalBlocos: number): void {
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT plan_status, renders_status FROM media_blocks WHERE project_id = ?")
+    .all(projectId) as Array<{ plan_status: string; renders_status: string }>;
+
+  if (rows.length === 0) {
+    updateProjectAnyStageStatus(projectId, "status_imagens_videos", "pending");
+    return;
+  }
+
+  let hasError = false;
+  let allDone = rows.length >= totalBlocos;
+  let hasProgress = false;
+
+  for (const row of rows) {
+    if (row.plan_status === "error" || row.renders_status === "error") hasError = true;
+    if (!(row.plan_status === "success" && row.renders_status === "success")) allDone = false;
+    if (row.plan_status === "processing" || row.renders_status === "processing" || row.plan_status === "success") {
+      hasProgress = true;
+    }
+  }
+
+  if (hasError) {
+    updateProjectAnyStageStatus(projectId, "status_imagens_videos", "error");
+  } else if (allDone) {
+    updateProjectAnyStageStatus(projectId, "status_imagens_videos", "success");
+  } else if (hasProgress) {
+    updateProjectAnyStageStatus(projectId, "status_imagens_videos", "processing");
+  } else {
+    updateProjectAnyStageStatus(projectId, "status_imagens_videos", "pending");
+  }
 }
