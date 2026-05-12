@@ -3,6 +3,7 @@ node_modules/
 dist/
 *.log
 .DS_Store
+._.DS_Store
 data/
 
 # Artefatos gerados por projetos de video
