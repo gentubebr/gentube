@@ -3,6 +3,7 @@ import path from "node:path";
 import { MAGNIFIC_API_KEY } from "../config.js";
 
 const BASE_URL = "https://api.magnific.com";
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024; // 100 MB
 
 function headers(): Record<string, string> {
   if (!MAGNIFIC_API_KEY) {
@@ -105,7 +106,14 @@ export async function downloadVideo(
 
   const fileRes = await fetch(downloadUrl);
   if (!fileRes.ok) throw new Error(`Falha ao baixar video Magnific (${fileRes.status})`);
+  const contentLength = Number(fileRes.headers.get("content-length") || 0);
+  if (contentLength > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`Magnific video ${videoId} excede 100 MB (${(contentLength / 1024 / 1024).toFixed(1)} MB)`);
+  }
   const buffer = Buffer.from(await fileRes.arrayBuffer());
+  if (buffer.length > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`Magnific video ${videoId} excede 100 MB (${(buffer.length / 1024 / 1024).toFixed(1)} MB)`);
+  }
   await fs.mkdir(path.dirname(finalPath), { recursive: true });
   await fs.writeFile(finalPath, buffer);
   return finalPath;
@@ -130,7 +138,14 @@ export async function downloadImage(
 
   const fileRes = await fetch(downloadUrl);
   if (!fileRes.ok) throw new Error(`Falha ao baixar imagem Magnific (${fileRes.status})`);
+  const contentLength = Number(fileRes.headers.get("content-length") || 0);
+  if (contentLength > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`Magnific imagem ${resourceId} excede 100 MB (${(contentLength / 1024 / 1024).toFixed(1)} MB)`);
+  }
   const buffer = Buffer.from(await fileRes.arrayBuffer());
+  if (buffer.length > MAX_DOWNLOAD_BYTES) {
+    throw new Error(`Magnific imagem ${resourceId} excede 100 MB (${(buffer.length / 1024 / 1024).toFixed(1)} MB)`);
+  }
   await fs.mkdir(path.dirname(finalPath), { recursive: true });
   await fs.writeFile(finalPath, buffer);
   return finalPath;
@@ -141,17 +156,36 @@ export async function searchAndDownload(input: {
   keywords: string;
   destPathNoExt: string;
 }): Promise<string> {
+  const limit = 5;
   if (input.type === "video") {
-    const results = await searchVideos(input.keywords, { limit: 3 });
+    const results = await searchVideos(input.keywords, { limit });
     if (results.length === 0) {
       throw new Error(`Magnific: nenhum video encontrado para "${input.keywords}"`);
     }
-    return downloadVideo(results[0].id, input.destPathNoExt);
+    for (const r of results) {
+      try {
+        return await downloadVideo(r.id, input.destPathNoExt);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("excede 100 MB")) continue;
+        throw err;
+      }
+    }
+    throw new Error(`Magnific: todos os ${results.length} videos para "${input.keywords}" excedem 100 MB`);
   }
 
-  const results = await searchImages(input.keywords, { limit: 3 });
+  const results = await searchImages(input.keywords, { limit });
   if (results.length === 0) {
     throw new Error(`Magnific: nenhuma imagem encontrada para "${input.keywords}"`);
   }
-  return downloadImage(results[0].id, input.destPathNoExt);
+  for (const r of results) {
+    try {
+      return await downloadImage(r.id, input.destPathNoExt);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("excede 100 MB")) continue;
+      throw err;
+    }
+  }
+  throw new Error(`Magnific: todas as ${results.length} imagens para "${input.keywords}" excedem 100 MB`);
 }
