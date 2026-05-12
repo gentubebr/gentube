@@ -101,6 +101,27 @@ export function getDb(): Database.Database {
       UNIQUE(project_id, block_number),
       FOREIGN KEY(project_id) REFERENCES video_projects(id)
     );
+
+    CREATE TABLE IF NOT EXISTS hf_cli_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      block_number INTEGER NOT NULL,
+      shot_id TEXT NOT NULL,
+      asset_type TEXT NOT NULL CHECK(asset_type IN ('image', 'video')),
+      out_path_no_ext TEXT NOT NULL,
+      hf_job_id TEXT NOT NULL UNIQUE,
+      hf_status TEXT,
+      outcome TEXT NOT NULL DEFAULT 'pending' CHECK(outcome IN ('pending', 'done', 'failed')),
+      result_url TEXT,
+      error_message TEXT,
+      downloaded_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(project_id) REFERENCES video_projects(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_hf_cli_jobs_project_block ON hf_cli_jobs(project_id, block_number);
+    CREATE INDEX IF NOT EXISTS idx_hf_cli_jobs_outcome ON hf_cli_jobs(outcome);
   `);
 
   return db;

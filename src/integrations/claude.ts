@@ -1,5 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { CLAUDE_API_KEY } from "../config.js";
+import type { MessageCreateParamsNonStreaming } from "@anthropic-ai/sdk/resources/messages.js";
+import {
+  CLAUDE_API_KEY,
+  CLAUDE_MODEL,
+  CLAUDE_MAX_TOKENS,
+  CLAUDE_THINKING,
+} from "../config.js";
 import { sanitizeScriptBlockContent } from "../utils/sanitize-script-block.js";
 
 let client: Anthropic | null = null;
@@ -27,7 +33,8 @@ export async function generateScriptBlock(input: {
 
   const formattedPrompt = input.promptBase
     .replaceAll("[NOME DO NICHO]", input.niche)
-    .replaceAll("[PUBLICO]", input.audience);
+    .replaceAll("[PUBLICO]", input.audience)
+    .replace(/dividido em \d+ blocos/i, `dividido em ${input.totalBlocks} blocos`);
 
   const referenceBlock = input.transcript
     ? `
@@ -58,16 +65,23 @@ ${formatRules}
 ${referenceBlock ? `${referenceBlock}` : ""}
 `.trim();
 
-  const response = await anthropic.messages.create({
-    model: "claude-opus-4-1-20250805",
-    max_tokens: 4096,
-    temperature: 0.7,
-    messages: [{ role: "user", content: userPrompt }],
-  });
+  const createParams: MessageCreateParamsNonStreaming = {
+    model: CLAUDE_MODEL,
+    max_tokens: CLAUDE_MAX_TOKENS,
+    messages: [{ role: "user" as const, content: userPrompt }],
+  };
+
+  if (CLAUDE_THINKING === "adaptive") {
+    (createParams as MessageCreateParamsNonStreaming & { thinking: unknown }).thinking = { type: "adaptive" };
+  } else {
+    createParams.temperature = 0.7;
+  }
+
+  const response = await anthropic.messages.create(createParams);
 
   const textChunks = response.content
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
+    .filter((part: { type: string }) => part.type === "text")
+    .map((part) => ("text" in part ? part.text : ""))
     .join("\n")
     .trim();
 
@@ -115,16 +129,23 @@ Return ONLY JSON for this block, following the schema in the prompt.
 Do not exceed max_videos_for_this_block and max_images_for_this_block.
 `.trim();
 
-  const response = await anthropic.messages.create({
-    model: "claude-opus-4-1-20250805",
-    max_tokens: 4096,
-    temperature: 0.4,
-    messages: [{ role: "user", content: userPrompt }],
-  });
+  const createParams: MessageCreateParamsNonStreaming = {
+    model: CLAUDE_MODEL,
+    max_tokens: CLAUDE_MAX_TOKENS,
+    messages: [{ role: "user" as const, content: userPrompt }],
+  };
+
+  if (CLAUDE_THINKING === "adaptive") {
+    (createParams as MessageCreateParamsNonStreaming & { thinking: unknown }).thinking = { type: "adaptive" };
+  } else {
+    createParams.temperature = 0.4;
+  }
+
+  const response = await anthropic.messages.create(createParams);
 
   const text = response.content
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
+    .filter((part: { type: string }) => part.type === "text")
+    .map((part) => ("text" in part ? part.text : ""))
     .join("\n")
     .trim();
 
@@ -133,3 +154,4 @@ Do not exceed max_videos_for_this_block and max_images_for_this_block.
   }
   return text;
 }
+

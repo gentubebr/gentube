@@ -12,12 +12,14 @@ import {
   DEFAULT_MAX_VIDEOS_BLOCK1,
   DEFAULT_MAX_VIDEOS_OTHER_BLOCKS,
   ELEVENLABS_VOICE_ID,
+  ROOT_DIR,
   VIDEOS_DIR,
 } from "./config.js";
 import { getPackageVersion } from "./version.js";
 import { getDb } from "./db.js";
 import {
   addProjectLog,
+  countHfCliJobsPending,
   createChannel,
   createProject,
   deleteProject,
@@ -32,7 +34,9 @@ import {
   runNarracaoBlock,
   runRoteiro,
   runRoteiroBlock,
+  runThumbnails,
 } from "./services/pipeline.js";
+import { syncHiggsfieldCliJobsOnce } from "./services/hf-cli-sync.js";
 import { ensureDir, ensureTemplateStructure, formatDateYYYYMMDD, toSlug, writeModelagemTranscript } from "./utils/fs.js";
 import { Step3Limits } from "./types/step3-limits.js";
 import {
@@ -40,8 +44,19 @@ import {
   forwardArgvAfterSubcommand,
   runHiggsfieldCli,
 } from "./integrations/higgsfield-agents.js";
+import { getSubscriptionInfo } from "./integrations/elevenlabs.js";
 
 type ProjectRow = Record<string, unknown>;
+
+function parseHfSyncIntervalMs(raw: string | undefined): number {
+  const t = (raw ?? "30s").trim().toLowerCase();
+  if (!t) return 30_000;
+  if (/^\d+$/.test(t)) return Math.max(1_000, parseInt(t, 10) * 1000);
+  if (t.endsWith("ms")) return Math.max(500, parseFloat(t) * 1);
+  if (t.endsWith("s")) return Math.max(1_000, (parseFloat(t) || 1) * 1000);
+  if (t.endsWith("m")) return Math.max(5_000, (parseFloat(t) || 1) * 60_000);
+  return 30_000;
+}
 
 function maskEmail(email: string): string {
   const at = email.indexOf("@");
@@ -85,8 +100,14 @@ ${chalk.bold("Exemplos")}
   npm run gentube -- run-all --project 1
   npm run gentube -- status --project 20260508-meu-video
   npm run gentube -- retry --project 1 --stage narracao --block 2
+  npm run gentube -- elevenlabs:status
   npm run gentube -- higgsfield:status
   npm run gentube -- higgsfield:generate nano_banana_flash --prompt "..." --aspect_ratio 16:9 --resolution 1k --wait
+  GENTUBE_HF_ASYNC=1 npm run gentube -- run-step --project 1 --step imagens
+  npm run gentube -- run-step --project 1 --step thumbnails --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" --avatar-file Avatars/lou02.jpeg --count 2
+  npm run gentube -- run-step --project 1 --step thumbnails --avatar-file Avatars/lou02.jpeg --count 2
+  npm run gentube -- higgsfield:sync --project 1
+  npm run gentube -- higgsfield:sync --project 1 --watch --interval 20s
 
 ${chalk.bold("Documentacao")}  README.md  ·  ESPECIFICACAO_TECNICA.md
 `.trimStart()
@@ -303,20 +324,28 @@ program
 
 program
   .command("run-step")
-  .description("Roda uma etapa do projeto: roteiro, narracao ou imagens")
+  .description(
+    "Roda uma etapa do projeto: roteiro, narracao, imagens ou thumbnails. Step imagens: defina GENTUBE_HF_ASYNC=1 para enfileirar jobs HF sem --wait; conclua com gentube higgsfield:sync"
+  )
   .requiredOption("--project <idOuSlug>", "ID numerico (ex.: 1) ou slug da pasta (ex.: 20260508-meu-titulo)")
-  .requiredOption("--step <etapa>", "roteiro | narracao | imagens")
+  .requiredOption("--step <etapa>", "roteiro | narracao | imagens | thumbnails")
   .option("--voice-id <id>", "Voice ElevenLabs; se omitido, usa ELEVENLABS_VOICE_ID do .env ou pede no terminal")
-  .option("--avatar-file <caminho>", "Opcional no step imagens: avatar para consistencia visual")
+  .option("--avatar-file <caminho>", "Opcional: avatar para consistencia visual (imagens e thumbnails)")
+  .option("--reference-url <url>", "Step thumbnails: URL do video YouTube cuja thumbnail sera usada como referencia")
+  .option("--count <n>", "Step thumbnails: quantidade de thumbnails a gerar (padrao 2)", "2")
+  .option("--prompt <texto>", "Step thumbnails: prompt customizado para o Higgsfield (opcional; sem flag usa prompt padrao com titulo)")
   .option("--max-videos-block1 <n>", `Max videos bloco 1 (padrao ${DEFAULT_MAX_VIDEOS_BLOCK1})`)
   .option("--max-images-block1 <n>", `Max imagens bloco 1 (padrao ${DEFAULT_MAX_IMAGES_BLOCK1})`)
   .option("--max-videos-other <n>", `Max videos blocos 2..N (padrao ${DEFAULT_MAX_VIDEOS_OTHER_BLOCKS})`)
   .option("--max-images-other <n>", `Max imagens blocos 2..N (padrao ${DEFAULT_MAX_IMAGES_OTHER_BLOCKS})`)
   .action(async (options: {
     project: string;
-    step: "roteiro" | "narracao" | "imagens";
+    step: "roteiro" | "narracao" | "imagens" | "thumbnails";
     voiceId?: string;
     avatarFile?: string;
+    referenceUrl?: string;
+    count?: string;
+    prompt?: string;
     maxVideosBlock1?: string;
     maxImagesBlock1?: string;
     maxVideosOther?: string;
@@ -332,6 +361,10 @@ program
     if (options.step === "imagens") {
       const limits = parseStep3Limits(options);
       await executeImagens(project, options.avatarFile, limits);
+      return;
+    }
+    if (options.step === "thumbnails") {
+      await executeThumbnails(project, options.referenceUrl, options.avatarFile, options.count, options.prompt);
       return;
     }
     const voiceId = await resolveVoiceId(options.voiceId);
@@ -363,6 +396,35 @@ program
     console.log(`- Imagens e Videos: ${project.status_imagens_videos}`);
     console.log(`- Thumbnails: ${project.status_thumbnails}`);
     console.log(`- Pasta: ${project.project_path}`);
+  });
+
+program
+  .command("elevenlabs:status")
+  .description("Uso de caracteres da conta ElevenLabs no periodo atual")
+  .option("--json", "Imprime JSON bruto")
+  .action(async (options: { json?: boolean }) => {
+    try {
+      const info = await getSubscriptionInfo();
+      if (options.json) {
+        console.log(JSON.stringify(info, null, 2));
+        return;
+      }
+      const pct = info.characterLimit > 0
+        ? ((info.characterCount / info.characterLimit) * 100).toFixed(1)
+        : "0.0";
+      const resetDate = info.nextResetUnix
+        ? new Date(info.nextResetUnix * 1000).toLocaleDateString("pt-BR")
+        : "n/a";
+      console.log(chalk.bold("\nElevenLabs — uso do periodo"));
+      console.log(`  Plano:      ${info.tier}`);
+      console.log(`  Usados:     ${info.characterCount.toLocaleString("pt-BR")} / ${info.characterLimit.toLocaleString("pt-BR")} caracteres (${pct}%)`);
+      console.log(`  Restantes:  ${info.characterRemaining.toLocaleString("pt-BR")} caracteres`);
+      console.log(`  Reset em:   ${resetDate}\n`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Erro desconhecido";
+      console.error(chalk.red(`Erro ao consultar ElevenLabs: ${msg}`));
+      process.exitCode = 1;
+    }
   });
 
 program
@@ -427,6 +489,110 @@ Credenciais: ~/.config/higgsfield/credentials.json (ou HIGGSFIELD_CREDENTIALS_PA
   });
 
 program
+  .command("higgsfield:sync")
+  .description(
+    "Poll/download jobs HF enfileirados (GENTUBE_HF_ASYNC): `hf generate get` + download para disco; atualiza SQLite"
+  )
+  .option("--project <idOuSlug>", "Somente jobs deste projeto (omitir = todos os pendentes)")
+  .option("--max-jobs <n>", "Maximo de jobs a processar por rodada", "30")
+  .option("--watch", "Repete ate nao restar job com outcome=pending (Ctrl+C encerra)")
+  .option("--interval <dur>", "Pausa entre rodadas no --watch (ex.: 15s, 2m, 45 = 45s)", "30s")
+  .action(async (options: { project?: string; maxJobs?: string; watch?: boolean; interval?: string }) => {
+    let projectId: number | undefined;
+    if (options.project?.trim()) {
+      const p = getProjectByIdOrSlug(options.project.trim());
+      if (!p) throw new Error("Projeto nao encontrado");
+      projectId = Number(p.id);
+    }
+    const maxJobs = Math.max(1, parseInt(String(options.maxJobs ?? "30"), 10) || 30);
+    const intervalMs = parseHfSyncIntervalMs(options.interval);
+
+    const runOnce = async (): Promise<{ processed: number; errors: string[] }> => {
+      return syncHiggsfieldCliJobsOnce({ projectId, maxJobs });
+    };
+
+    if (!options.watch) {
+      const { processed, errors } = await runOnce();
+      console.log(chalk.cyan(`HF sync: processados ${processed} job(s).`));
+      if (errors.length > 0) {
+        for (const e of errors) console.error(chalk.yellow(e));
+        process.exitCode = 1;
+      }
+      return;
+    }
+
+    let round = 0;
+    while (true) {
+      const pending = countHfCliJobsPending(projectId);
+      if (pending === 0) {
+        console.log(chalk.green("HF sync --watch: nenhum job pendente; encerrando."));
+        break;
+      }
+      round += 1;
+      const { processed, errors } = await runOnce();
+      console.log(
+        chalk.cyan(
+          `HF sync --watch [rodada ${round}] processados=${processed}, pendentes restantes≈${countHfCliJobsPending(projectId)}`
+        )
+      );
+      if (errors.length > 0) {
+        for (const e of errors) console.error(chalk.yellow(e));
+        process.exitCode = 1;
+      }
+      if (countHfCliJobsPending(projectId) === 0) {
+        console.log(chalk.green("HF sync --watch: todos os jobs concluidos ou falharam (sem pendencias)."));
+        break;
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+  });
+
+program
+  .command("copy-cmd")
+  .description(
+    "Imprime o comando rsync para copiar os arquivos do projeto para a maquina local (cole no terminal local)"
+  )
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .option("--remote-host <host>", "Host remoto (ex.: dev-development). Ou defina GENTUBE_REMOTE_HOST no .env")
+  .option("--local-dir <caminho>", "Diretorio local de destino (padrao: mesmo caminho relativo)")
+  .option("--dry-run", "Adiciona --dry-run ao rsync (simula sem copiar)")
+  .action(async (options: { project: string; remoteHost?: string; localDir?: string; dryRun?: boolean }) => {
+    const project = getProjectByIdOrSlug(options.project);
+    if (!project) throw new Error("Projeto nao encontrado");
+
+    const remoteHost = options.remoteHost?.trim() || (process.env.GENTUBE_REMOTE_HOST ?? "").trim();
+    if (!remoteHost) {
+      console.error(chalk.red("Informe --remote-host ou defina GENTUBE_REMOTE_HOST no .env"));
+      console.error(chalk.dim("Exemplo: npm run gentube -- copy-cmd --project 3 --remote-host dev-development"));
+      process.exitCode = 1;
+      return;
+    }
+
+    const remotePath = String(project.project_path);
+    const remotePathTrailing = remotePath.endsWith("/") ? remotePath : `${remotePath}/`;
+
+    let localPath: string;
+    if (options.localDir?.trim()) {
+      localPath = options.localDir.trim();
+    } else {
+      const relPath = path.relative(ROOT_DIR, remotePath);
+      localPath = `./${relPath}/`;
+    }
+
+    const flags = ["rsync", "-avz", "--progress"];
+    if (options.dryRun) flags.push("--dry-run");
+    flags.push(`${remoteHost}:${remotePathTrailing}`, localPath);
+
+    console.log(chalk.cyan(`Projeto: ${project.titulo} (${project.slug})`));
+    console.log(chalk.dim(`Remoto:  ${remoteHost}:${remotePathTrailing}`));
+    console.log(chalk.dim(`Local:   ${localPath}`));
+    console.log();
+    console.log(chalk.bold("Comando (cole no terminal local):"));
+    console.log();
+    console.log(flags.join(" "));
+  });
+
+program
   .command("delete-project")
   .description("Remove a pasta do projeto e os registros no banco (dupla confirmacao). Nao remove o canal")
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto a apagar")
@@ -448,12 +614,15 @@ program
 
 program
   .command("retry")
-  .description("Gera de novo roteiro, narracao ou imagens (etapa inteira ou so um bloco com --block)")
+  .description("Gera de novo roteiro, narracao, imagens ou thumbnails (etapa inteira ou so um bloco com --block)")
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
-  .requiredOption("--stage <etapa>", "roteiro | narracao | imagens")
+  .requiredOption("--stage <etapa>", "roteiro | narracao | imagens | thumbnails")
   .option("--block <N>", "Somente o bloco N (base 1). Sem esta opcao, refaz todos os blocos da etapa")
   .option("--voice-id <id>", "Obrigatorio implicitamente para narracao: .env ou flag")
-  .option("--avatar-file <caminho>", "Opcional para stage imagens: avatar de consistencia")
+  .option("--avatar-file <caminho>", "Opcional para stage imagens/thumbnails: avatar de consistencia")
+  .option("--reference-url <url>", "Stage thumbnails: URL do video YouTube como referencia")
+  .option("--count <n>", "Stage thumbnails: quantidade de thumbnails (padrao 2)", "2")
+  .option("--prompt <texto>", "Stage thumbnails: prompt customizado para o Higgsfield")
   .option("--max-videos-block1 <n>", `Max videos bloco 1 (padrao ${DEFAULT_MAX_VIDEOS_BLOCK1})`)
   .option("--max-images-block1 <n>", `Max imagens bloco 1 (padrao ${DEFAULT_MAX_IMAGES_BLOCK1})`)
   .option("--max-videos-other <n>", `Max videos blocos 2..N (padrao ${DEFAULT_MAX_VIDEOS_OTHER_BLOCKS})`)
@@ -461,10 +630,13 @@ program
   .action(
     async (options: {
       project: string;
-      stage: "roteiro" | "narracao" | "imagens";
+      stage: "roteiro" | "narracao" | "imagens" | "thumbnails";
       block?: string;
       voiceId?: string;
       avatarFile?: string;
+      referenceUrl?: string;
+      count?: string;
+      prompt?: string;
       maxVideosBlock1?: string;
       maxImagesBlock1?: string;
       maxVideosOther?: string;
@@ -496,6 +668,10 @@ program
         } else {
           await executeImagens(project, options.avatarFile, limits);
         }
+        return;
+      }
+      if (options.stage === "thumbnails") {
+        await executeThumbnails(project, options.referenceUrl, options.avatarFile, options.count, options.prompt);
         return;
       }
 
@@ -531,13 +707,12 @@ async function executeNarracao(project: ProjectRow, voiceId: string): Promise<vo
 }
 
 async function executeImagens(project: ProjectRow, avatarFile?: string, limits?: Step3Limits): Promise<void> {
-  const spinner = ora("Gerando direcao e renders de imagens/videos...").start();
   try {
     const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
     await runImagensVideos(project, avatarAbs, limits);
-    spinner.succeed("Step 3 (imagens/videos) concluido com sucesso.");
+    console.log(chalk.green.bold("Step 3 (imagens/videos) concluido com sucesso."));
   } catch (error) {
-    spinner.fail("Falha no step 3 (imagens/videos).");
+    console.log(chalk.red.bold("Falha no step 3 (imagens/videos)."));
     throw error;
   }
 }
@@ -564,14 +739,30 @@ async function executeNarracaoBlock(project: ProjectRow, voiceId: string, blockN
   }
 }
 
+async function executeThumbnails(
+  project: ProjectRow,
+  referenceUrl?: string,
+  avatarFile?: string,
+  countRaw?: string,
+  prompt?: string
+): Promise<void> {
+  const count = Math.max(1, parseInt(countRaw ?? "2", 10) || 2);
+  const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
+  try {
+    await runThumbnails(project, { referenceUrl, avatarPath: avatarAbs, count, prompt });
+  } catch (error) {
+    console.log(chalk.red.bold("Falha na geracao de thumbnails."));
+    throw error;
+  }
+}
+
 async function executeImagensBlock(project: ProjectRow, blockNumber: number, avatarFile?: string, limits?: Step3Limits): Promise<void> {
-  const spinner = ora(`Gerando imagens/videos — bloco ${blockNumber}...`).start();
   try {
     const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
     await runImagensVideosBlock(project, blockNumber, avatarAbs, limits);
-    spinner.succeed(`Step 3 do bloco ${blockNumber} concluido.`);
+    console.log(chalk.green.bold(`Step 3 do bloco ${blockNumber} concluido.`));
   } catch (error) {
-    spinner.fail(`Falha no step 3 do bloco ${blockNumber}.`);
+    console.log(chalk.red.bold(`Falha no step 3 do bloco ${blockNumber}.`));
     throw error;
   }
 }

@@ -12,8 +12,8 @@ Automatizar, via terminal, a criacao de projetos de video YouTube com pipeline p
 
 1. Roteiro
 2. Narracao
-3. Imagens ou Videos (fase futura)
-4. Thumbnails (fase futura)
+3. Imagens ou Videos (implementado: direcao + producao Higgsfield; ver secao 18 e 16)
+4. Thumbnails (implementado: com/sem referencia YouTube + Higgsfield direto; ver secao 19)
 
 Escopo da primeira entrega:
 
@@ -102,7 +102,8 @@ O CLI deve ser amigavel, visual e objetivo:
 
 ### 5.2 Sequencial (pipeline)
 
-- Executa automaticamente: Etapa 1 -> Etapa 2
+- `run-all` hoje executa automaticamente: Etapa 1 -> Etapa 2 (roteiro e narracao).
+- A etapa **imagens** roda com `run-step --step imagens` (ou fluxo equivalente no codigo), nao esta incluida no `run-all` atual.
 - Interrompe em erro, mantendo rastreabilidade
 
 ## 6) Etapa 1 - Roteiro (Claude API)
@@ -111,7 +112,15 @@ O CLI deve ser amigavel, visual e objetivo:
 
 - Usar prompt base `Prompts/matriz.md`
 - Injetar: titulo, nicho, publico, transcricao opcional e quantidade de blocos
-- Modelo alvo: Opus 4.6 (confirmar identificador tecnico final na API)
+- Numero de blocos no prompt e substituido dinamicamente (`.replace(/dividido em \d+ blocos/i, ...)`)
+- Modelo, max_tokens e thinking sao configurados via `.env`:
+  - `CLAUDE_MODEL` (default: `claude-opus-4-7`)
+  - `CLAUDE_MAX_TOKENS` (default: `16000`)
+  - `CLAUDE_THINKING` — `adaptive` habilita extended thinking do Opus 4.7 (remove `temperature` da chamada, pois sao incompativeis); `disabled` ou vazio usa `temperature: 0.7` sem thinking
+
+### 6.1.1 Retomada inteligente (skip de blocos concluidos)
+
+Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes de processar. Se o bloco ja tem `status = "success"` no SQLite, ele e pulado com log informativo. Isso evita desperdicio de creditos (Claude/ElevenLabs) ao reexecutar apos uma interrupcao parcial.
 
 ### 6.2 Saida
 
@@ -160,6 +169,15 @@ O CLI deve ser amigavel, visual e objetivo:
 - timestamps de inicio/fim
 - erro detalhado quando aplicavel
 
+## 7A) Etapa 3 - Imagens e videos (visao geral)
+
+- **Direcao**: Claude le `01 - Roteiro/blockXX.md` e grava o plano em `03 - Imagens e Videos/blockXX.assets.json` (ver secao 18). Cada shot e marcado com `source: "ai_generated"` ou `source: "stock"` conforme proporcao configurada.
+- **Producao mista**:
+  - Shots `ai_generated` → Higgsfield (`hf generate create`)
+  - Shots `stock` → API Magnific (busca por `search_keywords` + download)
+- **Persistencia**: uma linha `media_blocks` por `(project_id, block_number)` com `plan_status`, `renders_status`, contadores de renders; jobs do CLI em `hf_cli_jobs` quando assincrono.
+- **Politica criativa, modelos, limites e retry de shot**: secao 18. Proporcao IA/stock: secao 20.
+
 ## 8) Banco local SQL (SQLite)
 
 ### 8.1 Arquivo do banco
@@ -187,6 +205,19 @@ O CLI deve ser amigavel, visual e objetivo:
 5. `project_logs`
    - id, project_id, stage, level, message, details_json, created_at
 
+6. `media_blocks` (step 3 — por bloco)
+   - id, project_id, block_number, assets_json_path
+   - plan_status, plan_error
+   - renders_status, renders_done_count, renders_total_count
+   - started_at, finished_at, created_at, updated_at
+   - UNIQUE(project_id, block_number)
+
+7. `hf_cli_jobs` (filas do CLI Higgsfield, especialmente modo assincrono)
+   - id, project_id, block_number, shot_id, asset_type (`image`|`video`)
+   - out_path_no_ext, hf_job_id (UNIQUE), hf_status
+   - outcome (`pending`|`done`|`failed`), result_url, error_message, downloaded_at
+   - created_at, updated_at
+
 ## 9) Operacoes de CLI (contrato funcional)
 
 - `gentube init`
@@ -210,15 +241,33 @@ O CLI deve ser amigavel, visual e objetivo:
 - `gentube channel:list`
   - lista canais cadastrados
 
-- `gentube run-step --project <id|slug> --step <roteiro|narracao>`
+- `gentube run-step --project <id|slug> --step <roteiro|narracao|imagens|thumbnails>`
   - executa uma unica etapa
+  - **imagens**: direcao (Claude -> `blockXX.assets.json`) + producao (CLI `hf generate create`). Com `GENTUBE_HF_ASYNC=1` (`true`/`yes`), a producao enfileira jobs sem `--wait`; o usuario deve rodar `higgsfield:sync` para poll/download.
+  - **thumbnails**: baixa referencia YouTube (se `--reference-url`), envia imagens + prompt direto ao Higgsfield (sem Claude). Flags: `--reference-url`, `--avatar-file`, `--count`, `--prompt`.
 
 - `gentube run-all --project <id|slug>`
-  - executa pipeline completo (etapas disponiveis)
+  - executa pipeline completo das etapas **roteiro** e **narracao** (nao inclui imagens automaticamente)
 
-- `gentube retry --project <id|slug> --stage <roteiro|narracao> [--block N] [--voice-id ...]`
+- `gentube higgsfield:status [--json]`
+  - consulta conta/creditos via API de agents (Bearer a partir de `credentials.json` do CLI)
+
+- `gentube higgsfield:generate ...`
+  - repassa argumentos ao `hf generate create` (testes manuais; opcoes desconhecidas permitidas)
+
+- `gentube higgsfield:sync [--project <id|slug>] [--max-jobs <n>] [--watch] [--interval <dur>]`
+  - modo assincrono: para cada linha `hf_cli_jobs` com `outcome=pending`, executa `hf generate get`, baixa `result_url` para `out_path_no_ext`, atualiza SQLite e estados do bloco/projeto
+  - `--watch`: repete ate nao haver pendentes (pausa `--interval`; Ctrl+C encerra)
+
+- `gentube retry --project <id|slug> --stage <roteiro|narracao|imagens|thumbnails> [--block N] [--voice-id ...]`
   - sem `--block`: reprocessa a etapa inteira
-  - com `--block N` (1-based): reprocessa apenas o bloco N (roteiro ou narracao)
+  - com `--block N` (1-based): reprocessa apenas o bloco N (roteiro, narracao ou imagens)
+  - `--voice-id` aplica-se a **narracao**; flags de limite do step 3 (`--max-videos-*`, `--max-images-*`, `--avatar-file`) aplicam-se a **imagens**
+  - **thumbnails**: aceita `--reference-url`, `--avatar-file`, `--count`
+
+- `gentube elevenlabs:status [--json]`
+  - exibe uso de caracteres do periodo atual: usados, limite, restantes e data de reset
+  - `--json`: saida em JSON bruto
 
 - `gentube status --project <id|slug>`
   - mostra status consolidado e detalhado por bloco
@@ -240,6 +289,8 @@ Ao excluir:
    - `video_projects`
    - `script_blocks`
    - `narration_blocks`
+   - `media_blocks`
+   - `hf_cli_jobs`
    - `project_logs`
 4. Exibir resultado final da operacao
 
@@ -254,8 +305,20 @@ Regras:
 Variaveis em `.env`:
 
 - `CLAUDE_API_KEY`
+- `CLAUDE_MODEL` (opcional): modelo Claude — default `claude-opus-4-7`
+- `CLAUDE_MAX_TOKENS` (opcional): limite de tokens de saida — default `16000`
+- `CLAUDE_THINKING` (opcional): `adaptive` (Opus 4.7, extended thinking, sem temperature), `disabled` ou vazio (sem thinking, com temperature)
 - `ELEVENLABS_API_KEY`
 - `ELEVENLABS_VOICE_ID` (opcional): voice padrao quando `--voice-id` nao e passado no CLI
+- `MAGNIFIC_API_KEY`: chave da API Magnific (ex-Freepik) para busca e download de stock footage/imagens
+- `GENTUBE_STOCK_RATIO_BLOCK1` (opcional): % de shots do bloco 1 vindos do stock Magnific (default: `50`)
+- `GENTUBE_STOCK_RATIO_OTHER` (opcional): % de shots dos blocos 2..N vindos do stock (default: `90`)
+- `GENTUBE_HF_ASYNC` (opcional): habilita enfileiramento HF sem `--wait` no step imagens
+- `HIGGSFIELD_CLI_PATH` (opcional): caminho absoluto do executavel `hf` se nao estiver no PATH
+- `HIGGSFIELD_CREDENTIALS_PATH` (opcional): sobrescreve `~/.config/higgsfield/credentials.json`
+- `HIGGSFIELD_CLI_WAIT_TIMEOUT` (opcional): timeout do `--wait` no modo sincrono (ex.: `15m`)
+- `HIGGSFIELD_API_URL` (opcional): base da API de agents (padrao `https://fnf.higgsfield.ai`)
+- `HIGGSFIELD_API_KEY_ID` / `HIGGSFIELD_API_KEY_SECRET` (opcional): modulo legado HTTP `src/integrations/higgsfield.ts`; **nao** usados pelo pipeline do step 3
 
 Diretrizes:
 
@@ -279,8 +342,13 @@ Diretrizes:
 - `src/core/` regras de negocio por etapa
 - `src/integrations/claude/` cliente Claude
 - `src/integrations/elevenlabs/` cliente ElevenLabs
+- `src/integrations/higgsfield-cli.ts` — execucao do CLI `hf` (create/get, sync e async)
+- `src/integrations/higgsfield-agents.ts` — HTTP agents (status), resolucao do binario `hf`
+- `src/integrations/magnific.ts` — busca e download de stock footage/imagens via API Magnific
+- `src/services/hf-cli-sync.ts` — sincronizacao de `hf_cli_jobs`
 - `src/db/` conexao, migrations e repositorios
 - `src/services/` orchestrator de pipeline
+- `src/utils/youtube.ts` — extracao de video ID e download de thumbnail do YouTube
 - `src/utils/` slug, datas, logs, validacoes
 
 ## 13) Status e observabilidade
@@ -307,9 +375,8 @@ Diretrizes:
 
 ## 15) Itens para fase seguinte
 
-- Etapa 3: Imagens ou Videos
-- Etapa 4: Thumbnails
-- Definicao de providers, prompts e formatos de saida dessas etapas
+- Refinar etapa 3 (imagens): UX, mais providers, afinar defaults e observabilidade
+- Opcional: incluir step **imagens** no `run-all` ou comando dedicado `run-all --with-imagens`
 
 ## 16) Status atual da implementacao
 
@@ -320,25 +387,35 @@ Implementado no codigo em `src/`:
   - `channel:create`
   - `channel:list`
   - `create-video`
-  - `run-step`
+  - `run-step` (inclui `--step imagens`)
   - `run-all`
   - `status`
   - `delete-project`
-  - `retry` (etapa inteira ou `--block N`; apos cada bloco, `status_roteiro` / `status_narracao` e recalculado no SQLite)
+  - `retry` (etapa inteira ou `--block N`; apos cada bloco, `status_roteiro` / `status_narracao` e recalculado no SQLite; **imagens** e **thumbnails** tambem suportados)
+  - `elevenlabs:status` (uso de caracteres do periodo)
+  - `higgsfield:status`, `higgsfield:generate`, `higgsfield:sync` (integracao Higgsfield)
+- Step **thumbnails**: fluxo (A) com referencia YouTube + fluxo (B) sem referencia:
+  - Download da thumbnail de referencia → `05 - Modelagem/Thumbnail_<videoId>.jpg`
+  - Imagens (referencia + avatar) passadas diretamente ao Higgsfield via multiplos `--image`
+  - Geracoes salvas em `04 - Thumbnails/`
+  - Suporte a modo assincrono (`GENTUBE_HF_ASYNC=1` + `higgsfield:sync`)
 - Banco SQLite local com tabelas:
   - `channels`
   - `video_projects`
   - `script_blocks`
   - `narration_blocks`
+  - `media_blocks`
+  - `hf_cli_jobs`
   - `project_logs`
 - Pipeline funcional:
   - Geracao de roteiro com Claude (bloco a bloco, salvando `blockXX.md`)
   - Geracao de narracao com ElevenLabs (salvando `blockXX.mp3`)
+  - Step **imagens**: plano em `blockXX.assets.json`, renders via CLI Higgsfield; modo **sincrono** (`hf ... --wait --json`) ou **assincrono** (`GENTUBE_HF_ASYNC`, jobs em `hf_cli_jobs` + `higgsfield:sync` / `--watch`)
 - Estrutura de projeto por canal em:
   - `Videos/<canal>/<YYYYMMDD-video>/...`
 - Exclusao de projeto:
   - remove arquivos do projeto
-  - remove registros relacionados no SQLite
+  - remove registros relacionados no SQLite (inclui `media_blocks` e `hf_cli_jobs`)
 
 ## 17) Ajuda do CLI (UX)
 
@@ -448,8 +525,197 @@ Uso:
 - disponiveis em `run-step --step imagens` e `retry --stage imagens`.
 - quando omitidas, usam os defaults aprovados.
 
-### 18.8 Resumo da integracao Higgsfield (levantamento)
+### 18.8 Resumo da integracao Higgsfield (implementacao)
 
-- **Step 3 (producao)**: executa o **CLI oficial** (`higgsfield` / `hf`) com `generate create`, `--wait` e `--json`, usando os mesmos creditos da conta web. Autenticacao: `higgsfield auth login` e `~/.config/higgsfield/credentials.json` (ou `HIGGSFIELD_CREDENTIALS_PATH`). Binario: PATH ou `HIGGSFIELD_CLI_PATH`. Timeout de espera opcional: `HIGGSFIELD_CLI_WAIT_TIMEOUT` (padrao interno `15m`).
-- **Modulo legado** `src/integrations/higgsfield.ts`: HTTP em `platform.higgsfield.ai` com `HIGGSFIELD_API_KEY_ID` / `SECRET` (nao e mais usado pelo pipeline do step 3).
-- Modelos e parametros base para este projeto definidos na secao 18.4; o CLI aplica apenas flags suportadas pelo `job_set_type` (ex.: `kling3_0` sem `resolution` no schema publicado).
+- **Step 3 (producao)** usa o **CLI oficial** (`hf`) com `hf generate create` e saida `--json`, com os mesmos creditos da conta web.
+- **Autenticacao**: fluxo do proprio CLI (ex.: `higgsfield auth login`); arquivo tipico `~/.config/higgsfield/credentials.json`, sobrescrito por `HIGGSFIELD_CREDENTIALS_PATH` se definido.
+- **Binario**: deve estar no `PATH` ou em `HIGGSFIELD_CLI_PATH` (o codigo tenta candidatos comuns, ex. `node_modules/@higgsfield/cli/vendor/hf`).
+- **Modo sincrono** (padrao quando `GENTUBE_HF_ASYNC` esta vazio/falso): `create` com `--wait` e `--json`; timeout configuravel `HIGGSFIELD_CLI_WAIT_TIMEOUT` (padrao interno `15m`).
+- **Modo assincrono** (`GENTUBE_HF_ASYNC` em `1`, `true` ou `yes`): `create` **sem** `--wait`; o stdout JSON com array de UUIDs e persistido em `hf_cli_jobs` (`outcome=pending`). O projeto/bloco pode ficar com `renders_status=awaiting_hf` ate a sincronizacao.
+- **Sincronizacao**: comando `gentube higgsfield:sync` (`src/services/hf-cli-sync.ts`) chama `hf generate get <id> --json`, baixa `result_url` para o caminho base `out_path_no_ext` (extensao inferida), atualiza `hf_cli_jobs` e recalcula progresso do bloco/projeto (`finalizeBlockIfDone`, `recomputeImagensVideosStage`).
+- **`higgsfield:sync --watch`**: repete rodadas ate `COUNT(*) WHERE outcome='pending'` ser zero (filtro opcional `--project`); intervalo `--interval` (ex. `30s`, `2m`).
+- **`higgsfield:status`**: `GET` na API de agents (`HIGGSFIELD_API_URL`, padrao `https://fnf.higgsfield.ai`) com Bearer derivado das credenciais do CLI — alinhado ao que `hf account status` usa.
+- **Modulo legado** `src/integrations/higgsfield.ts`: HTTP com `HIGGSFIELD_API_KEY_ID` / `SECRET`; **nao** entra no pipeline do step 3 atual.
+- Modelos e parametros base definidos na secao 18.4; o executor envia apenas flags suportadas pelo modelo (ex.: `kling3_0` sem `resolution` quando o schema publicado nao expoe o campo).
+
+## 19) Politica aprovada — Step 4 (Thumbnails)
+
+### 19.1 Objetivo
+
+Gerar thumbnails para o video do projeto, com dois fluxos:
+
+- **Fluxo (A)** — com imagem de referencia (thumbnail de outro canal no YouTube)
+- **Fluxo (B)** — sem referencia (apenas prompt + avatar)
+
+### 19.2 Fluxo (A) — com referencia
+
+1. **Extrair video ID** da URL do YouTube (parametro `v=`)
+2. **Montar URL** da thumbnail: `https://img.youtube.com/vi/<videoId>/maxresdefault.jpg`
+3. **Baixar** a thumbnail de referencia para `05 - Modelagem/Thumbnail_<videoId>.jpg`
+4. **Enviar diretamente ao Higgsfield** via multiplos `--image`:
+   - `--image <referencia.jpg>` — thumbnail do outro canal como base visual
+   - `--image <avatar.jpeg>` — avatar do canal para consistencia de personagem
+   - `--prompt "..."` — descricao do que gerar
+5. **Salvar** em `04 - Thumbnails/thumb_ref_01.png`, `thumb_ref_02.png`, etc.
+
+O Higgsfield recebe as imagens diretamente e faz a fusao/interpretacao. **Nao passa pelo Claude.**
+
+### 19.3 Fluxo (B) — sem referencia
+
+1. **Enviar ao Higgsfield** com prompt + avatar (sem imagem de referencia)
+2. **Salvar** em `04 - Thumbnails/thumb_gen_01.png`, `thumb_gen_02.png`, etc.
+
+### 19.4 Defaults tecnicos
+
+- **Modelo**: `nano_banana_flash`
+- **Aspect ratio**: `16:9`
+- **Resolucao**: `1k`
+- **Imagens**: passadas via multiplos `--image` ao CLI HF (referencia + avatar)
+- **Quantidade padrao**: 2 thumbnails
+- **Prompt padrao**: `"generate a new thumbnail image for my youtube video with title "<titulo>" based on the image I am sharing with you here"` — pode ser sobrescrito via `--prompt`
+
+### 19.5 Multiplos `--image` no CLI Higgsfield
+
+O CLI `hf generate create` aceita multiplos `--image` na mesma chamada. Cada imagem pode ser um caminho local ou UUID de upload. O GenTube usa isso para enviar:
+
+- A thumbnail de referencia (fluxo A)
+- O avatar do canal
+
+Isso elimina a necessidade de Claude analisar a imagem — o Higgsfield interpreta diretamente as referencias visuais.
+
+### 19.6 CLI
+
+```bash
+# (A) Com referencia de outro canal
+npm run gentube -- run-step --project 3 --step thumbnails \
+  --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --avatar-file Avatars/lou02.jpeg \
+  --count 2
+
+# (A) Com prompt customizado
+npm run gentube -- run-step --project 3 --step thumbnails \
+  --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --avatar-file Avatars/lou02.jpeg \
+  --count 2 \
+  --prompt "generate a thumbnail with a man pointing at money symbols"
+
+# (B) Sem referencia
+npm run gentube -- run-step --project 3 --step thumbnails \
+  --avatar-file Avatars/lou02.jpeg \
+  --count 2
+
+# Retry
+npm run gentube -- retry --project 3 --stage thumbnails \
+  --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --avatar-file Avatars/lou02.jpeg \
+  --count 2
+```
+
+Flags:
+
+- `--reference-url <url>`: URL do video YouTube (fluxo A; omitir para fluxo B)
+- `--avatar-file <caminho>`: avatar para consistencia visual (passado como `--image` ao HF)
+- `--count <n>`: quantidade de thumbnails a gerar (padrao 2)
+- `--prompt <texto>`: prompt customizado para o Higgsfield (opcional; sem flag usa prompt padrao com titulo do video)
+
+### 19.7 Integracao com modo assincrono
+
+- Com `GENTUBE_HF_ASYNC=1`, os jobs de thumbnail sao enfileirados em `hf_cli_jobs` com `block_number=0` (nao pertence a um bloco de roteiro)
+- O download e feito via `higgsfield:sync` (mesmo fluxo do step imagens)
+- O `higgsfield:sync` detecta `block_number=0` e atualiza `status_thumbnails` (em vez de `status_imagens_videos`)
+- `status_thumbnails` no `video_projects` segue os estados padrao: `pending → processing → success | error`
+
+### 19.8 Utilitarios YouTube
+
+- `src/utils/youtube.ts`:
+  - `extractVideoId(url)`: extrai video ID de URLs `youtube.com/watch?v=`, `youtu.be/` e `youtube.com/embed/`
+  - `downloadYoutubeThumbnail(videoId, destDir)`: baixa `maxresdefault.jpg` para o diretorio informado
+
+### 19.9 Entregaveis
+
+- `05 - Modelagem/Thumbnail_<videoId>.jpg` — referencia baixada (fluxo A)
+- `04 - Thumbnails/thumb_ref_XX.png` ou `thumb_gen_XX.png` — thumbnails geradas
+
+## 20) Politica aprovada — Producao mista Higgsfield (IA) + Magnific (Stock)
+
+### 20.1 Objetivo
+
+Reduzir o consumo de creditos Higgsfield usando stock footage/imagens da Magnific (ex-Freepik) para a maioria dos shots, reservando a geracao por IA apenas para momentos de maior impacto visual.
+
+### 20.2 Provedores
+
+- **Higgsfield (IA)**: gera imagens e videos unicos via `hf generate create`
+- **Magnific (stock)**: busca e baixa imagens/videos do banco Magnific via API REST (`api.magnific.com`)
+
+### 20.3 Proporcao configuravel
+
+| | Higgsfield (IA) | Magnific (Stock) | Variavel |
+|---|---|---|---|
+| **Bloco 1** | 50% | 50% | `GENTUBE_STOCK_RATIO_BLOCK1=50` |
+| **Blocos 2..N** | 10% | 90% | `GENTUBE_STOCK_RATIO_OTHER=90` |
+
+Os valores sao configuraveis via `.env` (0-100). O Claude recebe a proporcao no contexto e distribui os shots respeitando-a.
+
+### 20.4 Politica criativa — quando usar IA vs stock
+
+O Claude decide quais shots sao `ai_generated` e quais sao `stock` no plano de direcao (`blockXX.assets.json`), seguindo estas regras:
+
+1. **IA e reservada para momentos de maior impacto**:
+   - **Hook/abertura** do bloco — para prender atencao com algo unico e customizado
+   - **Momento mais dramatico/enigmatico** — o ponto alto da narrativa do bloco
+   - Se a proporcao permitir mais shots IA, distribuir nos demais pontos de impacto visual
+
+2. **Stock e usado para o restante**:
+   - Cenas de apoio e ilustracoes genericas
+   - Transicoes entre conceitos
+   - Metaforas visuais comuns (graficos, dinheiro, cidades, pessoas andando, etc.)
+
+3. **Excecoes**: shots com `character_required: true` (avatar) devem ser `ai_generated` sempre (o Magnific nao tem o personagem do canal)
+
+### 20.5 Schema atualizado do shot
+
+Cada shot no `blockXX.assets.json` agora inclui:
+
+```json
+{
+  "id": "s01",
+  "type": "image",
+  "source": "ai_generated",
+  "role": "hook",
+  "description": "...",
+  "search_keywords": null,
+  ...
+}
+```
+
+- `source`: `"ai_generated"` (Higgsfield) ou `"stock"` (Magnific)
+- `search_keywords`: termos de busca em ingles para a API Magnific (obrigatorio quando `source="stock"`, `null` quando `source="ai_generated"`)
+
+### 20.6 API Magnific
+
+- **Autenticacao**: header `x-magnific-api-key` com valor de `MAGNIFIC_API_KEY`
+- **Busca**: `GET https://api.magnific.com/v1/videos?term=<keywords>&order=relevance`
+- **Download video**: `GET https://api.magnific.com/v1/videos/{id}/download`
+- **Busca imagens**: `GET https://api.magnific.com/v1/resources?term=<keywords>&filters[content_type][photo]=1`
+- **Download imagem**: `GET https://api.magnific.com/v1/resources/{id}/download`
+- Modulo: `src/integrations/magnific.ts`
+
+### 20.7 Fluxo de execucao no pipeline
+
+Para cada shot no plano:
+
+1. Se `source = "stock"`:
+   - Buscar na API Magnific usando `search_keywords`
+   - Baixar o resultado mais relevante
+   - Salvar em `03 - Imagens e Videos/renders/blockXX/`
+   - Download e imediato (nao depende de `higgsfield:sync`)
+
+2. Se `source = "ai_generated"`:
+   - Fluxo atual via Higgsfield (sincrono ou assincrono)
+
+### 20.8 Entregaveis por bloco
+
+Mesmo diretorio de saida: `03 - Imagens e Videos/renders/blockXX/`
+
+- `s01.png`, `s02.mp4`, etc. — independente da fonte (IA ou stock)
+- `blockXX.assets.json` — plano com campo `source` indicando a origem de cada shot

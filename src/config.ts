@@ -13,6 +13,18 @@ export const DATA_DIR = path.join(ROOT_DIR, "data");
 export const DB_PATH = path.join(DATA_DIR, "gentube.db");
 
 export const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY ?? "";
+
+/** Modelo Claude (default: claude-opus-4-7) */
+export const CLAUDE_MODEL = (process.env.CLAUDE_MODEL ?? "claude-opus-4-7").trim();
+
+/** Max tokens de saida (default: 16000) */
+export const CLAUDE_MAX_TOKENS = Math.max(
+  1024,
+  parseInt(process.env.CLAUDE_MAX_TOKENS ?? "16000", 10) || 16000,
+);
+
+/** Modo thinking: "adaptive" | "disabled" | "" (default: "") */
+export const CLAUDE_THINKING = (process.env.CLAUDE_THINKING ?? "").trim().toLowerCase();
 export const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY ?? "";
 /** Voice ID padrao quando --voice-id nao e passado no CLI */
 export const ELEVENLABS_VOICE_ID = (process.env.ELEVENLABS_VOICE_ID ?? "").trim();
