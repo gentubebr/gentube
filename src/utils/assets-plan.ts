@@ -20,6 +20,14 @@ function assertShot(shot: unknown, index: number): asserts shot is ShotPlan {
   if (shot.ip_risk !== "none" && shot.ip_risk !== "low" && shot.ip_risk !== "high") {
     throw new Error(`Shot ${index} invalido: ip_risk deve ser none|low|high`);
   }
+  if (shot.source !== "ai_generated" && shot.source !== "stock") {
+    throw new Error(`Shot ${index} invalido: source deve ser ai_generated|stock`);
+  }
+  if (shot.source === "stock") {
+    if (typeof shot.search_keywords !== "string" || !shot.search_keywords.trim()) {
+      throw new Error(`Shot ${index} invalido: search_keywords obrigatorio quando source=stock`);
+    }
+  }
   if (shot.type === "video" && shot.duration_seconds_max > 7) {
     throw new Error(`Shot ${index} invalido: video nao pode passar de 7s`);
   }

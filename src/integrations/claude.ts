@@ -106,6 +106,7 @@ export async function generateAssetsPlanJson(input: {
   avatarPath?: string;
   maxVideos: number;
   maxImages: number;
+  stockRatio: number;
 }): Promise<string> {
   const anthropic = getClient();
 
@@ -119,6 +120,7 @@ Context:
 - avatar_reference_optional: ${input.avatarPath ? input.avatarPath : "none"}
 - max_videos_for_this_block: ${input.maxVideos}
 - max_images_for_this_block: ${input.maxImages}
+- stock_ratio: ${input.stockRatio} (target % of shots that should have source "stock"; remaining should be "ai_generated")
 
 Script block to analyze:
 ---
@@ -127,6 +129,7 @@ ${input.scriptText}
 
 Return ONLY JSON for this block, following the schema in the prompt.
 Do not exceed max_videos_for_this_block and max_images_for_this_block.
+Respect the stock_ratio for source distribution.
 `.trim();
 
   const createParams: MessageCreateParamsNonStreaming = {

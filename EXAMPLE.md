@@ -421,3 +421,4 @@ Videos/Late-Bloomer-Lou/20260511-Ways-Rich-People-Make-Money-With-Debt/
 6. Creditos: verifique antes com `higgsfield:status` e `elevenlabs:status`. Se acabar no meio, jobs restantes falham e podem ser refeitos com `retry`.
 7. **Thumbnails** nao usam Claude — a referencia e o avatar vao direto ao Higgsfield via multiplos `--image`. O prompt pode ser customizado com `--prompt`.
 8. **Producao mista (Higgsfield + Magnific):** o Claude decide quais shots sao IA e quais sao stock no plano de direcao. IA e reservada para hooks e momentos dramaticos; stock para apoio e transicoes. A proporcao e configuravel via `GENTUBE_STOCK_RATIO_BLOCK1` (default 50%) e `GENTUBE_STOCK_RATIO_OTHER` (default 90%). Shots stock sao baixados imediatamente, independente do modo async.
+9. **`copy-cmd`:** gera o comando rsync pronto para colar no terminal local. Defina `GENTUBE_REMOTE_HOST` no `.env` ou use `--remote-host`. Exemplo: `npm run gentube -- copy-cmd --project 3`.

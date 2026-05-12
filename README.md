@@ -61,6 +61,7 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `MAGNIFIC_API_KEY` | Sim (step imagens) | API da Magnific/Freepik (stock footage e imagens) |
 | `GENTUBE_STOCK_RATIO_BLOCK1` | Opcional | % de shots do bloco 1 vindos do stock Magnific (default: `50`) |
 | `GENTUBE_STOCK_RATIO_OTHER` | Opcional | % de shots dos blocos 2..N vindos do stock (default: `90`) |
+| `GENTUBE_REMOTE_HOST` | Opcional | Host SSH remoto para `copy-cmd` (ex.: `dev-development`); evita `--remote-host` toda vez |
 | `GENTUBE_HF_ASYNC` | Opcional | `1`, `true` ou `yes`: no step **imagens**, enfileira jobs no Higgsfield sem esperar no mesmo comando; use `higgsfield:sync` (ou `--watch`) para baixar resultados |
 | `HIGGSFIELD_CLI_PATH`, `HIGGSFIELD_CREDENTIALS_PATH`, `HIGGSFIELD_CLI_WAIT_TIMEOUT`, `HIGGSFIELD_API_URL` | Opcionais | Caminho do binário `hf`, credenciais, timeout de `--wait` (modo síncrono), base da API de agents; ver [`.env.example`](.env.example) |
 
@@ -144,6 +145,15 @@ npm run gentube -- elevenlabs:status
 # 9) Reprocessar uma etapa ou só um bloco
 npm run gentube -- retry --project 1 --stage roteiro --block 2
 npm run gentube -- retry --project 1 --stage narracao --block 2
+
+# 10) Copiar arquivos do servidor remoto para a máquina local (rsync)
+npm run gentube -- copy-cmd --project 1 --remote-host dev-development
+# Com destino local customizado
+npm run gentube -- copy-cmd --project 1 --remote-host dev-development --local-dir ~/Downloads/video1/
+# Simulação (dry-run)
+npm run gentube -- copy-cmd --project 1 --remote-host dev-development --dry-run
+# Ou defina GENTUBE_REMOTE_HOST no .env para omitir --remote-host
+npm run gentube -- copy-cmd --project 1
 ```
 
 ### Build (TypeScript → `dist/`)

@@ -46,6 +46,21 @@ export function higgsfieldCliCredentialsPath(): string {
 /** Caminho absoluto do binario `hf` / `higgsfield` (opcional; senao usa PATH). */
 export const HIGGSFIELD_CLI_PATH = (process.env.HIGGSFIELD_CLI_PATH ?? "").trim();
 
+/** API key da Magnific (ex-Freepik) para stock footage/imagens */
+export const MAGNIFIC_API_KEY = (process.env.MAGNIFIC_API_KEY ?? "").trim();
+
+/** % de shots do bloco 1 vindos do stock Magnific (default: 50) */
+export const STOCK_RATIO_BLOCK1 = Math.min(
+  100,
+  Math.max(0, parseInt(process.env.GENTUBE_STOCK_RATIO_BLOCK1 ?? "50", 10) || 50),
+);
+
+/** % de shots dos blocos 2..N vindos do stock Magnific (default: 90) */
+export const STOCK_RATIO_OTHER = Math.min(
+  100,
+  Math.max(0, parseInt(process.env.GENTUBE_STOCK_RATIO_OTHER ?? "90", 10) || 90),
+);
+
 export const DEFAULT_BLOCKS = 8;
 export const DEFAULT_MAX_VIDEOS_BLOCK1 = 4;
 export const DEFAULT_MAX_IMAGES_BLOCK1 = 6;

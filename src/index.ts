@@ -108,6 +108,8 @@ ${chalk.bold("Exemplos")}
   npm run gentube -- run-step --project 1 --step thumbnails --avatar-file Avatars/lou02.jpeg --count 2
   npm run gentube -- higgsfield:sync --project 1
   npm run gentube -- higgsfield:sync --project 1 --watch --interval 20s
+  npm run gentube -- copy-cmd --project 1 --remote-host dev-development
+  npm run gentube -- copy-cmd --project 1
 
 ${chalk.bold("Documentacao")}  README.md  ·  ESPECIFICACAO_TECNICA.md
 `.trimStart()

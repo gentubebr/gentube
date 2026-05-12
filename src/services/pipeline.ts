@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import chalk from "chalk";
-import { PROMPT_MATRIX_PATH, PROMPT_MATRIX02_PATH } from "../config.js";
+import { PROMPT_MATRIX_PATH, PROMPT_MATRIX02_PATH, STOCK_RATIO_BLOCK1, STOCK_RATIO_OTHER } from "../config.js";
 import { generateAssetsPlanJson, generateScriptBlock } from "../integrations/claude.js";
 import { extractVideoId, downloadYoutubeThumbnail } from "../utils/youtube.js";
 import { textToSpeechMp3 } from "../integrations/elevenlabs.js";
@@ -29,6 +29,7 @@ import {
   upsertScriptBlock,
 } from "../repository.js";
 import { parseAndValidateAssetsPlan } from "../utils/assets-plan.js";
+import { searchAndDownload } from "../integrations/magnific.js";
 import { Step3Limits } from "../types/step3-limits.js";
 
 type ProjectRow = Record<string, unknown>;
@@ -384,6 +385,7 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
       const scriptText = await fs.readFile(scriptPath, "utf-8");
       upsertMediaBlock(projectId, i, { plan_status: "processing", started_at: startedAt, plan_error: null });
 
+      const stockRatio = i === 1 ? STOCK_RATIO_BLOCK1 : STOCK_RATIO_OTHER;
       const rawPlan = await generateAssetsPlanJson({
         promptBase,
         blockNumber: i,
@@ -393,6 +395,7 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
         avatarPath,
         maxVideos,
         maxImages,
+        stockRatio,
       });
       const plan = parseAndValidateAssetsPlan(rawPlan, i, limits);
       await fs.mkdir(path.dirname(jsonPath), { recursive: true });
@@ -427,76 +430,103 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
             ? String(avatarPath).trim()
             : path.resolve(String(avatarPath))
           : undefined;
+      let stockDone = 0;
       for (const shot of plan.shots) {
-        let referenceImageUrl = shot.character_required ? avatarRef : undefined;
-
-        if (shot.type === "video" && !referenceImageUrl) {
-          if (GENTUBE_HF_ASYNC) {
-            referenceImageUrl = avatarRef ?? lastImageRefLocal;
-          } else {
-            referenceImageUrl = lastImageRef;
-          }
-        }
-        if (shot.type === "video" && !referenceImageUrl) {
-          if (GENTUBE_HF_ASYNC) {
-            console.log(chalk.dim(`  ${blockTag(i, totalBlocos)} Bootstrap sincrono para video ${shot.id} (--wait)...`));
-            const bootstrap = await generateAndRenderShot({
-              type: "image",
-              prompt: shot.description,
-              outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
-              referenceImageUrl: avatarRef,
+        if (shot.source === "stock" && shot.search_keywords) {
+          console.log(chalk.dim(`  ${blockTag(i, totalBlocos)} Stock ${shot.id} (${shot.type}): "${shot.search_keywords}"...`));
+          try {
+            const localPath = await searchAndDownload({
+              type: shot.type,
+              keywords: shot.search_keywords,
+              destPathNoExt: path.join(rendersDir, shot.id),
             });
-            lastImageRefLocal = bootstrap.localPath;
-            referenceImageUrl = bootstrap.localPath;
-            console.log(chalk.dim(`  ${blockTag(i, totalBlocos)} Bootstrap pronto → ${path.basename(bootstrap.localPath)}`));
-            addProjectLog(projectId, "imagens_videos", "info", `Bootstrap sincrono para video ${shot.id}`, {
-              mediaPath: bootstrap.localPath,
+            stockDone += 1;
+            done += 1;
+            console.log(chalk.green(`  ${blockTag(i, totalBlocos)} Stock baixado: ${shot.id} → ${path.basename(localPath)}`));
+            addProjectLog(projectId, "imagens_videos", "info", `Stock baixado bloco ${i} shot ${shot.id}`, {
+              mediaPath: localPath,
+              keywords: shot.search_keywords,
             });
-          } else {
-            console.log(chalk.dim(`  ${blockTag(i, totalBlocos)} Bootstrap img para video ${shot.id} (--wait)...`));
-            const bootstrap = await generateAndRenderShot({
-              type: "image",
-              prompt: shot.description,
-              outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
-              referenceImageUrl: avatarRef,
-            });
-            lastImageRef = bootstrap.mediaUrl;
-            referenceImageUrl = bootstrap.mediaUrl;
-            addProjectLog(projectId, "imagens_videos", "info", `Bootstrap de imagem para video ${shot.id}`, {
-              mediaPath: bootstrap.localPath,
-            });
+            upsertMediaBlock(projectId, i, { renders_done_count: done });
+          } catch (stockErr) {
+            const msg = stockErr instanceof Error ? stockErr.message : "Erro stock";
+            console.log(chalk.yellow(`  ${blockTag(i, totalBlocos)} Stock falhou para ${shot.id}: ${msg} — fallback para IA`));
+            addProjectLog(projectId, "imagens_videos", "info", `Stock falhou bloco ${i} shot ${shot.id}, fallback IA`, { error: msg });
+            shot.source = "ai_generated";
           }
         }
 
-        if (GENTUBE_HF_ASYNC) {
-          const enq = await enqueueRenderShotTracked(projectId, i, shot.id, {
-            type: shot.type,
-            prompt: shot.description,
-            outPathNoExt: path.join(rendersDir, shot.id),
-            referenceImageUrl,
-          });
-          hfJobTotal += 1;
-          console.log(
-            chalk.dim(`  ${blockTag(i, totalBlocos)} HF enfileirado: ${shot.id} (${shot.type}) → ${enq.hfJobId.slice(0, 8)}...`)
-          );
-          addProjectLog(projectId, "imagens_videos", "info", `HF job enfileirado bloco ${i} shot ${shot.id}`, {
-            hfJobId: enq.hfJobId,
-          });
-        } else {
-          console.log(chalk.dim(`  ${blockTag(i, totalBlocos)} Renderizando ${shot.id} (${shot.type}, --wait)...`));
-          const out = await generateAndRenderShot({
-            type: shot.type,
-            prompt: shot.description,
-            outPathNoExt: path.join(rendersDir, shot.id),
-            referenceImageUrl,
-          });
-          if (shot.type === "image") lastImageRef = out.mediaUrl;
-          done += 1;
-          console.log(chalk.green(`  ${blockTag(i, totalBlocos)} ${shot.id} concluido → ${path.basename(out.localPath)} (${done}/${plan.shots.length})`));
-          addProjectLog(projectId, "imagens_videos", "info", `Render concluido bloco ${i} shot ${shot.id}`, {
-            mediaPath: out.localPath,
-          });
-          upsertMediaBlock(projectId, i, { renders_done_count: done });
+        if (shot.source === "ai_generated") {
+          let referenceImageUrl = shot.character_required ? avatarRef : undefined;
+
+          if (shot.type === "video" && !referenceImageUrl) {
+            if (GENTUBE_HF_ASYNC) {
+              referenceImageUrl = avatarRef ?? lastImageRefLocal;
+            } else {
+              referenceImageUrl = lastImageRef;
+            }
+          }
+          if (shot.type === "video" && !referenceImageUrl) {
+            if (GENTUBE_HF_ASYNC) {
+              console.log(chalk.dim(`  ${blockTag(i, totalBlocos)} Bootstrap sincrono para video ${shot.id} (--wait)...`));
+              const bootstrap = await generateAndRenderShot({
+                type: "image",
+                prompt: shot.description,
+                outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
+                referenceImageUrl: avatarRef,
+              });
+              lastImageRefLocal = bootstrap.localPath;
+              referenceImageUrl = bootstrap.localPath;
+              console.log(chalk.dim(`  ${blockTag(i, totalBlocos)} Bootstrap pronto → ${path.basename(bootstrap.localPath)}`));
+              addProjectLog(projectId, "imagens_videos", "info", `Bootstrap sincrono para video ${shot.id}`, {
+                mediaPath: bootstrap.localPath,
+              });
+            } else {
+              console.log(chalk.dim(`  ${blockTag(i, totalBlocos)} Bootstrap img para video ${shot.id} (--wait)...`));
+              const bootstrap = await generateAndRenderShot({
+                type: "image",
+                prompt: shot.description,
+                outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
+                referenceImageUrl: avatarRef,
+              });
+              lastImageRef = bootstrap.mediaUrl;
+              referenceImageUrl = bootstrap.mediaUrl;
+              addProjectLog(projectId, "imagens_videos", "info", `Bootstrap de imagem para video ${shot.id}`, {
+                mediaPath: bootstrap.localPath,
+              });
+            }
+          }
+
+          if (GENTUBE_HF_ASYNC) {
+            const enq = await enqueueRenderShotTracked(projectId, i, shot.id, {
+              type: shot.type,
+              prompt: shot.description,
+              outPathNoExt: path.join(rendersDir, shot.id),
+              referenceImageUrl,
+            });
+            hfJobTotal += 1;
+            console.log(
+              chalk.dim(`  ${blockTag(i, totalBlocos)} HF enfileirado: ${shot.id} (${shot.type}) → ${enq.hfJobId.slice(0, 8)}...`)
+            );
+            addProjectLog(projectId, "imagens_videos", "info", `HF job enfileirado bloco ${i} shot ${shot.id}`, {
+              hfJobId: enq.hfJobId,
+            });
+          } else {
+            console.log(chalk.dim(`  ${blockTag(i, totalBlocos)} Renderizando ${shot.id} (${shot.type}, --wait)...`));
+            const out = await generateAndRenderShot({
+              type: shot.type,
+              prompt: shot.description,
+              outPathNoExt: path.join(rendersDir, shot.id),
+              referenceImageUrl,
+            });
+            if (shot.type === "image") lastImageRef = out.mediaUrl;
+            done += 1;
+            console.log(chalk.green(`  ${blockTag(i, totalBlocos)} ${shot.id} concluido → ${path.basename(out.localPath)} (${done}/${plan.shots.length})`));
+            addProjectLog(projectId, "imagens_videos", "info", `Render concluido bloco ${i} shot ${shot.id}`, {
+              mediaPath: out.localPath,
+            });
+            upsertMediaBlock(projectId, i, { renders_done_count: done });
+          }
         }
       }
 
@@ -585,6 +615,7 @@ export async function runImagensVideosBlock(project: ProjectRow, blockNumber: nu
     console.log(chalk.cyan(`${blockTag(blockNumber, totalBlocos)} Gerando plano de direcao (Claude)...`));
     const scriptText = await fs.readFile(scriptPath, "utf-8");
     upsertMediaBlock(projectId, blockNumber, { plan_status: "processing", started_at: startedAt, plan_error: null });
+    const stockRatio = blockNumber === 1 ? STOCK_RATIO_BLOCK1 : STOCK_RATIO_OTHER;
     const rawPlan = await generateAssetsPlanJson({
       promptBase,
       blockNumber,
@@ -594,6 +625,7 @@ export async function runImagensVideosBlock(project: ProjectRow, blockNumber: nu
       avatarPath,
       maxVideos: limits ? (blockNumber === 1 ? limits.maxVideosBlock1 : limits.maxVideosOtherBlocks) : 999,
       maxImages: limits ? (blockNumber === 1 ? limits.maxImagesBlock1 : limits.maxImagesOtherBlocks) : 999,
+      stockRatio,
     });
     const plan = parseAndValidateAssetsPlan(rawPlan, blockNumber, limits);
     await fs.mkdir(path.dirname(jsonPath), { recursive: true });
@@ -627,59 +659,84 @@ export async function runImagensVideosBlock(project: ProjectRow, blockNumber: nu
           : path.resolve(String(avatarPath))
         : undefined;
     for (const shot of plan.shots) {
-      let referenceImageUrl = shot.character_required ? avatarRef : undefined;
-      if (shot.type === "video" && !referenceImageUrl) {
-        if (GENTUBE_HF_ASYNC) {
-          referenceImageUrl = avatarRef ?? lastImageRefLocal;
-        } else {
-          referenceImageUrl = lastImageRef;
+      if (shot.source === "stock" && shot.search_keywords) {
+        console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} Stock ${shot.id} (${shot.type}): "${shot.search_keywords}"...`));
+        try {
+          const localPath = await searchAndDownload({
+            type: shot.type,
+            keywords: shot.search_keywords,
+            destPathNoExt: path.join(rendersDir, shot.id),
+          });
+          done += 1;
+          console.log(chalk.green(`  ${blockTag(blockNumber, totalBlocos)} Stock baixado: ${shot.id} → ${path.basename(localPath)}`));
+          addProjectLog(projectId, "imagens_videos", "info", `Stock baixado bloco ${blockNumber} shot ${shot.id}`, {
+            mediaPath: localPath,
+            keywords: shot.search_keywords,
+          });
+          upsertMediaBlock(projectId, blockNumber, { renders_done_count: done });
+        } catch (stockErr) {
+          const msg = stockErr instanceof Error ? stockErr.message : "Erro stock";
+          console.log(chalk.yellow(`  ${blockTag(blockNumber, totalBlocos)} Stock falhou para ${shot.id}: ${msg} — fallback para IA`));
+          addProjectLog(projectId, "imagens_videos", "info", `Stock falhou bloco ${blockNumber} shot ${shot.id}, fallback IA`, { error: msg });
+          shot.source = "ai_generated";
         }
       }
-      if (shot.type === "video" && !referenceImageUrl) {
-        if (GENTUBE_HF_ASYNC) {
-          console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} Bootstrap sincrono para video ${shot.id} (--wait)...`));
-          const bootstrap = await generateAndRenderShot({
-            type: "image",
-            prompt: shot.description,
-            outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
-            referenceImageUrl: avatarRef,
-          });
-          lastImageRefLocal = bootstrap.localPath;
-          referenceImageUrl = bootstrap.localPath;
-          console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} Bootstrap pronto → ${path.basename(bootstrap.localPath)}`));
-        } else {
-          console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} Bootstrap img para video ${shot.id} (--wait)...`));
-          const bootstrap = await generateAndRenderShot({
-            type: "image",
-            prompt: shot.description,
-            outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
-            referenceImageUrl: avatarRef,
-          });
-          lastImageRef = bootstrap.mediaUrl;
-          referenceImageUrl = bootstrap.mediaUrl;
+
+      if (shot.source === "ai_generated") {
+        let referenceImageUrl = shot.character_required ? avatarRef : undefined;
+        if (shot.type === "video" && !referenceImageUrl) {
+          if (GENTUBE_HF_ASYNC) {
+            referenceImageUrl = avatarRef ?? lastImageRefLocal;
+          } else {
+            referenceImageUrl = lastImageRef;
+          }
         }
-      }
-      if (GENTUBE_HF_ASYNC) {
-        const enq = await enqueueRenderShotTracked(projectId, blockNumber, shot.id, {
-          type: shot.type,
-          prompt: shot.description,
-          outPathNoExt: path.join(rendersDir, shot.id),
-          referenceImageUrl,
-        });
-        hfJobTotal += 1;
-        console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} HF enfileirado: ${shot.id} (${shot.type}) → ${enq.hfJobId.slice(0, 8)}...`));
-      } else {
-        console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} Renderizando ${shot.id} (${shot.type}, --wait)...`));
-        const out = await generateAndRenderShot({
-          type: shot.type,
-          prompt: shot.description,
-          outPathNoExt: path.join(rendersDir, shot.id),
-          referenceImageUrl,
-        });
-        if (shot.type === "image") lastImageRef = out.mediaUrl;
-        done += 1;
-        console.log(chalk.green(`  ${blockTag(blockNumber, totalBlocos)} ${shot.id} concluido (${done}/${plan.shots.length})`));
-        upsertMediaBlock(projectId, blockNumber, { renders_done_count: done });
+        if (shot.type === "video" && !referenceImageUrl) {
+          if (GENTUBE_HF_ASYNC) {
+            console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} Bootstrap sincrono para video ${shot.id} (--wait)...`));
+            const bootstrap = await generateAndRenderShot({
+              type: "image",
+              prompt: shot.description,
+              outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
+              referenceImageUrl: avatarRef,
+            });
+            lastImageRefLocal = bootstrap.localPath;
+            referenceImageUrl = bootstrap.localPath;
+            console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} Bootstrap pronto → ${path.basename(bootstrap.localPath)}`));
+          } else {
+            console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} Bootstrap img para video ${shot.id} (--wait)...`));
+            const bootstrap = await generateAndRenderShot({
+              type: "image",
+              prompt: shot.description,
+              outPathNoExt: path.join(rendersDir, `${shot.id}__bootstrap`),
+              referenceImageUrl: avatarRef,
+            });
+            lastImageRef = bootstrap.mediaUrl;
+            referenceImageUrl = bootstrap.mediaUrl;
+          }
+        }
+        if (GENTUBE_HF_ASYNC) {
+          const enq = await enqueueRenderShotTracked(projectId, blockNumber, shot.id, {
+            type: shot.type,
+            prompt: shot.description,
+            outPathNoExt: path.join(rendersDir, shot.id),
+            referenceImageUrl,
+          });
+          hfJobTotal += 1;
+          console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} HF enfileirado: ${shot.id} (${shot.type}) → ${enq.hfJobId.slice(0, 8)}...`));
+        } else {
+          console.log(chalk.dim(`  ${blockTag(blockNumber, totalBlocos)} Renderizando ${shot.id} (${shot.type}, --wait)...`));
+          const out = await generateAndRenderShot({
+            type: shot.type,
+            prompt: shot.description,
+            outPathNoExt: path.join(rendersDir, shot.id),
+            referenceImageUrl,
+          });
+          if (shot.type === "image") lastImageRef = out.mediaUrl;
+          done += 1;
+          console.log(chalk.green(`  ${blockTag(blockNumber, totalBlocos)} ${shot.id} concluido (${done}/${plan.shots.length})`));
+          upsertMediaBlock(projectId, blockNumber, { renders_done_count: done });
+        }
       }
     }
 

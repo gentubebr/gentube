@@ -272,6 +272,12 @@ Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes d
 - `gentube status --project <id|slug>`
   - mostra status consolidado e detalhado por bloco
 
+- `gentube copy-cmd --project <id|slug> [--remote-host <host>] [--local-dir <caminho>] [--dry-run]`
+  - gera e imprime o comando `rsync` para copiar a pasta do projeto do servidor remoto para a maquina local
+  - `--remote-host`: host SSH (ex.: `dev-development`). Se omitido, usa `GENTUBE_REMOTE_HOST` do `.env`
+  - `--local-dir`: diretorio local de destino; padrao: mesmo caminho relativo ao workspace
+  - `--dry-run`: adiciona `--dry-run` ao rsync (simula sem copiar)
+
 - `gentube delete-project --project <id|slug> [-y|--yes]`
   - remove projeto completo; sem `--yes`, pede confirmacao dupla; com `--yes`, remove direto (cuidado em producao)
 
