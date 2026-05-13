@@ -18,3 +18,7 @@ data/
 # Projetos de vídeo gerados — no clone a pasta Videos/ fica vazia (só .gitkeep)
 /Videos/*
 !/Videos/.gitkeep
+
+# Transcrições de referência locais (não versionar conteúdo; só .gitkeep no clone)
+/Transcripts/*
+!/Transcripts/.gitkeep

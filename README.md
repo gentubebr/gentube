@@ -76,7 +76,7 @@ npm run rebuild:native
 
 ### Git e ficheiros que **não** vão para o remoto
 
-O repositório público **não** inclui: `.env`, `data/`, pasta **`Avatars/`** (coloque avatares só localmente), conteúdo de **`Videos/`** (só existe `Videos/.gitkeep` no clone), **`scripts/`**, **`EXAMPLE.md`** (runbook local). A pasta **`Template/`** com a estrutura de canal **é** versionada — use-a como modelo ao criar pastas de projeto.
+O repositório público **não** inclui: `.env`, `data/`, pasta **`Avatars/`** (coloque avatares só localmente), conteúdo de **`Videos/`** e de **`Transcripts/`** (só `.gitkeep` em cada pasta no clone), **`scripts/`**, **`EXAMPLE.md`** (runbook local). A pasta **`Template/`** com a estrutura de canal **é** versionada — use-a como modelo ao criar pastas de projeto.
 
 ---
 
@@ -169,7 +169,7 @@ npm run gentube -- create-video --channel 1 \
   --niche "finanças pessoais" \
   --audience "adultos EUA 30+" \
   --blocks 8 \
-  --transcript-file Transcripts/transcript.txt \
+  --transcript-file Transcripts/minha-referencia.txt \
   --mode iterativo
 
 # Apagar um projeto sem prompts (scripts)
@@ -242,8 +242,9 @@ npm start -- --help
   - `05 - Modelagem/` — ex.: `transcript.txt` (transcricao de referência), `Thumbnail_<videoId>.jpg` (thumbnail de referência YouTube)
 - Banco local: `data/gentube.db` (ignorado pelo Git)
 - Template de referência: `Template/[Nome do Canal]/`
+- `Transcripts/` — ficheiros UTF-8 de referência **locais** (não versionados; ver `.gitignore`). Exemplo: `--transcript-file Transcripts/minha-referencia.txt`
 
-Arquivos gerados em `Videos/` e imagens em `Avatars/` **não** são versionados (ver `.gitignore`); no clone o diretório `Videos/` vem vazio. O ficheiro `EXAMPLE.md` também é local-only — use-o como runbook privado.
+Arquivos gerados em `Videos/` e imagens em `Avatars/` **não** são versionados (ver `.gitignore`); no clone o diretório `Videos/` vem vazio. O mesmo vale para o conteúdo de `Transcripts/` (só `.gitkeep` no clone). O ficheiro `EXAMPLE.md` também é local-only — use-o como runbook privado.
 
 ### Produção mista: Higgsfield (IA) + Magnific (stock)
 

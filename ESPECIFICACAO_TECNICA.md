@@ -336,7 +336,7 @@ Politica de versionamento (Git):
 - `Videos/` — apenas `Videos/.gitkeep` no repositorio; projetos gerados e midias ficam locais (ignorados).
 - `Avatars/` — ignorado por completo; avatares nao devem ser commitados nem aparecer no remoto.
 - `scripts/` — ignorado (automacao local).
-- `EXAMPLE.md` — ignorado; runbook pessoal, nunca no remoto.
+- `Transcripts/` — conteúdo local (ignorado no Git; só `Transcripts/.gitkeep` no clone)
 - `Template/` — versionado (estrutura de pastas do canal modelo).
 
 ## 12) Arquitetura tecnica proposta (Node.js)
