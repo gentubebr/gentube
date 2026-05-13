@@ -104,8 +104,8 @@ ${chalk.bold("Exemplos")}
   npm run gentube -- higgsfield:status
   npm run gentube -- higgsfield:generate nano_banana_flash --prompt "..." --aspect_ratio 16:9 --resolution 1k --wait
   GENTUBE_HF_ASYNC=1 npm run gentube -- run-step --project 1 --step imagens
-  npm run gentube -- run-step --project 1 --step thumbnails --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" --avatar-file Avatars/lou02.jpeg --count 2
-  npm run gentube -- run-step --project 1 --step thumbnails --avatar-file Avatars/lou02.jpeg --count 2
+  npm run gentube -- run-step --project 1 --step thumbnails --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" --avatar-file Avatars/seu-avatar.jpg --count 2
+  npm run gentube -- run-step --project 1 --step thumbnails --avatar-file Avatars/seu-avatar.jpg --count 2
   npm run gentube -- higgsfield:sync --project 1
   npm run gentube -- higgsfield:sync --project 1 --watch --interval 20s
   npm run gentube -- copy-cmd --project 1 --remote-host dev-development

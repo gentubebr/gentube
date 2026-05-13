@@ -6,7 +6,15 @@ dist/
 ._.DS_Store
 data/
 
-# Artefatos gerados por projetos de video
-Videos/**/02 - Narracao/*.mp3
-Videos/**/03 - Imagens e Videos/*
-Videos/**/04 - Thumbnails/*
+# Runbook local — não versionar (cada máquina mantém o seu)
+/EXAMPLE.md
+
+# Scripts e automação locais
+/scripts/
+
+# Avatares (imagens locais; não enviar ao remoto)
+/Avatars/
+
+# Projetos de vídeo gerados — no clone a pasta Videos/ fica vazia (só .gitkeep)
+/Videos/*
+!/Videos/.gitkeep

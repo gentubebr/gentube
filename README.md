@@ -11,10 +11,79 @@ CLI em **Node.js** para organizar projetos de vídeo no estilo YouTube: **roteir
 - Áudio por bloco (`block01.mp3`, …) alinhado ao roteiro.
 - Status de cada etapa e de cada bloco gravados localmente (sem depender só de arquivos soltos).
 
-## Requisitos
+## Pré-requisitos: contas, chaves e ferramentas
 
-- [Node.js](https://nodejs.org/) **18+** (recomendado LTS).
-- Contas / chaves: **Anthropic (Claude)** e **ElevenLabs** (ver `.env.example`).
+Antes de clonar o GenTube, reúna o seguinte (sem gravar segredos em ficheiros versionados):
+
+### Anthropic (Claude)
+
+1. Conta em [console.anthropic.com](https://console.anthropic.com/).
+2. Crie uma **API key** e guarde-a; no GenTube use `CLAUDE_API_KEY` no `.env` (ver [`.env.example`](.env.example)).
+3. Opcional: ajuste `CLAUDE_MODEL`, `CLAUDE_MAX_TOKENS`, `CLAUDE_THINKING` conforme a documentação Anthropic.
+
+### ElevenLabs (narração)
+
+1. Conta em [elevenlabs.io](https://elevenlabs.io/) → API keys.
+2. No `.env`: `ELEVENLABS_API_KEY` e `ELEVENLABS_VOICE_ID` (voz desejada).
+3. O comando `elevenlabs:status` exige permissão `user_read` na chave.
+
+### Magnific (stock — imagens e vídeos)
+
+1. Conta / API em [Magnific](https://www.magnific.com/) (documentação da API B2B).
+2. No `.env`: `MAGNIFIC_API_KEY`. Planos sem download premium podem falhar em parte dos assets (o pipeline faz fallback para IA Higgsfield quando aplicável).
+
+### Higgsfield CLI (geração IA imagens/vídeo)
+
+O GenTube chama o binário **`hf`** / **`higgsfield`** (job sets `nano_banana_flash`, `kling3_0`). Instalação típica:
+
+```bash
+# Opção A — pacote npm global (recomendado)
+npm install -g @higgsfield/cli
+
+# Opção B — clonar o repositório oficial e seguir o README do projeto
+git clone https://github.com/higgsfield-ai/cli.git
+cd cli
+# instalar conforme instruções do repositório (npm link, etc.)
+```
+
+Depois faça **login** com o fluxo do próprio CLI (o ficheiro de credenciais costuma ficar em `~/.config/higgsfield/credentials.json`). **Proteja o ficheiro** (contém tokens):
+
+```bash
+chmod 600 ~/.config/higgsfield/credentials.json
+```
+
+No `.env` do GenTube pode definir:
+
+- `HIGGSFIELD_CLI_PATH` — caminho absoluto do executável, se não estiver no `PATH`
+- `HIGGSFIELD_CREDENTIALS_PATH` — se as credenciais estiverem noutro sítio
+- `GENTUBE_HF_ASYNC=1` — enfileira jobs; conclua com `higgsfield:sync`
+
+### Node.js e este repositório
+
+- [Node.js](https://nodejs.org/) **18+** (recomendado LTS **20** ou **22**), **a mesma major** em todas as máquinas onde correr `npm install`.
+- Após `git clone` e `cd gentube`:
+
+```bash
+npm install
+npm run build
+```
+
+Se aparecer erro **NODE_MODULE_VERSION** com `better-sqlite3`, recompile o módulo nativo para a versão do Node atual:
+
+```bash
+npm run rebuild:native
+```
+
+### Git e ficheiros que **não** vão para o remoto
+
+O repositório público **não** inclui: `.env`, `data/`, pasta **`Avatars/`** (coloque avatares só localmente), conteúdo de **`Videos/`** (só existe `Videos/.gitkeep` no clone), **`scripts/`**, **`EXAMPLE.md`** (runbook local). A pasta **`Template/`** com a estrutura de canal **é** versionada — use-a como modelo ao criar pastas de projeto.
+
+---
+
+## Requisitos (resumo)
+
+- Node.js **18+** (recomendado LTS).
+- Chaves e ferramentas listadas acima, conforme as etapas que for usar (roteiro, narração, imagens, thumbnails).
 
 ## Instalação
 
@@ -124,18 +193,18 @@ npm run gentube -- higgsfield:sync --project 1 --watch --interval 30s
 # (A) Com referência de outro canal (baixa thumbnail + avatar → direto ao HF)
 npm run gentube -- run-step --project 1 --step thumbnails \
   --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --avatar-file Avatars/lou02.jpeg \
+  --avatar-file Avatars/seu-avatar.jpg \
   --count 2
 
 # (B) Sem referência (apenas avatar + prompt → HF)
 npm run gentube -- run-step --project 1 --step thumbnails \
-  --avatar-file Avatars/lou02.jpeg \
+  --avatar-file Avatars/seu-avatar.jpg \
   --count 2
 
 # Com prompt customizado
 npm run gentube -- run-step --project 1 --step thumbnails \
   --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --avatar-file Avatars/lou02.jpeg \
+  --avatar-file Avatars/seu-avatar.jpg \
   --prompt "generate a thumbnail with a man pointing at money" \
   --count 2
 
@@ -174,7 +243,7 @@ npm start -- --help
 - Banco local: `data/gentube.db` (ignorado pelo Git)
 - Template de referência: `Template/[Nome do Canal]/`
 
-Arquivos de mídia em `Videos/` costumam ser ignorados pelo Git (veja `.gitignore`).
+Arquivos gerados em `Videos/` e imagens em `Avatars/` **não** são versionados (ver `.gitignore`); no clone o diretório `Videos/` vem vazio. O ficheiro `EXAMPLE.md` também é local-only — use-o como runbook privado.
 
 ### Produção mista: Higgsfield (IA) + Magnific (stock)
 

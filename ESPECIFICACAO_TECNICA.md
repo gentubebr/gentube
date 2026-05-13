@@ -331,6 +331,14 @@ Diretrizes:
 - Nunca logar chaves no terminal
 - Sanitizar erros antes de exibir ao usuario
 
+Politica de versionamento (Git):
+
+- `Videos/` — apenas `Videos/.gitkeep` no repositorio; projetos gerados e midias ficam locais (ignorados).
+- `Avatars/` — ignorado por completo; avatares nao devem ser commitados nem aparecer no remoto.
+- `scripts/` — ignorado (automacao local).
+- `EXAMPLE.md` — ignorado; runbook pessoal, nunca no remoto.
+- `Template/` — versionado (estrutura de pastas do canal modelo).
+
 ## 12) Arquitetura tecnica proposta (Node.js)
 
 ### 12.1 Stack
@@ -595,25 +603,25 @@ Isso elimina a necessidade de Claude analisar a imagem — o Higgsfield interpre
 # (A) Com referencia de outro canal
 npm run gentube -- run-step --project 3 --step thumbnails \
   --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --avatar-file Avatars/lou02.jpeg \
+  --avatar-file Avatars/seu-avatar.jpg \
   --count 2
 
 # (A) Com prompt customizado
 npm run gentube -- run-step --project 3 --step thumbnails \
   --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --avatar-file Avatars/lou02.jpeg \
+  --avatar-file Avatars/seu-avatar.jpg \
   --count 2 \
   --prompt "generate a thumbnail with a man pointing at money symbols"
 
 # (B) Sem referencia
 npm run gentube -- run-step --project 3 --step thumbnails \
-  --avatar-file Avatars/lou02.jpeg \
+  --avatar-file Avatars/seu-avatar.jpg \
   --count 2
 
 # Retry
 npm run gentube -- retry --project 3 --stage thumbnails \
   --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
-  --avatar-file Avatars/lou02.jpeg \
+  --avatar-file Avatars/seu-avatar.jpg \
   --count 2
 ```
 
