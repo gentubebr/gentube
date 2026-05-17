@@ -7,8 +7,78 @@ dotenv.config({ quiet: true });
 export const ROOT_DIR = process.cwd();
 export const VIDEOS_DIR = path.join(ROOT_DIR, "Videos");
 export const TEMPLATE_CHANNEL_DIR = path.join(ROOT_DIR, "Template", "[Nome do Canal]");
-export const PROMPT_MATRIX_PATH = path.join(ROOT_DIR, "Prompts", "matriz.md");
-export const PROMPT_MATRIX02_PATH = path.join(ROOT_DIR, "Prompts", "matriz02.md");
+export const PROMPTS_DIR = path.join(ROOT_DIR, "Prompts");
+/** Caminho fixo do prompt classico (referencia; o pipeline usa `resolvePromptMatrixPath`). */
+export const PROMPT_MATRIX_PATH = path.join(PROMPTS_DIR, "matriz.md");
+export const PROMPT_MATRIX02_PATH = path.join(PROMPTS_DIR, "matriz02.md");
+/** Segmentacao verbatim por cena (schema 2.0). */
+export const PROMPT_SEGMENTA01_PATH = path.join(PROMPTS_DIR, "segmenta01.md");
+/** Direcao visual por cena (schema 2.0). */
+export const PROMPT_VISUALIZA01_PATH = path.join(PROMPTS_DIR, "visualiza01.md");
+/** PNG dummy copiado para renders quando visual.source === manual_capture */
+export const MANUAL_CAPTURE_PLACEHOLDER_PATH = path.join(ROOT_DIR, "src", "assets", "manual_capture", "placeholder.png");
+
+/**
+ * Ficheiro de prompt da etapa roteiro (sob `Prompts/`).
+ * Prioridade: `cliOverride` (`--prompt-matrix`) > `GENTUBE_PROMPT_MATRIX` > `GENTUBE_ROTEIRO_MODE=tutorial` > default `matriz.md`.
+ */
+export function resolvePromptMatrixPath(cliOverride?: string): string {
+  const fromCli = (cliOverride ?? "").trim();
+  const fromEnvMatrix = (process.env.GENTUBE_PROMPT_MATRIX ?? "").trim();
+  const mode = (process.env.GENTUBE_ROTEIRO_MODE ?? "").trim().toLowerCase();
+  const raw =
+    fromCli ||
+    fromEnvMatrix ||
+    (mode === "tutorial" ? "matriz_tutorial.md" : "");
+  const nameIn = raw === "" ? "matriz.md" : raw;
+  const baseName = path.basename(nameIn.replace(/^\.\//, ""));
+  const withMd = baseName.toLowerCase().endsWith(".md") ? baseName : `${baseName}.md`;
+
+  let resolved: string;
+  if (path.isAbsolute(nameIn)) {
+    resolved = path.normalize(nameIn);
+  } else {
+    resolved = path.resolve(PROMPTS_DIR, withMd);
+  }
+
+  const promptsResolved = path.resolve(PROMPTS_DIR);
+  const rel = path.relative(promptsResolved, resolved);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`Prompt de roteiro deve estar dentro de ${PROMPTS_DIR}. Recebido: ${raw || "(vazio)"}`);
+  }
+
+  return resolved;
+}
+
+/**
+ * Ficheiro Markdown com voz e persona do canal (bloco 1 do roteiro).
+ * `cliOverride` ou `GENTUBE_PROMPT_CANAL_VOICE`: nome em Prompts/ ou caminho absoluto sob Prompts/.
+ * `none` ou `-` = nao carregar ficheiro. Desativar injecao: `GENTUBE_ROTEIRO_CANAL_VOICE=0`.
+ */
+export function resolveCanalVoicePath(cliOverride?: string): string | null {
+  if (!roteiroCanalVoiceEnabled()) return null;
+  const raw = (cliOverride ?? process.env.GENTUBE_PROMPT_CANAL_VOICE ?? "").trim();
+  if (["-", "none"].includes(raw.toLowerCase())) return null;
+  const nameIn = raw === "" ? "canal_voice.md" : raw;
+  const baseName = path.basename(nameIn.replace(/^\.\//, ""));
+  const withMd = baseName.toLowerCase().endsWith(".md") ? baseName : `${baseName}.md`;
+
+  let resolved: string;
+  if (path.isAbsolute(nameIn)) {
+    resolved = path.normalize(nameIn);
+  } else {
+    resolved = path.resolve(PROMPTS_DIR, withMd);
+  }
+
+  const promptsResolved = path.resolve(PROMPTS_DIR);
+  const rel = path.relative(promptsResolved, resolved);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`Prompt de voz do canal deve estar dentro de ${PROMPTS_DIR}. Recebido: ${raw || "(vazio)"}`);
+  }
+
+  return resolved;
+}
+
 export const DATA_DIR = path.join(ROOT_DIR, "data");
 export const DB_PATH = path.join(DATA_DIR, "gentube.db");
 
@@ -25,6 +95,34 @@ export const CLAUDE_MAX_TOKENS = Math.max(
 
 /** Modo thinking: "adaptive" | "disabled" | "" (default: "") */
 export const CLAUDE_THINKING = (process.env.CLAUDE_THINKING ?? "").trim().toLowerCase();
+
+/**
+ * Injeta o texto dos blocos 1..N-1 no prompt do roteiro (coesao entre blocos).
+ * Desative com GENTUBE_ROTEIRO_PREV_CONTEXT=0 | false | off.
+ */
+export function roteiroPrevContextEnabled(): boolean {
+  const v = String(process.env.GENTUBE_ROTEIRO_PREV_CONTEXT ?? "1").toLowerCase();
+  return !["0", "false", "no", "off"].includes(v);
+}
+
+/**
+ * Injeta `canal_voice.md` (ou GENTUBE_PROMPT_CANAL_VOICE) so no bloco 1 do roteiro.
+ * Desative com GENTUBE_ROTEIRO_CANAL_VOICE=0 | false | off.
+ */
+export function roteiroCanalVoiceEnabled(): boolean {
+  const v = String(process.env.GENTUBE_ROTEIRO_CANAL_VOICE ?? "1").toLowerCase();
+  return !["0", "false", "no", "off"].includes(v);
+}
+
+/**
+ * Limite de caracteres do contexto cumulativo dos blocos anteriores (0 = sem limite).
+ * Se exceder, mantem-se o fim (blocos mais recentes). Default: 100000.
+ */
+export const ROTEIRO_PREV_CONTEXT_MAX_CHARS = (() => {
+  const raw = process.env.GENTUBE_ROTEIRO_PREV_CONTEXT_CHARS ?? "100000";
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 100_000;
+})();
 export const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY ?? "";
 /** Voice ID padrao quando --voice-id nao e passado no CLI */
 export const ELEVENLABS_VOICE_ID = (process.env.ELEVENLABS_VOICE_ID ?? "").trim();
@@ -62,7 +160,24 @@ export const STOCK_RATIO_OTHER = Math.min(
 );
 
 export const DEFAULT_BLOCKS = 8;
-export const DEFAULT_MAX_VIDEOS_BLOCK1 = 4;
-export const DEFAULT_MAX_IMAGES_BLOCK1 = 6;
-export const DEFAULT_MAX_VIDEOS_OTHER_BLOCKS = 2;
-export const DEFAULT_MAX_IMAGES_OTHER_BLOCKS = 6;
+
+function envNonNegativeInt(key: string, fallback: number): number {
+  const raw = process.env[key]?.trim();
+  if (raw === undefined || raw === "") return fallback;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return n;
+}
+
+/**
+ * Step imagens: caps por bloco (Claude + plano). Padrao bloco 1: 16 videos, 20 imagens.
+ * `.env`: `GENTUBE_MAX_VIDEOS_BLOCK1`, `GENTUBE_MAX_IMAGES_BLOCK1`. Flags CLI `--max-*-block1` tem prioridade sobre o valor efetivo usado na corrida (o fallback do parser e estes exports, ja resolvidos do env).
+ */
+export const DEFAULT_MAX_VIDEOS_BLOCK1 = envNonNegativeInt("GENTUBE_MAX_VIDEOS_BLOCK1", 16);
+export const DEFAULT_MAX_IMAGES_BLOCK1 = envNonNegativeInt("GENTUBE_MAX_IMAGES_BLOCK1", 20);
+/**
+ * Blocos 2..N: padrao 10 videos, 40 imagens.
+ * `.env`: `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS`, `GENTUBE_MAX_IMAGES_OTHER_BLOCKS`.
+ */
+export const DEFAULT_MAX_VIDEOS_OTHER_BLOCKS = envNonNegativeInt("GENTUBE_MAX_VIDEOS_OTHER_BLOCKS", 10);
+export const DEFAULT_MAX_IMAGES_OTHER_BLOCKS = envNonNegativeInt("GENTUBE_MAX_IMAGES_OTHER_BLOCKS", 40);

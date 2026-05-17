@@ -15,10 +15,10 @@ Creative policy:
 Source policy (ai_generated vs stock):
 - Each shot must have a "source" field: "ai_generated" (custom AI render) or "stock" (stock footage/image search).
 - You will receive a "stock_ratio" percentage in the context. This is the target % of shots that should be "stock".
-- Reserve "ai_generated" for the highest-impact moments: the HOOK (opening shot of the block) and the most DRAMATIC/ENIGMATIC moment.
-- Use "stock" for supporting illustrations, transitions, metaphors, and generic scenes that stock footage handles well.
-- If stock_ratio allows more AI shots, distribute them to additional high-impact moments — always prioritize visual impact.
+- If stock_ratio is **below 100**: reserve "ai_generated" for the highest-impact moments (HOOK and the most DRAMATIC/ENIGMATIC beat); use "stock" for supporting illustrations, transitions, metaphors, and generic scenes. If stock_ratio allows more AI shots, distribute them to additional high-impact moments.
+- If stock_ratio is **100**, ignore the previous bullet for hook/drama — follow the rule below instead.
 - Shots with "character_required": true MUST be "ai_generated" (the stock library does not have the channel's avatar).
+- **When stock_ratio is 100:** use source "stock" for **every** shot (hook, drama, transitions, metaphors — all stock). Prefer type "image" when a still suffices; use type "video" only when motion is essential. Set "character_required": false on all shots unless the script **requires** the channel avatar on screen; only those minimal avatar shots may be "ai_generated" with search_keywords null. Do **not** use "ai_generated" for style alone when stock_ratio is 100 — the pipeline will call custom AI only as a fallback if a stock download fails.
 - When source is "stock", include "search_keywords": a concise English search phrase for a stock footage API (e.g. "businessman walking city street", "stock market chart green arrows").
 - When source is "ai_generated", set "search_keywords": null.
 

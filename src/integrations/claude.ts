@@ -26,6 +26,10 @@ export async function generateScriptBlock(input: {
   niche: string;
   audience: string;
   transcript?: string;
+  /** Voz/persona do canal — tipicamente bloco 1; opcional. */
+  channelVoiceContext?: string;
+  /** Texto dos blocos anteriores (1..N-1) para continuidade; opcional. */
+  previousBlocksText?: string;
   blockNumber: number;
   totalBlocks: number;
 }): Promise<string> {
@@ -36,11 +40,29 @@ export async function generateScriptBlock(input: {
     .replaceAll("[PUBLICO]", input.audience)
     .replace(/dividido em \d+ blocos/i, `dividido em ${input.totalBlocks} blocos`);
 
+  const channelVoiceSection = input.channelVoiceContext?.trim()
+    ? `
+VOZ E PERSONA DO CANAL (aplique em todo este bloco; alinha tom e promessa com a matriz acima — nao contradizer regras de formato nem idioma do roteiro):
+---
+${input.channelVoiceContext.trim()}
+---
+`.trim()
+    : "";
+
   const referenceBlock = input.transcript
     ? `
 REFERENCIA (video ou transcricao similar — use apenas estrutura, ritmo e mensagens-chave; NAO copie frases nem paragrafos; utilize-o como modelagem apenas; caso seja necessario, reescreva com voz, tom e estilo original do roteiro):
 ---
 ${input.transcript}
+---
+`.trim()
+    : "";
+
+  const previousBlocksSection = input.previousBlocksText?.trim()
+    ? `
+ROTEIRO JA GERADO (blocos anteriores — use apenas para manter coerencia de tom, referencias e continuidade logica; NAO repetir nem parafrasear longamente o que ja foi dito; nao voltar ao hook inicial; produza somente o material novo do bloco ${input.blockNumber}):
+---
+${input.previousBlocksText.trim()}
 ---
 `.trim()
     : "";
@@ -57,12 +79,12 @@ FORMATO OBRIGATORIO DA RESPOSTA (o pipeline e automatico; nao simule chat):
   const userPrompt = `
 ${formattedPrompt}
 
-Titulo do video: ${input.title}
+${channelVoiceSection ? `${channelVoiceSection}\n\n` : ""}Titulo do video: ${input.title}
 Quantidade total de blocos: ${input.totalBlocks}
 Gere apenas o bloco ${input.blockNumber} de ${input.totalBlocks}.
 
 ${formatRules}
-${referenceBlock ? `${referenceBlock}` : ""}
+${previousBlocksSection ? `${previousBlocksSection}\n\n` : ""}${referenceBlock ? `${referenceBlock}` : ""}
 `.trim();
 
   const createParams: MessageCreateParamsNonStreaming = {
@@ -156,5 +178,107 @@ Respect the stock_ratio for source distribution.
     throw new Error(`Claude retornou plano vazio para bloco ${input.blockNumber}`);
   }
   return text;
+}
+
+export async function generateSegmentationPlanJson(input: {
+  promptBase: string;
+  blockNumber: number;
+  totalBlocks: number;
+  blockText: string;
+  maxScenes: number;
+}): Promise<string> {
+  const anthropic = getClient();
+  const userPrompt = `
+${input.promptBase}
+
+Context:
+- block_number: ${input.blockNumber}
+- total_blocks: ${input.totalBlocks}
+- max_scenes_for_this_block: ${input.maxScenes}
+- block_text:
+---
+${input.blockText}
+---
+
+Return ONLY JSON following segmenta01 schema (schema_version "2.0-segmentation", stage "segmentation").
+`.trim();
+
+  const createParams: MessageCreateParamsNonStreaming = {
+    model: CLAUDE_MODEL,
+    max_tokens: CLAUDE_MAX_TOKENS,
+    messages: [{ role: "user" as const, content: userPrompt }],
+  };
+
+  if (CLAUDE_THINKING === "adaptive") {
+    (createParams as MessageCreateParamsNonStreaming & { thinking: unknown }).thinking = { type: "adaptive" };
+  } else {
+    createParams.temperature = 0.35;
+  }
+
+  const response = await anthropic.messages.create(createParams);
+  const textOut = response.content
+    .filter((part: { type: string }) => part.type === "text")
+    .map((part) => ("text" in part ? part.text : ""))
+    .join("\n")
+    .trim();
+
+  if (!textOut) throw new Error(`Claude retornou segmentacao vazia para bloco ${input.blockNumber}`);
+  return textOut;
+}
+
+export async function generateVisualizationPlanJson(input: {
+  promptBase: string;
+  blockNumber: number;
+  totalBlocks: number;
+  audience: string;
+  stockRatio: number;
+  manualCaptureSignals: string[];
+  segmentationJson: string;
+  maxVideos: number;
+  maxImages: number;
+}): Promise<string> {
+  const anthropic = getClient();
+  const signals =
+    input.manualCaptureSignals.length > 0
+      ? JSON.stringify(input.manualCaptureSignals)
+      : "[]";
+  const userPrompt = `
+${input.promptBase}
+
+Context:
+- block_number: ${input.blockNumber}
+- total_blocks: ${input.totalBlocks}
+- audience: ${input.audience}
+- stock_ratio: ${input.stockRatio}
+- manual_capture_signals: ${signals}
+- max_videos_for_this_block: ${input.maxVideos} — HARD CAP: count of scenes with visual.type "video" must be ≤ this number.
+- max_images_for_this_block: ${input.maxImages} — HARD CAP: count of scenes with visual.type "image" must be ≤ this number.
+- scenes (segmentation output — copy narration fields verbatim in output):
+${input.segmentationJson}
+
+Return ONLY JSON following visualiza01 schema (schema_version "2.0-visualization").
+`.trim();
+
+  const createParams: MessageCreateParamsNonStreaming = {
+    model: CLAUDE_MODEL,
+    max_tokens: CLAUDE_MAX_TOKENS,
+    messages: [{ role: "user" as const, content: userPrompt }],
+  };
+
+  if (CLAUDE_THINKING === "adaptive") {
+    (createParams as MessageCreateParamsNonStreaming & { thinking: unknown }).thinking = { type: "adaptive" };
+  } else {
+    createParams.temperature = 0.35;
+  }
+
+  const response = await anthropic.messages.create(createParams);
+  const textOut = response.content
+    .filter((part: { type: string }) => part.type === "text")
+    .map((part) => ("text" in part ? part.text : ""))
+    .join("\n")
+    .trim();
+
+  if (!textOut) throw new Error(`Claude retornou visualizacao vazia para bloco ${input.blockNumber}`);
+  return textOut;
 }
 

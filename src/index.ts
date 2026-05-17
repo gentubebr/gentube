@@ -25,6 +25,7 @@ import {
   deleteProject,
   getProjectByIdOrSlug,
   listChannels,
+  listProjectsSummary,
 } from "./repository.js";
 import { runInit } from "./init-setup.js";
 import {
@@ -37,6 +38,8 @@ import {
   runThumbnails,
 } from "./services/pipeline.js";
 import { syncHiggsfieldCliJobsOnce } from "./services/hf-cli-sync.js";
+import { syncProjectFromDisk, type SyncFromDiskScope } from "./services/sync-from-disk.js";
+import { writeShotListManualFiles } from "./services/shot-list-manual.js";
 import { ensureDir, ensureTemplateStructure, formatDateYYYYMMDD, toSlug, writeModelagemTranscript } from "./utils/fs.js";
 import { Step3Limits } from "./types/step3-limits.js";
 import {
@@ -95,8 +98,11 @@ program.addHelpText(
 ${chalk.bold("Exemplos")}
   npm run gentube -- init
   npm run gentube -- channel:list
+  npm run gentube -- projects:list
   npm run gentube -- create-video
   npm run gentube -- run-step --project 1 --step roteiro
+  npm run gentube -- run-step --project 1 --step roteiro --prompt-matrix matriz_tutorial.md
+  npm run gentube -- run-step --project 1 --step roteiro --prompt-canal-voice canal_voice.md
   npm run gentube -- run-all --project 1
   npm run gentube -- status --project 20260508-meu-video
   npm run gentube -- retry --project 1 --stage narracao --block 2
@@ -104,12 +110,15 @@ ${chalk.bold("Exemplos")}
   npm run gentube -- higgsfield:status
   npm run gentube -- higgsfield:generate nano_banana_flash --prompt "..." --aspect_ratio 16:9 --resolution 1k --wait
   GENTUBE_HF_ASYNC=1 npm run gentube -- run-step --project 1 --step imagens
+  npm run gentube -- run-step --project 1 --step imagens --max-videos-block1 8 --max-images-block1 12
   npm run gentube -- run-step --project 1 --step thumbnails --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" --avatar-file Avatars/seu-avatar.jpg --count 2
   npm run gentube -- run-step --project 1 --step thumbnails --avatar-file Avatars/seu-avatar.jpg --count 2
   npm run gentube -- higgsfield:sync --project 1
   npm run gentube -- higgsfield:sync --project 1 --watch --interval 20s
   npm run gentube -- copy-cmd --project 1 --remote-host dev-development
   npm run gentube -- copy-cmd --project 1
+  npm run gentube -- sync-from-disk --project 6 --dry-run
+  npm run gentube -- sync-from-disk --project 6 --only roteiro
 
 ${chalk.bold("Documentacao")}  README.md  ·  ESPECIFICACAO_TECNICA.md
 `.trimStart()
@@ -153,6 +162,69 @@ program
     });
   });
 
+program
+  .command("projects:list")
+  .description("Lista canais e projetos de video registados no SQLite (por canal)")
+  .option("--json", "Saida em JSON (canais com array projects)")
+  .action((opts: { json?: boolean }) => {
+    const channels = listChannels();
+    const projects = listProjectsSummary();
+    const byChannel = new Map<number, typeof projects>();
+    for (const p of projects) {
+      const arr = byChannel.get(p.channel_id) ?? [];
+      arr.push(p);
+      byChannel.set(p.channel_id, arr);
+    }
+
+    if (opts.json) {
+      const payload = channels.map((c) => ({
+        id: c.id,
+        nome_canal: c.nome_canal,
+        slug_canal: c.slug_canal,
+        base_path: c.base_path,
+        projects: (byChannel.get(c.id) ?? []).map((p) => ({
+          id: p.id,
+          titulo: p.titulo,
+          slug: p.slug,
+          data_projeto: p.data_projeto,
+          project_path: p.project_path,
+          total_blocos: p.total_blocos,
+          status_roteiro: p.status_roteiro,
+          status_narracao: p.status_narracao,
+          status_imagens_videos: p.status_imagens_videos,
+          status_thumbnails: p.status_thumbnails,
+        })),
+      }));
+      console.log(JSON.stringify(payload, null, 2));
+      return;
+    }
+
+    if (channels.length === 0) {
+      console.log(chalk.yellow("Nenhum canal cadastrado."));
+      return;
+    }
+
+    console.log(chalk.cyan.bold("Canais e projetos"));
+    for (const c of channels) {
+      console.log("");
+      console.log(chalk.cyan(`Canal [${c.id}] ${c.nome_canal} (${c.slug_canal})`));
+      console.log(chalk.dim(`  ${c.base_path}`));
+      const list = byChannel.get(c.id) ?? [];
+      if (list.length === 0) {
+        console.log(chalk.dim("  (nenhum projeto)"));
+        continue;
+      }
+      for (const p of list) {
+        const st = `${p.status_roteiro} | ${p.status_narracao} | ${p.status_imagens_videos} | ${p.status_thumbnails}`;
+        console.log(
+          `  - [${p.id}] ${p.titulo}  ${chalk.dim(`(${p.slug})`)}  ${chalk.dim(`${p.total_blocos} blocos`)}  ${chalk.dim(st)}`
+        );
+        console.log(chalk.dim(`      ${p.project_path}`));
+      }
+    }
+    console.log("");
+  });
+
 type CreateVideoCliOptions = {
   channel?: string;
   title?: string;
@@ -162,6 +234,8 @@ type CreateVideoCliOptions = {
   transcriptFile?: string;
   transcriptText?: string;
   mode?: string;
+  promptMatrix?: string;
+  promptCanalVoice?: string;
 };
 
 program
@@ -171,7 +245,7 @@ program
   )
   .option("--channel <id>", "ID do canal (channel:list). Sem flag, abre menu")
   .option("--title <texto>", "Titulo do video")
-  .option("--niche <texto>", "Nicho ([NOME DO NICHO] no matriz.md)")
+  .option("--niche <texto>", "Nicho ([NOME DO NICHO] no prompt de roteiro)")
   .option("--audience <texto>", "Publico alvo ([PUBLICO])")
   .option("--blocks <n>", `Quantidade de blocos (1-64; padrao interativo: ${DEFAULT_BLOCKS})`)
   .option(
@@ -183,6 +257,14 @@ program
     "Mesmo papel de --transcript-file, em uma linha (textos longos: prefira arquivo)"
   )
   .option("--mode <modo>", "Apos criar: iterativo | sequencial (sem flag, pergunta)")
+  .option(
+    "--prompt-matrix <ficheiro>",
+    "Prompt da etapa roteiro: nome em Prompts/ (ex.: matriz_tutorial.md) ou caminho absoluto sob Prompts/. Sobrescreve GENTUBE_PROMPT_MATRIX"
+  )
+  .option(
+    "--prompt-canal-voice <ficheiro>",
+    "Bloco 1: voz/persona do canal (Markdown em Prompts/; padrao canal_voice.md). Sobrescreve GENTUBE_PROMPT_CANAL_VOICE; use none para nao injetar"
+  )
   .action(async (opts: CreateVideoCliOptions) => {
     const channels = listChannels();
     if (channels.length === 0) {
@@ -318,7 +400,7 @@ program
     if (!project) throw new Error("Projeto recem-criado nao encontrado");
 
     if (mode === "sequencial") {
-      await executeAll(project);
+      await executeAll(project, undefined, opts.promptMatrix, opts.promptCanalVoice);
     } else {
       console.log(chalk.cyan("Projeto criado. Use run-step para executar as etapas."));
     }
@@ -340,6 +422,15 @@ program
   .option("--max-images-block1 <n>", `Max imagens bloco 1 (padrao ${DEFAULT_MAX_IMAGES_BLOCK1})`)
   .option("--max-videos-other <n>", `Max videos blocos 2..N (padrao ${DEFAULT_MAX_VIDEOS_OTHER_BLOCKS})`)
   .option("--max-images-other <n>", `Max imagens blocos 2..N (padrao ${DEFAULT_MAX_IMAGES_OTHER_BLOCKS})`)
+  .option(
+    "--prompt-matrix <ficheiro>",
+    "Step roteiro: ficheiro em Prompts/ (ex.: matriz_tutorial.md) ou caminho absoluto sob Prompts/. Sobrescreve GENTUBE_PROMPT_MATRIX"
+  )
+  .option(
+    "--prompt-canal-voice <ficheiro>",
+    "Step roteiro bloco 1: voz do canal (Prompts/; padrao canal_voice.md). Sobrescreve GENTUBE_PROMPT_CANAL_VOICE"
+  )
+  .option("--scene-plan-v2", "Step imagens: plano por cenas (Claude em 2 passos, schema 2.0)")
   .action(async (options: {
     project: string;
     step: "roteiro" | "narracao" | "imagens" | "thumbnails";
@@ -352,17 +443,20 @@ program
     maxImagesBlock1?: string;
     maxVideosOther?: string;
     maxImagesOther?: string;
+    promptMatrix?: string;
+    promptCanalVoice?: string;
+    scenePlanV2?: boolean;
   }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
 
     if (options.step === "roteiro") {
-      await executeRoteiro(project);
+      await executeRoteiro(project, options.promptMatrix, options.promptCanalVoice);
       return;
     }
     if (options.step === "imagens") {
       const limits = parseStep3Limits(options);
-      await executeImagens(project, options.avatarFile, limits);
+      await executeImagens(project, options.avatarFile, limits, options.scenePlanV2);
       return;
     }
     if (options.step === "thumbnails") {
@@ -378,11 +472,60 @@ program
   .description("Pipeline completo: roteiro todos os blocos, depois narracao (mesma ordem que create-video sequencial)")
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto em video_projects")
   .option("--voice-id <id>", "Voice ElevenLabs (ou .env ELEVENLABS_VOICE_ID)")
-  .action(async (options: { project: string; voiceId?: string }) => {
+  .option(
+    "--prompt-matrix <ficheiro>",
+    "Roteiro: ficheiro em Prompts/ (ex.: matriz_tutorial.md). Sobrescreve GENTUBE_PROMPT_MATRIX"
+  )
+  .option(
+    "--prompt-canal-voice <ficheiro>",
+    "Roteiro bloco 1: voz do canal (Prompts/). Sobrescreve GENTUBE_PROMPT_CANAL_VOICE"
+  )
+  .action(async (options: { project: string; voiceId?: string; promptMatrix?: string; promptCanalVoice?: string }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
     const voiceId = await resolveVoiceId(options.voiceId);
-    await executeAll(project, voiceId);
+    await executeAll(project, voiceId, options.promptMatrix, options.promptCanalVoice);
+  });
+
+program
+  .command("sync-from-disk")
+  .description(
+    "Alinha o SQLite com ficheiros ja existentes no disco (roteiro .md, narracao .mp3, imagens plano+renders). Ver README / ESPECIFICACAO secao 21"
+  )
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .option("--dry-run", "Lista alteracoes sem escrever no SQLite")
+  .option("--force", "Reimportar blocos que ja estao success no DB")
+  .option("--only <escopo>", "roteiro | narracao | imagens | all (default: all)", "all")
+  .action(
+    async (opts: { project: string; dryRun?: boolean; force?: boolean; only?: string }) => {
+      const allowed: SyncFromDiskScope[] = ["roteiro", "narracao", "imagens", "all"];
+      const onlyRaw = (opts.only ?? "all").trim().toLowerCase();
+      if (!allowed.includes(onlyRaw as SyncFromDiskScope)) {
+        throw new Error(`--only deve ser um de: ${allowed.join(", ")}`);
+      }
+      const project = getProjectByIdOrSlug(opts.project);
+      if (!project) throw new Error("Projeto nao encontrado");
+      const report = await syncProjectFromDisk(project, {
+        dryRun: Boolean(opts.dryRun),
+        force: Boolean(opts.force),
+        only: onlyRaw as SyncFromDiskScope,
+      });
+      console.log(chalk.dim("\nResumo (JSON):"));
+      console.log(JSON.stringify(report, null, 2));
+    }
+  );
+
+program
+  .command("shot-list-manual")
+  .description("Gera shot_list_manual.md e shot_list_manual.csv (capturas manuais) a partir de block*.assets.json schema 2.0")
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .action(async (opts: { project: string }) => {
+    const project = getProjectByIdOrSlug(opts.project);
+    if (!project) throw new Error("Projeto nao encontrado");
+    const out = await writeShotListManualFiles(String(project.project_path));
+    console.log(chalk.green(`Shot list manual: ${out.totalCaptures} captura(s).`));
+    console.log(chalk.dim(out.mdPath));
+    console.log(chalk.dim(out.csvPath));
   });
 
 program
@@ -629,6 +772,15 @@ program
   .option("--max-images-block1 <n>", `Max imagens bloco 1 (padrao ${DEFAULT_MAX_IMAGES_BLOCK1})`)
   .option("--max-videos-other <n>", `Max videos blocos 2..N (padrao ${DEFAULT_MAX_VIDEOS_OTHER_BLOCKS})`)
   .option("--max-images-other <n>", `Max imagens blocos 2..N (padrao ${DEFAULT_MAX_IMAGES_OTHER_BLOCKS})`)
+  .option(
+    "--prompt-matrix <ficheiro>",
+    "Stage roteiro: ficheiro em Prompts/ (ex.: matriz_tutorial.md). Sobrescreve GENTUBE_PROMPT_MATRIX"
+  )
+  .option(
+    "--prompt-canal-voice <ficheiro>",
+    "Stage roteiro bloco 1: voz do canal (Prompts/). Sobrescreve GENTUBE_PROMPT_CANAL_VOICE"
+  )
+  .option("--scene-plan-v2", "Stage imagens: plano por cenas (schema 2.0)")
   .action(
     async (options: {
       project: string;
@@ -643,6 +795,9 @@ program
       maxImagesBlock1?: string;
       maxVideosOther?: string;
       maxImagesOther?: string;
+      promptMatrix?: string;
+      promptCanalVoice?: string;
+      scenePlanV2?: boolean;
     }) => {
       const project = getProjectByIdOrSlug(options.project);
       if (!project) throw new Error("Projeto nao encontrado");
@@ -657,18 +812,18 @@ program
 
       if (options.stage === "roteiro") {
         if (blockNumber !== undefined) {
-          await executeRoteiroBlock(project, blockNumber);
+          await executeRoteiroBlock(project, blockNumber, options.promptMatrix, options.promptCanalVoice);
         } else {
-          await executeRoteiro(project);
+          await executeRoteiro(project, options.promptMatrix, options.promptCanalVoice);
         }
         return;
       }
       if (options.stage === "imagens") {
         const limits = parseStep3Limits(options);
         if (blockNumber !== undefined) {
-          await executeImagensBlock(project, blockNumber, options.avatarFile, limits);
+          await executeImagensBlock(project, blockNumber, options.avatarFile, limits, options.scenePlanV2);
         } else {
-          await executeImagens(project, options.avatarFile, limits);
+          await executeImagens(project, options.avatarFile, limits, options.scenePlanV2);
         }
         return;
       }
@@ -686,10 +841,18 @@ program
     }
   );
 
-async function executeRoteiro(project: ProjectRow): Promise<void> {
+function resolveScenePlanV2(cliFlag?: boolean): boolean {
+  if (cliFlag === true) return true;
+  return ["1", "true", "yes"].includes(String(process.env.GENTUBE_SCENE_PLAN_V2 ?? "").toLowerCase());
+}
+
+async function executeRoteiro(project: ProjectRow, promptMatrix?: string, promptCanalVoice?: string): Promise<void> {
   const spinner = ora("Gerando roteiro...").start();
   try {
-    await runRoteiro(project);
+    await runRoteiro(project, {
+      promptMatrix: promptMatrix?.trim() || undefined,
+      promptCanalVoice: promptCanalVoice?.trim() || undefined,
+    });
     spinner.succeed("Roteiro gerado com sucesso.");
   } catch (error) {
     spinner.fail("Falha na geracao do roteiro.");
@@ -708,10 +871,17 @@ async function executeNarracao(project: ProjectRow, voiceId: string): Promise<vo
   }
 }
 
-async function executeImagens(project: ProjectRow, avatarFile?: string, limits?: Step3Limits): Promise<void> {
+async function executeImagens(
+  project: ProjectRow,
+  avatarFile?: string,
+  limits?: Step3Limits,
+  scenePlanV2Cli?: boolean,
+): Promise<void> {
   try {
     const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
-    await runImagensVideos(project, avatarAbs, limits);
+    await runImagensVideos(project, avatarAbs, limits, {
+      scenePlanV2: resolveScenePlanV2(scenePlanV2Cli),
+    });
     console.log(chalk.green.bold("Step 3 (imagens/videos) concluido com sucesso."));
   } catch (error) {
     console.log(chalk.red.bold("Falha no step 3 (imagens/videos)."));
@@ -719,10 +889,18 @@ async function executeImagens(project: ProjectRow, avatarFile?: string, limits?:
   }
 }
 
-async function executeRoteiroBlock(project: ProjectRow, blockNumber: number): Promise<void> {
+async function executeRoteiroBlock(
+  project: ProjectRow,
+  blockNumber: number,
+  promptMatrix?: string,
+  promptCanalVoice?: string
+): Promise<void> {
   const spinner = ora(`Gerando roteiro — bloco ${blockNumber}...`).start();
   try {
-    await runRoteiroBlock(project, blockNumber);
+    await runRoteiroBlock(project, blockNumber, {
+      promptMatrix: promptMatrix?.trim() || undefined,
+      promptCanalVoice: promptCanalVoice?.trim() || undefined,
+    });
     spinner.succeed(`Bloco ${blockNumber} do roteiro gerado.`);
   } catch (error) {
     spinner.fail(`Falha no bloco ${blockNumber} do roteiro.`);
@@ -758,10 +936,18 @@ async function executeThumbnails(
   }
 }
 
-async function executeImagensBlock(project: ProjectRow, blockNumber: number, avatarFile?: string, limits?: Step3Limits): Promise<void> {
+async function executeImagensBlock(
+  project: ProjectRow,
+  blockNumber: number,
+  avatarFile?: string,
+  limits?: Step3Limits,
+  scenePlanV2Cli?: boolean,
+): Promise<void> {
   try {
     const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
-    await runImagensVideosBlock(project, blockNumber, avatarAbs, limits);
+    await runImagensVideosBlock(project, blockNumber, avatarAbs, limits, {
+      scenePlanV2: resolveScenePlanV2(scenePlanV2Cli),
+    });
     console.log(chalk.green.bold(`Step 3 do bloco ${blockNumber} concluido.`));
   } catch (error) {
     console.log(chalk.red.bold(`Falha no step 3 do bloco ${blockNumber}.`));
@@ -784,6 +970,7 @@ function parseStep3Limits(options: {
   maxVideosOther?: string;
   maxImagesOther?: string;
 }): Step3Limits {
+  // Fallbacks DEFAULT_* leem GENTUBE_MAX_* no .env (src/config.ts). Flags CLI substituem quando passadas.
   const parsed: Step3Limits = {
     maxVideosBlock1: parsePositiveInt(options.maxVideosBlock1, DEFAULT_MAX_VIDEOS_BLOCK1, "--max-videos-block1"),
     maxImagesBlock1: parsePositiveInt(options.maxImagesBlock1, DEFAULT_MAX_IMAGES_BLOCK1, "--max-images-block1"),
@@ -796,8 +983,13 @@ function parseStep3Limits(options: {
   return parsed;
 }
 
-async function executeAll(project: ProjectRow, voiceIdFromArg?: string): Promise<void> {
-  await executeRoteiro(project);
+async function executeAll(
+  project: ProjectRow,
+  voiceIdFromArg?: string,
+  promptMatrix?: string,
+  promptCanalVoice?: string
+): Promise<void> {
+  await executeRoteiro(project, promptMatrix, promptCanalVoice);
   const voiceId = await resolveVoiceId(voiceIdFromArg);
   const updatedProject = getProjectByIdOrSlug(String(project.id));
   if (!updatedProject) throw new Error("Projeto nao encontrado apos etapa de roteiro");

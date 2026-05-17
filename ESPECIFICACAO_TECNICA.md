@@ -80,8 +80,8 @@ O CLI deve ser amigavel, visual e objetivo:
 ### 4.1 Obrigatorias
 
 - Titulo do video
-- Nome do nicho (substitui `[NOME DO NICHO]` em `Prompts/matriz.md`)
-- Publico alvo (substitui `[PUBLICO]` em `Prompts/matriz.md`)
+- Nome do nicho (substitui `[NOME DO NICHO]` no prompt de roteiro em uso — por omissão `Prompts/matriz.md`)
+- Publico alvo (substitui `[PUBLICO]` no prompt de roteiro em uso — por omissão `Prompts/matriz.md`)
 
 ### 4.2 Opcionais
 
@@ -110,7 +110,12 @@ O CLI deve ser amigavel, visual e objetivo:
 
 ### 6.1 Requisitos
 
-- Usar prompt base `Prompts/matriz.md`
+- Prompt de roteiro: ficheiro **Markdown** sob `Prompts/`, escolhido por `resolvePromptMatrixPath()` em `src/config.ts`:
+  - **Prioridade:** `--prompt-matrix` (CLI) > `GENTUBE_PROMPT_MATRIX` > `GENTUBE_ROTEIRO_MODE=tutorial` > default **`matriz.md`**.
+  - **Padrão dissertativo:** `Prompts/matriz.md` quando nada acima fixa outro ficheiro.
+  - **Modo tutorial:** defina `GENTUBE_ROTEIRO_MODE=tutorial` **e** deixe `GENTUBE_PROMPT_MATRIX` vazio (ou use explicitamente `GENTUBE_PROMPT_MATRIX=matriz_tutorial.md` / `--prompt-matrix matriz_tutorial.md`).
+  - **Alternativa explícita:** `Prompts/matriz_tutorial.md` via `GENTUBE_PROMPT_MATRIX` ou `--prompt-matrix` nos comandos que geram roteiro.
+  - O ficheiro deve resolver para um caminho **dentro** de `Prompts/` (segurança).
 - Injetar: titulo, nicho, publico, transcricao opcional e quantidade de blocos
 - Numero de blocos no prompt e substituido dinamicamente (`.replace(/dividido em \d+ blocos/i, ...)`)
 - Modelo, max_tokens e thinking sao configurados via `.env`:
@@ -121,6 +126,20 @@ O CLI deve ser amigavel, visual e objetivo:
 ### 6.1.1 Retomada inteligente (skip de blocos concluidos)
 
 Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes de processar. Se o bloco ja tem `status = "success"` no SQLite, ele e pulado com log informativo. Isso evita desperdicio de creditos (Claude/ElevenLabs) ao reexecutar apos uma interrupcao parcial.
+
+### 6.1.2 `matriz_tutorial.md` (tutorial / aula)
+
+- Ficheiro **`Prompts/matriz_tutorial.md`**: roteiro no estilo **tutorial** (roadmap, módulos, voz-over alinhável a demonstração no ecrã), em contraste com o tom “conversa profunda / narrativa” de `matriz.md`.
+- **Seleção:** ordem em `resolvePromptMatrixPath`: `--prompt-matrix` > `GENTUBE_PROMPT_MATRIX` > `GENTUBE_ROTEIRO_MODE=tutorial` (usa `matriz_tutorial.md`) > default `matriz.md`.
+- **Comandos:** `create-video` (quando `--mode sequencial`), `run-step --step roteiro`, `run-all`, `retry --stage roteiro` (etapa inteira ou `--block N`).
+- **Registo:** ao iniciar roteiro, `project_logs` grava o caminho relativo do prompt usado.
+- **Requisitos partilhados:** placeholders `[NOME DO NICHO]` e `[PUBLICO]`, saída em inglês, mesmas regras em `blockXX.md` (sem perguntas meta; `sanitizeScriptBlockContent`).
+
+### 6.1.3 Voz do canal (bloco 1) e coesão entre blocos
+
+- **`Prompts/canal_voice.md`** (ou outro ficheiro em `Prompts/`): texto fixo de **persona, tom e promessa do canal**, injetado no pedido ao Claude **apenas quando `block_number === 1`**, independentemente de usar `matriz.md` ou `matriz_tutorial.md`. Implementação: `resolveCanalVoicePath()` + `loadCanalVoiceForBlock1` em `src/services/pipeline.ts`, secção `channelVoiceContext` em `src/integrations/claude.ts`.
+- **Seleção / desativação:** `GENTUBE_PROMPT_CANAL_VOICE` (nome ou caminho sob `Prompts/`), `--prompt-canal-voice` nos comandos de roteiro (`create-video` modo sequencial, `run-step --step roteiro`, `run-all`, `retry --stage roteiro`); valor `none` ou `-` não carrega ficheiro; `GENTUBE_ROTEIRO_CANAL_VOICE=0` desliga a funcionalidade.
+- **Blocos 2..N — texto dos blocos anteriores:** antes de gerar o bloco *N*, o pipeline lê `01 - Roteiro/block01.md` … `block(N-1).md` e envia como contexto opcional (`previousBlocksText`). `GENTUBE_ROTEIRO_PREV_CONTEXT=0` desativa; `GENTUBE_ROTEIRO_PREV_CONTEXT_CHARS` limita o tamanho (default `100000`; `0` = ilimitado; truncagem mantém o fim).
 
 ### 6.2 Saida
 
@@ -171,7 +190,7 @@ Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes d
 
 ## 7A) Etapa 3 - Imagens e videos (visao geral)
 
-- **Direcao**: Claude le `01 - Roteiro/blockXX.md` e grava o plano em `03 - Imagens e Videos/blockXX.assets.json` (ver secao 18). Cada shot e marcado com `source: "ai_generated"` ou `source: "stock"` conforme proporcao configurada.
+- **Direcao**: Claude le `01 - Roteiro/blockXX.md` e grava o plano em `03 - Imagens e Videos/blockXX.assets.json` (ver secao 18). Modo **classico**: um JSON com `shots[]`; cada shot usa `source: "ai_generated"` ou `source: "stock"` conforme proporcao. Modo **`--scene-plan-v2` / `GENTUBE_SCENE_PLAN_V2`**: dois pedidos Claude (`segmenta01.md`, `visualiza01.md`), JSON com `schema_version: "2.0"` e `scenes[]`; cada cena pode usar `source` em `ai_generated`, `stock` ou `manual_capture` (placeholder PNG no repo ate gravacao).
 - **Producao mista**:
   - Shots `ai_generated` → Higgsfield (`hf generate create`)
   - Shots `stock` → API Magnific (busca por `search_keywords` + download)
@@ -234,6 +253,8 @@ Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes d
     - `--transcript-text <texto>` — mesmo papel em uma linha (textos longos: usar arquivo)
     - nao usar `transcript-file` e `transcript-text` juntos
     - `--mode iterativo|sequencial`
+    - `--prompt-matrix <ficheiro>` — prompt da etapa roteiro (`Prompts/…`; sobrescreve `GENTUBE_PROMPT_MATRIX`; relevante se `--mode sequencial`)
+    - `--prompt-canal-voice <ficheiro>` — voz do canal para o **bloco 1** (`Prompts/…`; default `canal_voice.md`; `none` não injeta; sobrescreve `GENTUBE_PROMPT_CANAL_VOICE`)
 
 - `gentube channel:create`
   - cadastra um novo canal para organizar os videos
@@ -241,13 +262,19 @@ Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes d
 - `gentube channel:list`
   - lista canais cadastrados
 
-- `gentube run-step --project <id|slug> --step <roteiro|narracao|imagens|thumbnails>`
+- `gentube projects:list [--json]`
+  - lista **canais** e, sob cada um, os **projetos** (`video_projects`): id do projeto, titulo, slug, blocos, estados das etapas e caminho da pasta
+  - `--json`: saida estruturada (array de canais com `projects[]`) para scripts
+
+- `gentube run-step --project <id|slug> --step <roteiro|narracao|imagens|thumbnails> [--prompt-matrix <ficheiro>] [--prompt-canal-voice <ficheiro>]`
   - executa uma unica etapa
-  - **imagens**: direcao (Claude -> `blockXX.assets.json`) + producao (CLI `hf generate create`). Com `GENTUBE_HF_ASYNC=1` (`true`/`yes`), a producao enfileira jobs sem `--wait`; o usuario deve rodar `higgsfield:sync` para poll/download.
+  - **roteiro**: `--prompt-matrix` escolhe o ficheiro em `Prompts/` (padrao `matriz.md`); `--prompt-canal-voice` define o Markdown de voz do canal no **bloco 1** (padrao `canal_voice.md` quando a funcionalidade esta ativa)
+  - **imagens**: direcao (Claude -> `blockXX.assets.json`) + producao (CLI `hf generate create`). Com `GENTUBE_HF_ASYNC=1` (`true`/`yes`), a producao enfileira jobs sem `--wait`; o usuario deve rodar `higgsfield:sync` para poll/download. Limites de videos/imagens por bloco: ver **18.2.1** e **18.7.1** (`.env` + flags `--max-*`).
   - **thumbnails**: baixa referencia YouTube (se `--reference-url`), envia imagens + prompt direto ao Higgsfield (sem Claude). Flags: `--reference-url`, `--avatar-file`, `--count`, `--prompt`.
 
-- `gentube run-all --project <id|slug>`
+- `gentube run-all --project <id|slug> [--prompt-matrix <ficheiro>] [--prompt-canal-voice <ficheiro>]`
   - executa pipeline completo das etapas **roteiro** e **narracao** (nao inclui imagens automaticamente)
+  - `--prompt-matrix` e `--prompt-canal-voice` aplicam-se ao roteiro da mesma forma que em `run-step`
 
 - `gentube higgsfield:status [--json]`
   - consulta conta/creditos via API de agents (Bearer a partir de `credentials.json` do CLI)
@@ -259,10 +286,11 @@ Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes d
   - modo assincrono: para cada linha `hf_cli_jobs` com `outcome=pending`, executa `hf generate get`, baixa `result_url` para `out_path_no_ext`, atualiza SQLite e estados do bloco/projeto
   - `--watch`: repete ate nao haver pendentes (pausa `--interval`; Ctrl+C encerra)
 
-- `gentube retry --project <id|slug> --stage <roteiro|narracao|imagens|thumbnails> [--block N] [--voice-id ...]`
+- `gentube retry --project <id|slug> --stage <roteiro|narracao|imagens|thumbnails> [--block N] [--voice-id ...] [--prompt-matrix <ficheiro>] [--prompt-canal-voice <ficheiro>]`
   - sem `--block`: reprocessa a etapa inteira
   - com `--block N` (1-based): reprocessa apenas o bloco N (roteiro, narracao ou imagens)
   - `--voice-id` aplica-se a **narracao**; flags de limite do step 3 (`--max-videos-*`, `--max-images-*`, `--avatar-file`) aplicam-se a **imagens**
+  - `--prompt-matrix` e `--prompt-canal-voice` aplicam-se quando `--stage roteiro`
   - **thumbnails**: aceita `--reference-url`, `--avatar-file`, `--count`
 
 - `gentube elevenlabs:status [--json]`
@@ -319,6 +347,16 @@ Variaveis em `.env`:
 - `MAGNIFIC_API_KEY`: chave da API Magnific (ex-Freepik) para busca e download de stock footage/imagens
 - `GENTUBE_STOCK_RATIO_BLOCK1` (opcional): % de shots do bloco 1 vindos do stock Magnific (default: `50`)
 - `GENTUBE_STOCK_RATIO_OTHER` (opcional): % de shots dos blocos 2..N vindos do stock (default: `90`)
+- `GENTUBE_PROMPT_MATRIX` (opcional): ficheiro do roteiro em `Prompts/`; tem prioridade sobre `GENTUBE_ROTEIRO_MODE`
+- `GENTUBE_ROTEIRO_MODE` (opcional): `tutorial` usa `matriz_tutorial.md` quando `GENTUBE_PROMPT_MATRIX` esta vazio e nao ha `--prompt-matrix`; caso contrario o default do ficheiro e `matriz.md`
+- `GENTUBE_PROMPT_CANAL_VOICE` (opcional): ficheiro Markdown em `Prompts/` com voz do canal para o **bloco 1** do roteiro (default `canal_voice.md` quando a injecao esta ativa); `none` nao carrega
+- `GENTUBE_ROTEIRO_CANAL_VOICE` (opcional): `0` / `false` / `off` desliga injecao de voz do canal
+- `GENTUBE_ROTEIRO_PREV_CONTEXT` (opcional): `0` / `false` / `off` desliga contexto dos blocos anteriores no roteiro (blocos 2..N)
+- `GENTUBE_ROTEIRO_PREV_CONTEXT_CHARS` (opcional): teto de caracteres do contexto cumulativo dos blocos anteriores (default `100000`; `0` = ilimitado)
+- `GENTUBE_MAX_VIDEOS_BLOCK1`, `GENTUBE_MAX_IMAGES_BLOCK1` (opcionais): caps do plano no **bloco 1** (defaults: **16** videos, **20** imagens)
+- `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS`, `GENTUBE_MAX_IMAGES_OTHER_BLOCKS` (opcionais): caps nos **blocos 2..N** (defaults: **10** videos, **40** imagens)
+- `GENTUBE_SCENE_PLAN_V2` (opcional): `1` / `true` / `yes` ativa plano por cenas no step imagens (equivalente a `--scene-plan-v2` quando a flag nao e passada)
+- `GENTUBE_FORCE_VIZ_REGEN` (opcional): `1` / `true` / `yes` forca nova segmentacao/visualizacao Claude no retry e apaga `hf_cli_jobs` do bloco; sem isto, reutiliza `blockXX.assets.json` e/ou `.error` quando aplicavel
 - `GENTUBE_HF_ASYNC` (opcional): habilita enfileiramento HF sem `--wait` no step imagens
 - `HIGGSFIELD_CLI_PATH` (opcional): caminho absoluto do executavel `hf` se nao estiver no PATH
 - `HIGGSFIELD_CREDENTIALS_PATH` (opcional): sobrescreve `~/.config/higgsfield/credentials.json`
@@ -362,6 +400,9 @@ Politica de versionamento (Git):
 - `src/services/hf-cli-sync.ts` — sincronizacao de `hf_cli_jobs`
 - `src/db/` conexao, migrations e repositorios
 - `src/services/` orchestrator de pipeline
+- `Prompts/matriz.md` — prompt base da etapa **roteiro** (carregado pelo código)
+- `Prompts/matriz_tutorial.md` — variante **tutorial / aula**; ver secao **6.1.2** (sem selector no codigo)
+- `Prompts/matriz02.md` — prompt da etapa **imagens** (plano de assets)
 - `src/utils/youtube.ts` — extracao de video ID e download de thumbnail do YouTube
 - `src/utils/` slug, datas, logs, validacoes
 
@@ -400,11 +441,13 @@ Implementado no codigo em `src/`:
   - `init` (setup guiado)
   - `channel:create`
   - `channel:list`
+  - `projects:list` (`--json` opcional; dados via `listProjectsSummary` em `repository.ts`)
   - `create-video`
   - `run-step` (inclui `--step imagens`)
   - `run-all`
   - `status`
   - `delete-project`
+  - `sync-from-disk` (alinhamento SQLite com `01 - Roteiro`, `02 - Narracao`, `03 - Imagens`; `--dry-run`, `--only`, `--force`)
   - `retry` (etapa inteira ou `--block N`; apos cada bloco, `status_roteiro` / `status_narracao` e recalculado no SQLite; **imagens** e **thumbnails** tambem suportados)
   - `elevenlabs:status` (uso de caracteres do periodo)
   - `higgsfield:status`, `higgsfield:generate`, `higgsfield:sync` (integracao Higgsfield)
@@ -422,9 +465,9 @@ Implementado no codigo em `src/`:
   - `hf_cli_jobs`
   - `project_logs`
 - Pipeline funcional:
-  - Geracao de roteiro com Claude (bloco a bloco, salvando `blockXX.md`)
+  - Geracao de roteiro com Claude (bloco a bloco, salvando `blockXX.md`; prompt via `resolvePromptMatrixPath` — `GENTUBE_PROMPT_MATRIX`, `GENTUBE_ROTEIRO_MODE`, `--prompt-matrix`; voz do canal no bloco 1 via `canal_voice.md` / `GENTUBE_PROMPT_CANAL_VOICE` / `--prompt-canal-voice`; contexto dos blocos anteriores nos blocos 2..N — `GENTUBE_ROTEIRO_PREV_CONTEXT*`)
   - Geracao de narracao com ElevenLabs (salvando `blockXX.mp3`)
-  - Step **imagens**: plano em `blockXX.assets.json`, renders via CLI Higgsfield; modo **sincrono** (`hf ... --wait --json`) ou **assincrono** (`GENTUBE_HF_ASYNC`, jobs em `hf_cli_jobs` + `higgsfield:sync` / `--watch`)
+  - Step **imagens**: plano em `blockXX.assets.json`, renders via CLI Higgsfield; modo **sincrono** (`hf ... --wait --json`) ou **assincrono** (`GENTUBE_HF_ASYNC`, jobs em `hf_cli_jobs` + `higgsfield:sync` / `--watch`); **blocos ja concluidos no SQLite sao saltados** ao voltar a correr o step (ver secao 21)
 - Estrutura de projeto por canal em:
   - `Videos/<canal>/<YYYYMMDD-video>/...`
 - Exclusao de projeto:
@@ -470,14 +513,14 @@ Este step sera implementado em duas tarefas internas por bloco:
 ### 18.2.1 Limites maximos por bloco (aprovado)
 
 - **Bloco 1**:
-  - max videos: **4**
-  - max imagens: **6**
+  - max videos: **16** (default; `.env` `GENTUBE_MAX_VIDEOS_BLOCK1`)
+  - max imagens: **20** (default; `.env` `GENTUBE_MAX_IMAGES_BLOCK1`)
 - **Blocos 2..N**:
-  - max videos: **2**
-  - max imagens: **6**
+  - max videos: **10** (default; `.env` `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS`)
+  - max imagens: **40** (default; `.env` `GENTUBE_MAX_IMAGES_OTHER_BLOCKS`)
   - regra adicional: max imagens deve ser maior que max videos.
 
-Esses limites sao defaults e podem ser sobrescritos no CLI do step 3.
+Os valores efetivos ao correr o CLI sao lidos de `src/config.ts` (`DEFAULT_MAX_*`), que por sua vez leem o `.env` na arranque do processo. **Prioridade na corrida:** flags `--max-videos-block1`, `--max-images-block1`, `--max-videos-other`, `--max-images-other` em `run-step --step imagens` e `retry --stage imagens` **substituem** esses numeros **nessa execução** (sem alterar o `.env`).
 
 ### 18.3 Regras de duracao e IP
 
@@ -527,17 +570,19 @@ Para cada shot de imagem/video:
 - `03 - Imagens e Videos/blockXX.assets.json` (direcao aprovada para producao)
 - arquivos renderizados locais de imagem/video (nomenclatura a ser definida na implementacao)
 
-### 18.7.1 Flags de limite no CLI (step imagens)
+### 18.7.1 Flags de limite no CLI e `.env` (step imagens)
 
-- `--max-videos-block1 <n>`
-- `--max-images-block1 <n>`
-- `--max-videos-other <n>`
-- `--max-images-other <n>`
+- `.env` (opcional): `GENTUBE_MAX_VIDEOS_BLOCK1`, `GENTUBE_MAX_IMAGES_BLOCK1`, `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS`, `GENTUBE_MAX_IMAGES_OTHER_BLOCKS` — ver **18.2.1**.
+- CLI (opcional, por execucao):
+  - `--max-videos-block1 <n>`
+  - `--max-images-block1 <n>`
+  - `--max-videos-other <n>`
+  - `--max-images-other <n>`
 
 Uso:
 
 - disponiveis em `run-step --step imagens` e `retry --stage imagens`.
-- quando omitidas, usam os defaults aprovados.
+- quando as quatro flags estao omitidas, usam-se os valores exportados de `src/config.ts` (que refletem o `.env` carregado no arranque).
 
 ### 18.8 Resumo da integracao Higgsfield (implementacao)
 
@@ -551,6 +596,43 @@ Uso:
 - **`higgsfield:status`**: `GET` na API de agents (`HIGGSFIELD_API_URL`, padrao `https://fnf.higgsfield.ai`) com Bearer derivado das credenciais do CLI — alinhado ao que `hf account status` usa.
 - **Modulo legado** `src/integrations/higgsfield.ts`: HTTP com `HIGGSFIELD_API_KEY_ID` / `SECRET`; **nao** entra no pipeline do step 3 atual.
 - Modelos e parametros base definidos na secao 18.4; o executor envia apenas flags suportadas pelo modelo (ex.: `kling3_0` sem `resolution` quando o schema publicado nao expoe o campo).
+
+### 18.9 Plano por cenas (schema 2.0) — fluxo, caps, debug e retoma
+
+**Implementacao:** `src/utils/scenes-plan.ts`, `src/services/pipeline.ts` (`imagensBlockPlanAndRenderV2`), prompts `Prompts/segmenta01.md` e `Prompts/visualiza01.md`, tipos em `src/types/scenes-plan.ts`.
+
+**Fluxo por bloco:**
+
+1. **Segmentacao** (`schema_version: "2.0-segmentation"`): Claude devolve cenas com `narration_text` verbatim alinhado ao `blockXX.md`.
+2. **Visualizacao** (`schema_version: "2.0-visualization"`): segundo pedido Claude com o JSON da segmentacao; merge local produz `blockXX.assets.json` (`schema_version: "2.0"`, `scenes[]` com `visual`).
+3. **Producao**: por cena, stock Magnific / placeholder `manual_capture` / fila Higgsfield conforme `visual.source` e `visual.type`.
+
+**Limites (18.2.1):** na visualizacao, `maxScenes = maxVideos + maxImages` do bloco. Se o modelo devolver mais imagens/videos do que o cap, `enforceScenePlanCaps()` em `scenes-plan.ts` converte cenas nao-hook de `image` para `video` (ou o inverso) **sem nova chamada Claude**. Se ainda exceder apos ajuste, falha com mensagem explicita.
+
+**Ficheiro de debug `blockXX.assets.json.error`:**
+
+Gravado ao falhar parse/validacao em segmentacao ou visualizacao (`writePlanParseError` em `src/utils/scenes-plan.ts`). Campos principais:
+
+| Campo | Descricao |
+|-------|-----------|
+| `at` | ISO timestamp |
+| `stage` | `segmentation` ou `visualization` |
+| `parse_error` | Mensagem curta (ex.: JSON invalido, caps) |
+| `raw_response` | Resposta bruta do Claude |
+| `unwrapped_for_json_parse` | JSON extraido (remove cercas ```json) |
+| `segmentation_json` | Presente se a falha foi na visualizacao — permite retoma |
+
+**Politica de creditos Claude:**
+
+- **Sem retry automatico** em loop na API; uma falha grava `.error` e interrompe o bloco.
+- **Retoma no `retry --stage imagens --scene-plan-v2`:**
+  - Plano valido em `blockXX.assets.json` → reutiliza plano; salta renders existentes em `renders/blockNN/`; nao apaga `hf_cli_jobs` salvo `GENTUBE_FORCE_VIZ_REGEN=1`.
+  - `.error` de visualizacao com `segmentation_json` + `raw_response` → reparse local sem Claude.
+- Em sucesso do plano, `blockXX.assets.json.error` e renomeado para **`blockXX.assets.json.error.resolved`** (historico de debug).
+
+**Narracao (schema 2.0):** `runNarracao` gera `02 - Narracao/blockNN/scYY.mp3` por cena; reutiliza MP3 ≥ 1 KiB; concat opcional para `blockNN.mp3` via ffmpeg (`src/utils/mp3-concat.ts`).
+
+**Comando auxiliar:** `gentube shot-list-manual --project <id>` — exporta capturas `manual_capture` para `shot_list_manual.md` / `.csv` (`src/services/shot-list-manual.ts`).
 
 ## 19) Politica aprovada — Step 4 (Thumbnails)
 
@@ -708,10 +790,10 @@ Cada shot no `blockXX.assets.json` agora inclui:
 ### 20.6 API Magnific
 
 - **Autenticacao**: header `x-magnific-api-key` com valor de `MAGNIFIC_API_KEY`
-- **Busca**: `GET https://api.magnific.com/v1/videos?term=<keywords>&order=relevance`
-- **Download video**: `GET https://api.magnific.com/v1/videos/{id}/download`
-- **Busca imagens**: `GET https://api.magnific.com/v1/resources?term=<keywords>&filters[content_type][photo]=1`
-- **Download imagem**: `GET https://api.magnific.com/v1/resources/{id}/download`
+- **Busca video**: `GET .../v1/videos` com `filters[aspect_ratio][]=16:9` e `filters[orientation][]=horizontal`; entradas com `aspect_ratio` na resposta diferente de `16:9` sao ignoradas antes do download quando o campo vem preenchido
+- **Download video**: `GET https://api.magnific.com/v1/videos/{id}/download`; apos download, `ffprobe` (se existir no PATH) confirma largura/altura ~16:9; se `ffprobe` nao estiver disponivel, confia-se no filtro da API e no `aspect_ratio` quando presente
+- **Busca imagens**: `GET .../v1/resources` com `filters[content_type][photo]=1`, `filters[orientation][landscape]=1`, `filters[orientation][panoramic]=0`; quando `image.source.size` vem como `WxH`, candidatos fora de ~16:9 sao saltados sem download
+- **Download imagem**: `GET https://api.magnific.com/v1/resources/{id}/download?image_size=large`; apos download usa-se `image-size` para validar ~16:9 (tolerancia relativa ~2%) e descartar ficheiro se falhar, tentando o proximo resultado
 - Modulo: `src/integrations/magnific.ts`
 
 ### 20.7 Fluxo de execucao no pipeline
@@ -733,3 +815,59 @@ Mesmo diretorio de saida: `03 - Imagens e Videos/renders/blockXX/`
 
 - `s01.png`, `s02.mp4`, etc. — independente da fonte (IA ou stock)
 - `blockXX.assets.json` — plano com campo `source` indicando a origem de cada shot
+
+## 21) Artefactos no disco vs SQLite (`sync-from-disk` e saltos no step imagens)
+
+**Estado:** **implementado** em `src/services/sync-from-disk.ts`, comando `gentube sync-from-disk`, `getMediaBlock` em `repository.ts`, e skip de bloco em `runImagensVideos` / `runImagensVideosBlock` em `pipeline.ts`.
+
+### 21.1 Problema
+
+O pipeline decide o que executar com base nas tabelas `script_blocks`, `narration_blocks` e `media_blocks`. Ficheiros existentes em `01 - Roteiro/`, `02 - Narracao/` ou `03 - Imagens e Videos/` **sem** linhas correspondentes no SQLite (ou com `status` diferente de `success`) fazem com que:
+
+- `run-step --step narracao` falhe (`listScriptBlocks` tem de ter `total_blocos` linhas e todas em `success` para o roteiro), ou
+- a narração seja **gerada de novo** (custo ElevenLabs) se o MP3 existe mas a linha em `narration_blocks` nao está `success`, ou
+- `run-step --step imagens` **volte a correr** o bloco 1 (Claude + HF/Magnific) mesmo com outputs já presentes.
+
+### 21.2 Principio
+
+1. **Fonte de decisão para saltar etapas:** mantém-se o **SQLite** (`status` por bloco), coerente com a retomada já descrita na secção 6.1.1 (roteiro/narração gerados pelo CLI).
+2. **Sincronização explícita:** um comando dedicado **materializa** o que já está no disco em `upsert*` + `recomputeStageFromBlocks` / `recomputeImagensVideosStage`, sem chamar Anthropic, ElevenLabs nem Higgsfield na importação.
+3. **Sem regressão acidental:** por defeito o import **nao** sobrescreve blocos ja `success` no DB; use `--force` para reimportar.
+
+### 21.3 Comando `sync-from-disk`
+
+| Parametro | Papel |
+|-----------|--------|
+| `--project <id\|slug>` | Obrigatorio |
+| `--dry-run` | Listar o que seria atualizado sem escrever no SQLite |
+| `--only <roteiro\|narracao\|imagens\|all>` | Limitar o escopo (default CLI: `all`) |
+| `--force` | Reimportar mesmo quando o bloco ja esta `success` no DB |
+
+**Roteiro:** para cada `N` em `1..total_blocos`, se existir `01 - Roteiro/blockNN.md` com tamanho >= 32 bytes e texto nao vazio, `upsertScriptBlock` com `status=success`, `file_path_md` absoluto, `content_md`, `finished_at`.
+
+**Narração:** se existir `02 - Narracao/blockNN.mp3` com tamanho >= 1 KiB, `upsertNarrationBlock` com `status=success`, `file_path_mp3`, `finished_at`.
+
+**Imagens:** se existirem `03 - Imagens e Videos/blockNN.assets.json` e, para cada entrada do plano, um ficheiro em `renders/blockNN/` com nome `<id>.<ext>`, entao `upsertMediaBlock` com `plan_status=success`, `renders_status=success`, contagens iguais ao numero de entradas. Dois formatos sao aceites pelo validador em disco: (1) **schema classico** — JSON com `shots[]`, `id` e `type` por shot (`image`: png/jpg/jpeg/webp; `video`: mp4/webm); `block_number` opcional mas validado se presente; (2) **schema 2.0** — `schema_version: "2.0"` com `scenes[]`; cada cena usa `visual.type` e `visual.source`; para `manual_capture`, aceita-se imagem (`png`/`jpg`/…) mesmo quando `visual.type` for `video` (placeholder ate gravacao real).
+
+No fim (sem `--dry-run`): `recomputeStageFromBlocks` para roteiro e/ou narracao e/ou `recomputeImagensVideosStage` conforme `--only`. Registo em `project_logs` (`stage=sync`).
+
+### 21.4 Narração apos import
+
+O código atual de `runNarracao` já faz `continue` quando `getNarrationBlock(...).status === "success"`. Depois de `sync-from-disk` marcar o bloco 1 (e quaisquer outros MP3 já existentes) como `success`, `run-step --step narracao` **nao** volta a chamar ElevenLabs para esses blocos — apenas gera os que continuarem `pending` / `error`.
+
+### 21.5 Step imagens — saltar bloco 1 concluído
+
+**Implementado:** no loop de `runImagensVideos` e no inicio de `runImagensVideosBlock`, se existir linha em `media_blocks` com `plan_status === "success"` e (`renders_status === "success"` **ou** (`renders_status === "awaiting_hf"` e zero jobs em `hf_cli_jobs` com `outcome=pending` para esse bloco)), o bloco e **saltado** com log (sem Claude/HF/Magnific).
+
+Assim, apos `sync-from-disk` (imagens) ou apos uma corrida bem-sucedida, `run-step --step imagens` continua nos blocos pendentes (ex.: bloco 2) sem refazer o bloco 1.
+
+**Alternativa `--from-block N`:** nao implementada; o skip por estado em DB + `sync-from-disk` e o caminho suportado.
+
+### 21.6 Riscos e mitigacao
+
+- Ficheiros corrompidos ou vazios marcados como `success` → minimo de bytes + opcionalmente `--dry-run` com listagem.
+- Contagem de blocos no projeto diferente do numero de ficheiros → o comando reporta blocos em falta; nao inventa conteúdo.
+
+### 21.7 Documentacao de utilizador
+
+Resumo no `README.md` (secção dedicada) e referência cruzada a esta secção 21.

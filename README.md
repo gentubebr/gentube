@@ -7,7 +7,7 @@ CLI em **Node.js** para organizar projetos de vídeo no estilo YouTube: **roteir
 ## Por que usar
 
 - Estrutura fixa de pastas por canal e por vídeo (`Videos/<canal>/<data>-<titulo>/`).
-- Roteiro em blocos (`block01.md`, …) a partir do prompt em `Prompts/matriz.md`.
+- Roteiro em blocos (`block01.md`, …) a partir do prompt em `Prompts/matriz.md` ou **`matriz_tutorial.md`** (`GENTUBE_ROTEIRO_MODE=tutorial`, `GENTUBE_PROMPT_MATRIX` ou `--prompt-matrix`). No **bloco 1**, o ficheiro opcional `Prompts/canal_voice.md` fixa voz/persona do canal; nos **blocos seguintes**, o texto dos `.md` anteriores entra como contexto de coesão (configurável; ver tabela de variáveis).
 - Áudio por bloco (`block01.mp3`, …) alinhado ao roteiro.
 - Status de cada etapa e de cada bloco gravados localmente (sem depender só de arquivos soltos).
 
@@ -26,11 +26,13 @@ Antes de clonar o GenTube, reúna o seguinte (sem gravar segredos em ficheiros v
 1. Conta em [elevenlabs.io](https://elevenlabs.io/) → API keys.
 2. No `.env`: `ELEVENLABS_API_KEY` e `ELEVENLABS_VOICE_ID` (voz desejada).
 3. O comando `elevenlabs:status` exige permissão `user_read` na chave.
+4. Antes do TTS, o texto passa por **`stripMarkdownForSpeech`** (remove `**negrito**`, listas, links, etc.) para o modelo não ler pontuação Markdown em voz alta.
 
 ### Magnific (stock — imagens e vídeos)
 
 1. Conta / API em [Magnific](https://www.magnific.com/) (documentação da API B2B).
 2. No `.env`: `MAGNIFIC_API_KEY`. Planos sem download premium podem falhar em parte dos assets (o pipeline faz fallback para IA Higgsfield quando aplicável).
+3. Stock **16:9**: a busca de vídeo usa `filters[aspect_ratio][]=16:9`; imagens usam metadados `source.size` e validação pós-download (`image-size`). Vídeos podem ser confirmados com **`ffprobe`** se estiver no `PATH` (pacote `ffmpeg`).
 
 ### Higgsfield CLI (geração IA imagens/vídeo)
 
@@ -130,6 +132,18 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `MAGNIFIC_API_KEY` | Sim (step imagens) | API da Magnific/Freepik (stock footage e imagens) |
 | `GENTUBE_STOCK_RATIO_BLOCK1` | Opcional | % de shots do bloco 1 vindos do stock Magnific (default: `50`) |
 | `GENTUBE_STOCK_RATIO_OTHER` | Opcional | % de shots dos blocos 2..N vindos do stock (default: `90`) |
+| `GENTUBE_PROMPT_MATRIX` | Opcional | Ficheiro em `Prompts/` para o **roteiro** (ex.: `matriz_tutorial.md`). Tem prioridade sobre `GENTUBE_ROTEIRO_MODE`. A flag `--prompt-matrix` tem prioridade sobre ambos |
+| `GENTUBE_ROTEIRO_MODE` | Opcional | Com `tutorial` (e sem `GENTUBE_PROMPT_MATRIX` nem `--prompt-matrix`), usa **`matriz_tutorial.md`**. Sem esta variável ou com outro valor, o default do ficheiro continua **`matriz.md`** |
+| `GENTUBE_PROMPT_CANAL_VOICE` | Opcional | Ficheiro em `Prompts/` com **voz/persona do canal** (default `canal_voice.md`), injetado **só no bloco 1** do roteiro; `none` desativa. A flag `--prompt-canal-voice` tem prioridade |
+| `GENTUBE_ROTEIRO_CANAL_VOICE` | Opcional | `0` / `false` / `off`: não injeta voz do canal no bloco 1 |
+| `GENTUBE_ROTEIRO_PREV_CONTEXT` | Opcional | `0` / `false` / `off`: não envia texto dos blocos `01 - Roteiro/block*.md` anteriores ao gerar o bloco *N* (default: ativo) |
+| `GENTUBE_ROTEIRO_PREV_CONTEXT_CHARS` | Opcional | Teto de caracteres do contexto cumulativo dos blocos anteriores (default `100000`; `0` = sem limite; se exceder, mantém o fim) |
+| `GENTUBE_MAX_VIDEOS_BLOCK1` | Opcional | Máx. **vídeos** no plano do **bloco 1** (default `16`). As flags `--max-videos-block1` / `--max-images-block1` etc. no `run-step` / `retry` **têm prioridade** na corrida |
+| `GENTUBE_MAX_IMAGES_BLOCK1` | Opcional | Máx. **imagens** no plano do **bloco 1** (default `20`) |
+| `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS` | Opcional | Máx. vídeos nos **blocos 2..N** (default `10`) |
+| `GENTUBE_MAX_IMAGES_OTHER_BLOCKS` | Opcional | Máx. imagens nos **blocos 2..N** (default `40`) |
+| `GENTUBE_SCENE_PLAN_V2` | Opcional | `1` / `true` / `yes`: step **imagens** em modo plano por cenas (dois passos Claude). A flag `--scene-plan-v2` tem prioridade quando passada |
+| `GENTUBE_FORCE_VIZ_REGEN` | Opcional | `1` / `true` / `yes`: força **nova** segmentação/visualização Claude e apaga jobs HF do bloco no retry (ignora `blockNN.assets.json` e `.error` no disco) |
 | `GENTUBE_REMOTE_HOST` | Opcional | Host SSH remoto para `copy-cmd` (ex.: `dev-development`); evita `--remote-host` toda vez |
 | `GENTUBE_HF_ASYNC` | Opcional | `1`, `true` ou `yes`: no step **imagens**, enfileira jobs no Higgsfield sem esperar no mesmo comando; use `higgsfield:sync` (ou `--watch`) para baixar resultados |
 | `HIGGSFIELD_CLI_PATH`, `HIGGSFIELD_CREDENTIALS_PATH`, `HIGGSFIELD_CLI_WAIT_TIMEOUT`, `HIGGSFIELD_API_URL` | Opcionais | Caminho do binário `hf`, credenciais, timeout de `--wait` (modo síncrono), base da API de agents; ver [`.env.example`](.env.example) |
@@ -160,6 +174,10 @@ npm run gentube -- channel:create
 # 2) Listar canais e anotar o id, se precisar
 npm run gentube -- channel:list
 
+# 2b) Ver todos os canais com os projetos de cada um (SQLite); --json para scripts
+npm run gentube -- projects:list
+npm run gentube -- projects:list --json
+
 # 3) Criar projeto de vídeo (interativo ou com flags)
 npm run gentube -- create-video
 
@@ -177,7 +195,11 @@ npm run gentube -- delete-project --project 2 --yes
 
 # 4) Só roteiro ou só narração (use id numérico ou slug da pasta do projeto)
 npm run gentube -- run-step --project 1 --step roteiro
+npm run gentube -- run-step --project 1 --step roteiro --prompt-matrix matriz_tutorial.md --prompt-canal-voice canal_voice.md
 npm run gentube -- run-step --project 1 --step narracao
+
+# 4b) Step imagens — limites vêm do .env (GENTUBE_MAX_*); sobrescreva por corrida, ex.:
+# npm run gentube -- run-step --project 1 --step imagens --max-videos-block1 12 --max-images-other 30
 
 # 5) Roteiro + narração em sequência
 npm run gentube -- run-all --project 1
@@ -225,6 +247,36 @@ npm run gentube -- copy-cmd --project 1 --remote-host dev-development --dry-run
 npm run gentube -- copy-cmd --project 1
 ```
 
+### Artefactos criados fora do GenTube (`sync-from-disk`)
+
+Quando já tens `blockNN.md`, `blockNN.mp3` ou plano + renders em `03 - Imagens e Videos/` mas o SQLite ainda não reflete `success`, usa:
+
+```bash
+npm run gentube -- sync-from-disk --project 6 --dry-run   # pré-visualizar
+npm run gentube -- sync-from-disk --project 6             # roteiro + narração + imagens (conforme ficheiros)
+npm run gentube -- sync-from-disk --project 6 --only roteiro
+npm run gentube -- sync-from-disk --project 6 --only narracao
+npm run gentube -- sync-from-disk --project 6 --only imagens
+npm run gentube -- sync-from-disk --project 6 --force     # reimportar mesmo com blocos já success
+```
+
+**Narração:** `run-step --step narracao` **já** ignora blocos com `narration_blocks.status === success` — depois do sync não se volta a gastar ElevenLabs nesses blocos.
+
+**Imagens:** `run-step --step imagens` **salta blocos** em que `media_blocks` já tem plano e renders concluídos (e, em modo HF assíncrono, sem jobs `hf_cli_jobs` pendentes para esse bloco). Para trabalho feito fora do CLI, o `sync-from-disk --only imagens` valida `blockNN.assets.json` + ficheiros em `renders/blockNN/` e grava o estado no SQLite.
+
+**Plano por cenas (schema 2.0):** em `run-step` / `retry` com **`--scene-plan-v2`** (imagens) ou variável **`GENTUBE_SCENE_PLAN_V2=1`**, o Claude corre em dois passos (`Prompts/segmenta01.md`, `Prompts/visualiza01.md`), grava `blockNN.assets.json` com `schema_version: "2.0"` e `scenes[]`; `manual_capture` usa um PNG placeholder em `src/assets/manual_capture/placeholder.png` até substituíres; a narração grava um MP3 por cena em `02 - Narracao/blockNN/scXX.mp3` e **reutiliza** ficheiros já existentes (≥ 1 KiB) sem voltar a chamar o ElevenLabs; opcionalmente junta `blockNN.mp3` com **ffmpeg** — **sem ffmpeg não há segundo gasto de API**: não se gera monólito do bloco inteiro.
+
+**Retoma sem gastar Claude de novo (imagens v2):**
+
+- Se `blockNN.assets.json` já existe e é válido, o `retry --stage imagens` **reutiliza o plano** (não chama segmentação/visualização), salta cenas cujo ficheiro já está em `renders/blockNN/`, e só enfileira o que falta.
+- Se existir `blockNN.assets.json.error` com falha na **visualização** e campo `segmentation_json`, o retry reutiliza segmentação + `raw_response` e só revalida localmente (útil quando o JSON era válido mas excedeu caps de imagens/vídeos — o código ajusta `image`→`video` quando possível).
+- Em falha de parse, grava-se `03 - Imagens e Videos/blockNN.assets.json.error` com `parse_error`, `raw_response` e `unwrapped_for_json_parse` para inspeção; **não há retry automático** na API Claude. Em sucesso, o ficheiro passa a `blockNN.assets.json.error.resolved`.
+- `GENTUBE_FORCE_VIZ_REGEN=1` força regerar plano e apaga jobs HF do bloco nessa execução.
+
+**Lista de capturas manuais:** `npm run gentube -- shot-list-manual --project <id>` gera `shot_list_manual.md` / `.csv` a partir dos planos 2.0.
+
+Detalhes: **secções 18.9 e 21** de `ESPECIFICACAO_TECNICA.md`.
+
 ### Build (TypeScript → `dist/`)
 
 ```bash
@@ -236,7 +288,7 @@ npm start -- --help
 
 - Projetos gerados: `Videos/<slug-do-canal>/<YYYYMMDD-slug-do-titulo>/`
   - `01 - Roteiro/` — `blockXX.md` (só texto narrado; sem cabeçalho de bloco nem pergunta de “continuar”)
-  - `02 - Narracao/` — `blockXX.mp3`
+  - `02 - Narracao/` — `blockXX.mp3` (modo clássico) ou `blockXX/scYY.mp3` por cena (modo `--scene-plan-v2`)
   - `03 - Imagens e Videos/` — saídas do step **imagens**: mix de IA (Higgsfield) e stock (Magnific), proporção configurável via `.env`
   - `04 - Thumbnails/` — thumbnails geradas (step **thumbnails**): `thumb_ref_01.png` (com referência) ou `thumb_gen_01.png` (sem referência)
   - `05 - Modelagem/` — ex.: `transcript.txt` (transcricao de referência), `Thumbnail_<videoId>.jpg` (thumbnail de referência YouTube)
@@ -259,6 +311,8 @@ A proporção é configurável via `.env`:
 |----------|---------|--------|
 | `GENTUBE_STOCK_RATIO_BLOCK1` | `50` | 50% stock / 50% IA no bloco 1 |
 | `GENTUBE_STOCK_RATIO_OTHER` | `90` | 90% stock / 10% IA nos blocos 2..N |
+
+**Quantidade máxima de vídeos e imagens no plano** (step imagens — cada entrada no JSON conta para o teto antes dos renders): por defeito **bloco 1** = 16 vídeos e 20 imagens; **blocos 2..N** = 10 vídeos e 40 imagens. Ajuste com `GENTUBE_MAX_VIDEOS_BLOCK1`, `GENTUBE_MAX_IMAGES_BLOCK1`, `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS`, `GENTUBE_MAX_IMAGES_OTHER_BLOCKS`. Na linha de comando, `--max-videos-block1`, `--max-images-block1`, `--max-videos-other` e `--max-images-other` em `run-step --step imagens` e `retry --stage imagens` **substituem** esses valores **nessa execução** (útil para testes sem alterar o `.env`).
 
 O Claude decide **quais** shots são IA vs stock no plano de direção (`blockXX.assets.json`), priorizando IA para momentos de maior impacto visual e stock para o restante.
 

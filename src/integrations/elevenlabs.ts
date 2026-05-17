@@ -1,5 +1,6 @@
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 import { ELEVENLABS_API_KEY } from "../config.js";
+import { stripMarkdownForSpeech } from "../utils/markdown-for-tts.js";
 
 export interface ElevenLabsSubscriptionInfo {
   characterCount: number;
@@ -35,8 +36,12 @@ export async function getSubscriptionInfo(): Promise<ElevenLabsSubscriptionInfo>
 
 export async function textToSpeechMp3(input: { text: string; voiceId: string }): Promise<Buffer> {
   const elevenlabs = getClient();
+  const text = stripMarkdownForSpeech(input.text);
+  if (!text.trim()) {
+    throw new Error("Texto de narracao vazio apos remover Markdown (verifique o bloco ou a cena).");
+  }
   const audioStream = await elevenlabs.textToSpeech.convert(input.voiceId, {
-    text: input.text,
+    text,
     modelId: "eleven_multilingual_v2",
     outputFormat: "mp3_44100_128",
   });

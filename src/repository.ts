@@ -78,6 +78,52 @@ export function getProjectByIdOrSlug(idOrSlug: string) {
   return (bySlug as Record<string, unknown>) ?? null;
 }
 
+export type ProjectSummaryRow = {
+  id: number;
+  channel_id: number;
+  titulo: string;
+  slug: string;
+  data_projeto: string;
+  project_path: string;
+  total_blocos: number;
+  status_roteiro: string;
+  status_narracao: string;
+  status_imagens_videos: string;
+  status_thumbnails: string;
+  created_at: string;
+  nome_canal: string;
+  slug_canal: string;
+};
+
+/** Projetos com dados do canal (JOIN), ordenados por canal e data do projeto. */
+export function listProjectsSummary(): ProjectSummaryRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `
+    SELECT
+      p.id,
+      p.channel_id,
+      p.titulo,
+      p.slug,
+      p.data_projeto,
+      p.project_path,
+      p.total_blocos,
+      p.status_roteiro,
+      p.status_narracao,
+      p.status_imagens_videos,
+      p.status_thumbnails,
+      p.created_at,
+      c.nome_canal,
+      c.slug_canal
+    FROM video_projects p
+    INNER JOIN channels c ON c.id = p.channel_id
+    ORDER BY c.nome_canal COLLATE NOCASE, p.data_projeto DESC, p.id DESC
+  `,
+    )
+    .all() as ProjectSummaryRow[];
+}
+
 export function updateProjectStageStatus(projectId: number, stage: "status_roteiro" | "status_narracao", status: BlockStatus): void {
   const db = getDb();
   db.prepare(`UPDATE video_projects SET ${stage} = ?, updated_at = ? WHERE id = ?`).run(status, nowIso(), projectId);
@@ -169,6 +215,26 @@ export function listMediaBlocks(projectId: number): Array<{ block_number: number
   return db
     .prepare("SELECT block_number, plan_status, renders_status FROM media_blocks WHERE project_id = ? ORDER BY block_number")
     .all(projectId) as Array<{ block_number: number; plan_status: string; renders_status: string }>;
+}
+
+export type MediaBlockRow = {
+  block_number: number;
+  plan_status: string;
+  renders_status: string;
+  renders_done_count: number;
+  renders_total_count: number;
+  assets_json_path: string | null;
+};
+
+export function getMediaBlock(projectId: number, blockNumber: number): MediaBlockRow | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT block_number, plan_status, renders_status, renders_done_count, renders_total_count, assets_json_path
+       FROM media_blocks WHERE project_id = ? AND block_number = ?`
+    )
+    .get(projectId, blockNumber);
+  return (row as MediaBlockRow) ?? null;
 }
 
 export function listScriptBlocks(projectId: number): Array<{ block_number: number; file_path_md: string | null; status: string }> {
