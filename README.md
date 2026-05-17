@@ -1,6 +1,6 @@
 # GenTube
 
-CLI em **Node.js** para organizar projetos de vídeo no estilo YouTube: **roteiro** (Claude), **narração** (ElevenLabs), **imagens e vídeos** (direção Claude + produção mista Higgsfield IA / Magnific stock), **thumbnails** (referência YouTube + avatar direto ao Higgsfield via múltiplos `--image`), pastas por **canal** e histórico em **SQLite**.
+CLI em **Node.js** para organizar projetos de vídeo no estilo YouTube: **roteiro** (Claude), **narração** (ElevenLabs), **imagens e vídeos** (direção Claude + produção mista **Higgsfield** / **Google Gemini** IA + Magnific stock), **thumbnails** (referência YouTube + avatar via HF ou Gemini), pastas por **canal** e histórico em **SQLite**.
 
 ---
 
@@ -31,7 +31,7 @@ Antes de clonar o GenTube, reúna o seguinte (sem gravar segredos em ficheiros v
 ### Magnific (stock — imagens e vídeos)
 
 1. Conta / API em [Magnific](https://www.magnific.com/) (documentação da API B2B).
-2. No `.env`: `MAGNIFIC_API_KEY`. Planos sem download premium podem falhar em parte dos assets (o pipeline faz fallback para IA Higgsfield quando aplicável).
+2. No `.env`: `MAGNIFIC_API_KEY`. Planos sem download premium podem falhar em parte dos assets (o pipeline faz fallback para IA — Higgsfield ou Gemini, conforme `GENTUBE_IMAGE_BACKEND`).
 3. Stock **16:9**: a busca de vídeo usa `filters[aspect_ratio][]=16:9`; imagens usam metadados `source.size` e validação pós-download (`image-size`). Vídeos podem ser confirmados com **`ffprobe`** se estiver no `PATH` (pacote `ffmpeg`).
 
 ### Higgsfield CLI (geração IA imagens/vídeo)
@@ -58,7 +58,25 @@ No `.env` do GenTube pode definir:
 
 - `HIGGSFIELD_CLI_PATH` — caminho absoluto do executável, se não estiver no `PATH`
 - `HIGGSFIELD_CREDENTIALS_PATH` — se as credenciais estiverem noutro sítio
-- `GENTUBE_HF_ASYNC=1` — enfileira jobs; conclua com `higgsfield:sync`
+- `GENTUBE_HF_ASYNC=1` — enfileira jobs HF; conclua com `image:sync` ou `higgsfield:sync` (alias)
+
+### Google GenAI / Gemini (imagens IA e thumbnails)
+
+Segundo provedor de **imagens** (Nano Banana via `@google/genai`). **Vídeos** continuam só no Higgsfield (`kling3_0`).
+
+1. Chave em [Google AI Studio](https://aistudio.google.com/apikey) ou Vertex; no `.env`: `GEMINI_API_KEY` (o alias `google_api_key` também é aceite).
+2. Batch oficial (produção, menor custo): `GENTUBE_IMAGE_DELIVERY=google_batch` ou flag `--google-batch-mode`.
+3. Após enfileirar: `npm run gentube -- image:sync --project <id>` (planeado; hoje use `higgsfield:sync` para jobs HF legados).
+
+| Modo | Flag CLI | Uso |
+|------|----------|-----|
+| **Sync** | (nenhuma; 1 prompt) | Teste rápido, fallback imediato |
+| **Batch Google** | `--google-batch-mode` | Produção; requer `--prompts-file` no `gemini:image` ou pipeline imagens/thumbnails |
+| **Batch local** | `--batch-local` | Testes com concorrência (`--concurrency`); mutuamente exclusivo com `--google-batch-mode` |
+
+**Política `GENTUBE_IMAGE_BACKEND=auto` (default):** tenta Higgsfield; se falhar (sem créditos, timeout, erro CLI, etc.) → **uma** tentativa Gemini. Com `--google-batch-mode`, usa só Gemini Batch — se o submit falhar, **não** há fallback sync (falha e regista em log).
+
+Detalhes: **secção 22** de `ESPECIFICACAO_TECNICA.md`.
 
 ### Node.js e este repositório
 
@@ -145,8 +163,15 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `GENTUBE_SCENE_PLAN_V2` | Opcional | `1` / `true` / `yes`: step **imagens** em modo plano por cenas (dois passos Claude). A flag `--scene-plan-v2` tem prioridade quando passada |
 | `GENTUBE_FORCE_VIZ_REGEN` | Opcional | `1` / `true` / `yes`: força **nova** segmentação/visualização Claude e apaga jobs HF do bloco no retry (ignora `blockNN.assets.json` e `.error` no disco) |
 | `GENTUBE_REMOTE_HOST` | Opcional | Host SSH remoto para `copy-cmd` (ex.: `dev-development`); evita `--remote-host` toda vez |
-| `GENTUBE_HF_ASYNC` | Opcional | `1`, `true` ou `yes`: no step **imagens**, enfileira jobs no Higgsfield sem esperar no mesmo comando; use `higgsfield:sync` (ou `--watch`) para baixar resultados |
+| `GENTUBE_HF_ASYNC` | Opcional | `1`, `true` ou `yes`: no step **imagens**, enfileira jobs no Higgsfield sem esperar no mesmo comando; use `image:sync` / `higgsfield:sync` (ou `--watch`) para baixar resultados |
 | `HIGGSFIELD_CLI_PATH`, `HIGGSFIELD_CREDENTIALS_PATH`, `HIGGSFIELD_CLI_WAIT_TIMEOUT`, `HIGGSFIELD_API_URL` | Opcionais | Caminho do binário `hf`, credenciais, timeout de `--wait` (modo síncrono), base da API de agents; ver [`.env.example`](.env.example) |
+| `GEMINI_API_KEY` | Sim (se usar Gemini) | API Google GenAI; alias: `google_api_key` |
+| `google_project_name`, `google_parent_folder_id` | Opcionais | Vertex / Batch API Google (quando aplicável) |
+| `GEMINI_IMAGE_MODEL` | Opcional | Default `gemini-2.5-flash-image` (Nano Banana rápido) |
+| `GENTUBE_IMAGE_BACKEND` | Opcional | `auto` (default), `higgsfield` ou `gemini` |
+| `GENTUBE_IMAGE_DELIVERY` | Opcional | `google_batch` (default produção), `sync` ou `local_batch` |
+| `GENTUBE_GEMINI_BATCH_SCOPE` | Opcional | `block` no pipeline; CLI manual pode agrupar por projeto |
+| `GENTUBE_GEMINI_LOCAL_CONCURRENCY` | Opcional | Concorrência do batch local (default `4`) |
 
 > O arquivo `.env` não deve ser commitado (já está no `.gitignore`).
 
@@ -207,13 +232,20 @@ npm run gentube -- run-all --project 1
 # 6) Consultar status
 npm run gentube -- status --project 1
 
-# 6b) Modo assíncrono Higgsfield (GENTUBE_HF_ASYNC=1): após run-step imagens, sincronizar jobs
+# 6b) Imagens IA — batch Google (produção) ou HF async legado
+npm run gentube -- run-step --project 1 --step imagens --google-batch-mode
+npm run gentube -- image:sync --project 1 --watch --interval 60s
+# HF legado (hf_cli_jobs → migrar para image_jobs):
 npm run gentube -- higgsfield:sync --project 1
-npm run gentube -- higgsfield:sync --project 1 --watch --interval 30s
 
-# 7) Gerar thumbnails
-# (A) Com referência de outro canal (baixa thumbnail + avatar → direto ao HF)
-npm run gentube -- run-step --project 1 --step thumbnails \
+# 6c) Teste avulso Gemini (planeado)
+npm run gentube -- gemini:image --prompt "cinematic 16:9 ..." --out ./out/teste.png
+npm run gentube -- gemini:image --google-batch-mode --prompts-file prompts.txt --out-dir ./out
+npm run gentube -- gemini:image --batch-local --prompts-file prompts.txt --out-dir ./out --concurrency 4
+
+# 7) Gerar thumbnails (mesma política de imagem: --google-batch-mode, auto, etc.)
+# (A) Com referência de outro canal (baixa thumbnail + avatar → HF ou Gemini)
+npm run gentube -- run-step --project 1 --step thumbnails --google-batch-mode \
   --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
   --avatar-file Avatars/seu-avatar.jpg \
   --count 2
@@ -262,7 +294,7 @@ npm run gentube -- sync-from-disk --project 6 --force     # reimportar mesmo com
 
 **Narração:** `run-step --step narracao` **já** ignora blocos com `narration_blocks.status === success` — depois do sync não se volta a gastar ElevenLabs nesses blocos.
 
-**Imagens:** `run-step --step imagens` **salta blocos** em que `media_blocks` já tem plano e renders concluídos (e, em modo HF assíncrono, sem jobs `hf_cli_jobs` pendentes para esse bloco). Para trabalho feito fora do CLI, o `sync-from-disk --only imagens` valida `blockNN.assets.json` + ficheiros em `renders/blockNN/` e grava o estado no SQLite.
+**Imagens:** `run-step --step imagens` **salta blocos** em que `media_blocks` já tem plano e renders concluídos (e, em modo assíncrono, sem jobs `image_jobs` / `hf_cli_jobs` pendentes para esse bloco). Para trabalho feito fora do CLI, o `sync-from-disk --only imagens` valida `blockNN.assets.json` + ficheiros em `renders/blockNN/` e grava o estado no SQLite.
 
 **Plano por cenas (schema 2.0):** em `run-step` / `retry` com **`--scene-plan-v2`** (imagens) ou variável **`GENTUBE_SCENE_PLAN_V2=1`**, o Claude corre em dois passos (`Prompts/segmenta01.md`, `Prompts/visualiza01.md`), grava `blockNN.assets.json` com `schema_version: "2.0"` e `scenes[]`; `manual_capture` usa um PNG placeholder em `src/assets/manual_capture/placeholder.png` até substituíres; a narração grava um MP3 por cena em `02 - Narracao/blockNN/scXX.mp3` e **reutiliza** ficheiros já existentes (≥ 1 KiB) sem voltar a chamar o ElevenLabs; opcionalmente junta `blockNN.mp3` com **ffmpeg** — **sem ffmpeg não há segundo gasto de API**: não se gera monólito do bloco inteiro.
 
@@ -289,8 +321,8 @@ npm start -- --help
 - Projetos gerados: `Videos/<slug-do-canal>/<YYYYMMDD-slug-do-titulo>/`
   - `01 - Roteiro/` — `blockXX.md` (só texto narrado; sem cabeçalho de bloco nem pergunta de “continuar”)
   - `02 - Narracao/` — `blockXX.mp3` (modo clássico) ou `blockXX/scYY.mp3` por cena (modo `--scene-plan-v2`)
-  - `03 - Imagens e Videos/` — saídas do step **imagens**: mix de IA (Higgsfield) e stock (Magnific), proporção configurável via `.env`
-  - `04 - Thumbnails/` — thumbnails geradas (step **thumbnails**): `thumb_ref_01.png` (com referência) ou `thumb_gen_01.png` (sem referência)
+  - `03 - Imagens e Videos/` — saídas do step **imagens**: mix de IA (Higgsfield e/ou Gemini) e stock (Magnific)
+  - `04 - Thumbnails/` — thumbnails (HF ou Gemini): `thumb_ref_01.png` / `thumb_gen_01.png`
   - `05 - Modelagem/` — ex.: `transcript.txt` (transcricao de referência), `Thumbnail_<videoId>.jpg` (thumbnail de referência YouTube)
 - Banco local: `data/gentube.db` (ignorado pelo Git)
 - Template de referência: `Template/[Nome do Canal]/`
@@ -298,12 +330,13 @@ npm start -- --help
 
 Arquivos gerados em `Videos/` e imagens em `Avatars/` **não** são versionados (ver `.gitignore`); no clone o diretório `Videos/` vem vazio. O mesmo vale para o conteúdo de `Transcripts/` (só `.gitkeep` no clone). O ficheiro `EXAMPLE.md` também é local-only — use-o como runbook privado.
 
-### Produção mista: Higgsfield (IA) + Magnific (stock)
+### Produção mista: IA (Higgsfield + Gemini) + Magnific (stock)
 
-O step **imagens** usa dois provedores para os shots de cada bloco:
+O step **imagens** combina até três fontes por cena:
 
-- **Higgsfield (IA)**: gera imagens/vídeos únicos — reservado para o **hook** (abertura) e os **momentos mais impactantes/dramáticos** de cada bloco.
-- **Magnific (stock)**: busca imagens/vídeos no banco da Magnific (ex-Freepik) — usado para ilustrações de apoio, transições e cenas genéricas.
+- **Higgsfield (IA)**: imagens e **vídeos** (`nano_banana_flash`, `kling3_0`) — hook e momentos de maior impacto quando `GENTUBE_IMAGE_BACKEND` permite HF.
+- **Google Gemini (IA)**: **só imagens** — sync, batch Google (`--google-batch-mode`) ou batch local (`--batch-local`); fallback ou produção principal conforme `.env` e flags.
+- **Magnific (stock)**: ilustrações e transições genéricas.
 
 A proporção é configurável via `.env`:
 
@@ -316,9 +349,11 @@ A proporção é configurável via `.env`:
 
 O Claude decide **quais** shots são IA vs stock no plano de direção (`blockXX.assets.json`), priorizando IA para momentos de maior impacto visual e stock para o restante.
 
-### Higgsfield (modo assíncrono)
+### Fila de imagens (`image_jobs`) e sync
 
-Com `GENTUBE_HF_ASYNC` em `1`, `true` ou `yes`, os shots marcados como `ai_generated` são enfileirados no Higgsfield (sem `--wait` no mesmo processo). Os IDs ficam na tabela `hf_cli_jobs` no SQLite; os arquivos aparecem em `03 - Imagens e Videos/` depois de rodar **`higgsfield:sync`**. Shots `stock` são baixados da Magnific imediatamente, independente do modo async.
+**Planeado (migração opção B):** a tabela `image_jobs` unifica jobs HF e Gemini Batch (`provider`, `delivery_mode`, `external_id`, `batch_id`, `outcome`). A tabela legada `hf_cli_jobs` deixa de receber novas imagens; vídeos HF podem migrar depois.
+
+Com `GENTUBE_HF_ASYNC` e backend HF, imagens `ai_generated` vão para a fila sem `--wait`. Conclua com **`image:sync`** (recomendado) ou **`higgsfield:sync`** (alias HF). Com `--google-batch-mode`, o submit é Batch API Google por **bloco** no pipeline; poll via `image:sync`. Stock Magnific continua imediato.
 
 Requisitos:
 
@@ -345,7 +380,8 @@ Regras de negócio, modelo de dados, contratos de comandos e decisões de implem
 
 ## Roadmap
 
-- Afinar defaults e observabilidade do step imagens (Higgsfield + Magnific).
+- Implementar `image_jobs`, `gemini:image`, `image:sync` e flags `--google-batch-mode` / `--batch-local` (spec sec. 22).
+- Migrar imagens de `hf_cli_jobs` → `image_jobs`.
 - Incluir steps no `run-all` ou comando `run-all --with-imagens`.
 
 ## Licença

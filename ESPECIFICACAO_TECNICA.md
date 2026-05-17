@@ -231,10 +231,17 @@ Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes d
    - started_at, finished_at, created_at, updated_at
    - UNIQUE(project_id, block_number)
 
-7. `hf_cli_jobs` (filas do CLI Higgsfield, especialmente modo assincrono)
+7. `hf_cli_jobs` (**legado** — videos HF e imagens antigas; migracao para `image_jobs`)
    - id, project_id, block_number, shot_id, asset_type (`image`|`video`)
    - out_path_no_ext, hf_job_id (UNIQUE), hf_status
    - outcome (`pending`|`done`|`failed`), result_url, error_message, downloaded_at
+   - created_at, updated_at
+
+8. `image_jobs` (**aprovado** — fila unificada de imagens; ver secao **22**)
+   - id, project_id, block_number (`0` = thumbnails), shot_id, asset_type (`image`)
+   - provider (`higgsfield`|`gemini`), delivery_mode (`sync`|`google_batch`|`local_batch`)
+   - external_id, batch_id, out_path_no_ext, status, outcome
+   - result_mime, error_message, reference_image_path, downloaded_at
    - created_at, updated_at
 
 ## 9) Operacoes de CLI (contrato funcional)
@@ -266,11 +273,24 @@ Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes d
   - lista **canais** e, sob cada um, os **projetos** (`video_projects`): id do projeto, titulo, slug, blocos, estados das etapas e caminho da pasta
   - `--json`: saida estruturada (array de canais com `projects[]`) para scripts
 
-- `gentube run-step --project <id|slug> --step <roteiro|narracao|imagens|thumbnails> [--prompt-matrix <ficheiro>] [--prompt-canal-voice <ficheiro>]`
+- `gentube run-step --project <id|slug> --step <roteiro|narracao|imagens|thumbnails> [--prompt-matrix <ficheiro>] [--prompt-canal-voice <ficheiro>] [--google-batch-mode] [--batch-local] [--scene-plan-v2]`
   - executa uma unica etapa
   - **roteiro**: `--prompt-matrix` escolhe o ficheiro em `Prompts/` (padrao `matriz.md`); `--prompt-canal-voice` define o Markdown de voz do canal no **bloco 1** (padrao `canal_voice.md` quando a funcionalidade esta ativa)
-  - **imagens**: direcao (Claude -> `blockXX.assets.json`) + producao (CLI `hf generate create`). Com `GENTUBE_HF_ASYNC=1` (`true`/`yes`), a producao enfileira jobs sem `--wait`; o usuario deve rodar `higgsfield:sync` para poll/download. Limites de videos/imagens por bloco: ver **18.2.1** e **18.7.1** (`.env` + flags `--max-*`).
-  - **thumbnails**: baixa referencia YouTube (se `--reference-url`), envia imagens + prompt direto ao Higgsfield (sem Claude). Flags: `--reference-url`, `--avatar-file`, `--count`, `--prompt`.
+  - **imagens**: direcao (Claude -> `blockXX.assets.json`) + producao IA/stock. Flags de imagem: **`--google-batch-mode`** (Batch API Google, um job por **bloco** no pipeline) e **`--batch-local`** (testes, concorrencia local); **mutuamente exclusivas**. Sem batch: sync ou HF async legado conforme `GENTUBE_IMAGE_*`. Poll: `image:sync`. Limites: **18.2.1**, **18.7.1**, secao **22**.
+  - **thumbnails**: mesma politica de provedor/entrega que imagens (`--google-batch-mode`, `auto`, etc.); `block_number=0` em `image_jobs`. Flags: `--reference-url`, `--avatar-file`, `--count`, `--prompt`.
+
+- `gentube gemini:image` (**planeado** — testes avulsos)
+  - Um prompt: **sync** por defeito (`--prompt`, `--out`)
+  - Varias imagens: **`--google-batch-mode`** + `--prompts-file` + `--out-dir`, ou **`--batch-local`** + `--concurrency`
+  - `--reference <path>` para consistencia multimodal (avatar)
+  - Escopo batch manual: agrupar por **projeto** (nao por bloco)
+
+- `gentube image:sync [--project <id|slug>] [--provider all|higgsfield|gemini] [--watch] [--interval]` (**planeado**)
+  - Poll unificado de `image_jobs` (HF get + Gemini batch)
+  - `gentube higgsfield:sync` permanece como alias HF ate migracao completa
+
+- `gentube image:status --project <id|slug>` (**planeado**)
+  - Resumo pending/done/failed por provider
 
 - `gentube run-all --project <id|slug> [--prompt-matrix <ficheiro>] [--prompt-canal-voice <ficheiro>]`
   - executa pipeline completo das etapas **roteiro** e **narracao** (nao inclui imagens automaticamente)
@@ -356,8 +376,19 @@ Variaveis em `.env`:
 - `GENTUBE_MAX_VIDEOS_BLOCK1`, `GENTUBE_MAX_IMAGES_BLOCK1` (opcionais): caps do plano no **bloco 1** (defaults: **16** videos, **20** imagens)
 - `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS`, `GENTUBE_MAX_IMAGES_OTHER_BLOCKS` (opcionais): caps nos **blocos 2..N** (defaults: **10** videos, **40** imagens)
 - `GENTUBE_SCENE_PLAN_V2` (opcional): `1` / `true` / `yes` ativa plano por cenas no step imagens (equivalente a `--scene-plan-v2` quando a flag nao e passada)
-- `GENTUBE_FORCE_VIZ_REGEN` (opcional): `1` / `true` / `yes` forca nova segmentacao/visualizacao Claude no retry e apaga `hf_cli_jobs` do bloco; sem isto, reutiliza `blockXX.assets.json` e/ou `.error` quando aplicavel
-- `GENTUBE_HF_ASYNC` (opcional): habilita enfileiramento HF sem `--wait` no step imagens
+- `GENTUBE_FORCE_VIZ_REGEN` (opcional): `1` / `true` / `yes` forca nova segmentacao/visualizacao Claude no retry e apaga jobs do bloco na fila HF/imagem; sem isto, reutiliza `blockXX.assets.json` e/ou `.error` quando aplicavel
+- `GENTUBE_HF_ASYNC` (opcional): habilita enfileiramento HF sem `--wait` no step imagens (legado; ver migracao **22**)
+- `GEMINI_API_KEY` (obrigatoria se usar Gemini): chave Google GenAI; alias aceite: `google_api_key`
+- `google_project_name`, `google_parent_folder_id` (opcionais): Vertex / Batch API Google
+- `GEMINI_IMAGE_MODEL` (opcional): default `gemini-2.5-flash-image`
+- `GEMINI_IMAGE_MODEL_PRO` (opcional): ex. `gemini-3-pro-image-preview` para alta resolucao
+- `GENTUBE_IMAGE_BACKEND` (opcional): `auto` | `higgsfield` | `gemini` (default `auto`)
+- `GENTUBE_IMAGE_DELIVERY` (opcional): `sync` | `google_batch` | `local_batch` (default producao: `google_batch`)
+- `GENTUBE_GEMINI_BATCH_SCOPE` (opcional): `block` no pipeline (default); CLI `gemini:image` pode agrupar por projeto
+- `GENTUBE_GEMINI_BATCH_POLL_INTERVAL` (opcional): ex. `60s` para `image:sync`
+- `GENTUBE_GEMINI_LOCAL_CONCURRENCY` (opcional): default `4` para `--batch-local`
+- `GENTUBE_GEMINI_IMAGE_ASPECT_RATIO` (opcional): default `16:9`
+- `GENTUBE_GEMINI_IMAGE_SIZE` (opcional): default `1K`
 - `HIGGSFIELD_CLI_PATH` (opcional): caminho absoluto do executavel `hf` se nao estiver no PATH
 - `HIGGSFIELD_CREDENTIALS_PATH` (opcional): sobrescreve `~/.config/higgsfield/credentials.json`
 - `HIGGSFIELD_CLI_WAIT_TIMEOUT` (opcional): timeout do `--wait` no modo sincrono (ex.: `15m`)
@@ -397,7 +428,12 @@ Politica de versionamento (Git):
 - `src/integrations/higgsfield-cli.ts` — execucao do CLI `hf` (create/get, sync e async)
 - `src/integrations/higgsfield-agents.ts` — HTTP agents (status), resolucao do binario `hf`
 - `src/integrations/magnific.ts` — busca e download de stock footage/imagens via API Magnific
-- `src/services/hf-cli-sync.ts` — sincronizacao de `hf_cli_jobs`
+- `src/services/hf-cli-sync.ts` — sincronizacao legada de `hf_cli_jobs`
+- `src/integrations/gemini-image.ts` — sync inline Gemini (**planeado**)
+- `src/integrations/gemini-batch.ts` — submit/poll Batch API Google (**planeado**)
+- `src/services/image-generation.ts` — backend, fallback HF→Gemini (**planeado**)
+- `src/services/image-sync.ts` — poll `image_jobs` (**planeado**)
+- `src/services/image-local-batch.ts` — worker batch local (**planeado**)
 - `src/db/` conexao, migrations e repositorios
 - `src/services/` orchestrator de pipeline
 - `Prompts/matriz.md` — prompt base da etapa **roteiro** (carregado pelo código)
@@ -871,3 +907,131 @@ Assim, apos `sync-from-disk` (imagens) ou apos uma corrida bem-sucedida, `run-st
 ### 21.7 Documentacao de utilizador
 
 Resumo no `README.md` (secção dedicada) e referência cruzada a esta secção 21.
+
+## 22) Provedores de imagem — Higgsfield + Google Gemini (aprovado)
+
+**Estado:** especificacao e documentacao **aprovadas**; implementacao em fases (ver **22.8**). **Videos** permanecem apenas no Higgsfield (`kling3_0`).
+
+### 22.1 Objetivos
+
+- Segundo provedor de **imagens** via Google GenAI (`@google/genai`, Nano Banana).
+- Fallback em `GENTUBE_IMAGE_BACKEND=auto`: HF primeiro; em **qualquer** falha relevante (sem creditos, timeout, 5xx, erro CLI) → **uma** tentativa Gemini (modo conforme `GENTUBE_IMAGE_DELIVERY`).
+- Producao economica: **Batch API Google** por defeito (`GENTUBE_IMAGE_DELIVERY=google_batch`, flag `--google-batch-mode`).
+- Fila unificada **`image_jobs`** (migracao **opcao B**: substituir uso de `hf_cli_jobs` para imagens).
+- **Thumbnails** na mesma politica ( `block_number = 0` ).
+
+### 22.2 Provedor (`GENTUBE_IMAGE_BACKEND`)
+
+| Valor | Comportamento |
+|-------|----------------|
+| `auto` | HF para imagens `ai_generated`; falha HF → Gemini (1x) |
+| `higgsfield` | So HF; sem fallback |
+| `gemini` | So Gemini; nao chama HF para imagens |
+
+### 22.3 Modos de entrega (`GENTUBE_IMAGE_DELIVERY` + flags CLI)
+
+| Modo | Flag CLI | Pipeline | Latencia | Custo |
+|------|----------|----------|----------|-------|
+| `sync` | (nenhuma; 1 prompt no `gemini:image`) | Inline `generateContent` | Segundos | API normal |
+| `google_batch` | `--google-batch-mode` | Submit Batch API; **um batch por bloco** | Minutos–horas | ~50% vs inline (politica Google) |
+| `local_batch` | `--batch-local` | Pool local com `GENTUBE_GEMINI_LOCAL_CONCURRENCY` | Segundos–min | API normal × N |
+
+**Regras de flags:**
+
+- `--google-batch-mode` e `--batch-local` sao **mutuamente exclusivas** (erro se ambas).
+- `gemini:image` com **um** `--prompt`: sempre **sync**.
+- Batch Google ou local: exige `--prompts-file` **ou** `--google-batch-mode` / `--batch-local` explicito no pipeline.
+- Com `--google-batch-mode` no pipeline: se o **submit** batch falhar → **falhar direto** (sem fallback sync); log + `image_jobs.outcome=failed`.
+
+**Escopo do batch:**
+
+- **Pipeline** (`run-step` / `retry` imagens e thumbnails): agrupar por **bloco** (`GENTUBE_GEMINI_BATCH_SCOPE=block`).
+- **CLI** `gemini:image`: pode agrupar por **projeto** ou lote manual definido no comando.
+
+### 22.4 Tabela `image_jobs` (schema alvo)
+
+```sql
+CREATE TABLE image_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  block_number INTEGER NOT NULL,
+  shot_id TEXT NOT NULL,
+  asset_type TEXT NOT NULL DEFAULT 'image' CHECK(asset_type = 'image'),
+  provider TEXT NOT NULL CHECK(provider IN ('higgsfield', 'gemini')),
+  delivery_mode TEXT NOT NULL CHECK(delivery_mode IN ('sync', 'google_batch', 'local_batch')),
+  external_id TEXT,
+  batch_id TEXT,
+  out_path_no_ext TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  outcome TEXT NOT NULL DEFAULT 'pending' CHECK(outcome IN ('pending', 'done', 'failed')),
+  result_mime TEXT,
+  error_message TEXT,
+  reference_image_path TEXT,
+  downloaded_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(project_id) REFERENCES video_projects(id)
+);
+CREATE INDEX idx_image_jobs_outcome ON image_jobs(outcome);
+CREATE INDEX idx_image_jobs_batch ON image_jobs(batch_id);
+CREATE INDEX idx_image_jobs_project_block ON image_jobs(project_id, block_number);
+```
+
+**Migracao opcao B:** deixar de inserir imagens em `hf_cli_jobs`; migrar linhas existentes; `higgsfield:sync` → `image:sync --provider higgsfield` (alias temporario).
+
+### 22.5 Integracao Google GenAI
+
+- SDK: `@google/genai` (`GoogleGenAI`, `ai.models.generateContent`).
+- Chave: `GEMINI_API_KEY` (alias `google_api_key` no codigo).
+- Modelo default: `gemini-2.5-flash-image`; opcional Pro via `GEMINI_IMAGE_MODEL_PRO` / flag `--model pro`.
+- Saida: `candidates[0].content.parts[].inlineData` → gravar `{out_path_no_ext}.png` (ou extensao do mime).
+- Config imagem: `config.imageConfig.aspectRatio: '16:9'`, `imageSize: '1K'` (variaveis `GENTUBE_GEMINI_IMAGE_*`).
+- Referencia / avatar: `contents` multimodal (texto + `inlineData` da imagem) quando `character_required` ou thumbnails com `--avatar-file`.
+
+**Batch API Google:** modulo `gemini-batch.ts` — submit, poll, download para `out_path_no_ext`; `external_id` = operacao Google; `batch_id` interno por bloco/projeto.
+
+**Batch local:** modulo `image-local-batch.ts` — processa `image_jobs` pendentes com concorrencia limitada; mesmo API inline que sync.
+
+### 22.6 Fallback (`auto`) — decisoes aprovadas
+
+1. Tentativa HF (sync ou enqueue em `image_jobs` / legado `hf_cli_jobs`).
+2. Em falha (inclui `not_enough_credits`, timeout, 5xx, JSON CLI invalido, etc.): **uma** tentativa Gemini no modo definido por `GENTUBE_IMAGE_DELIVERY` (tipicamente sync no fallback imediato, ou re-enfileirar batch se delivery=batch — a implementacao deve documentar o ramo exato).
+3. Excecao: modo **`--google-batch-mode` forçado** sem fallback no submit (secao **22.3**).
+4. Vídeos: nunca Gemini nesta fase.
+
+### 22.7 Thumbnails (step 4)
+
+- Mesmos flags `--google-batch-mode`, `--batch-local` e `.env` `GENTUBE_IMAGE_*`.
+- Registos em `image_jobs` com `block_number = 0`, `shot_id` tipo `thumb_ref_01`.
+- Referencia YouTube + avatar: entrada multimodal no Gemini (equivalente a multiplos `--image` no HF).
+
+### 22.8 Fases de implementacao
+
+| Fase | Entregavel |
+|------|------------|
+| 0 | Migration SQLite `image_jobs`; plano migracao `hf_cli_jobs` |
+| 1a | `gemini-image.ts` + `gemini:image` sync |
+| 1b | `gemini:image --batch-local` |
+| 1c | `gemini-batch.ts` + `gemini:image --google-batch-mode` |
+| 2 | `image-generation.ts` + fallback `auto` no pipeline |
+| 3 | Enfileirar pipeline + `image:sync` |
+| 4 | Flags pipeline + thumbnails |
+| 5 | Referencia multimodal (avatar) |
+| 6 | Deprecar `hf_cli_jobs` para imagens; docs finais |
+
+### 22.9 Comandos CLI (resumo)
+
+```bash
+# Sync — 1 imagem
+gentube gemini:image --prompt "..." --out ./out/x.png
+
+# Batch Google
+gentube gemini:image --google-batch-mode --prompts-file prompts.txt --out-dir ./out
+
+# Batch local (testes)
+gentube gemini:image --batch-local --prompts-file prompts.txt --out-dir ./out --concurrency 4
+
+# Pipeline producao
+gentube run-step --project 1 --step imagens --google-batch-mode --scene-plan-v2
+gentube image:sync --project 1 --watch --interval 60s
+```
