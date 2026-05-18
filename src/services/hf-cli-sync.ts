@@ -3,6 +3,10 @@ import path from "node:path";
 import chalk from "chalk";
 import { runGenerateGetJson } from "../integrations/higgsfield-cli.js";
 import {
+  loadSceneVideoMetaFromProject,
+  renderVideoAfterHfFailure,
+} from "./video-generation.js";
+import {
   addProjectLog,
   countHfCliJobsByBlock,
   countHfCliJobsByBlockOutcome,
@@ -56,6 +60,41 @@ async function processOneJob(row: HfCliJobRow, idx: number, total: number): Prom
   const url = payload.result_url?.trim() ?? "";
 
   if (isTerminalFailure(st)) {
+    if (row.asset_type === "video" && row.block_number > 0) {
+      const project = getProjectByIdOrSlug(String(row.project_id));
+      const projectPath =
+        project && typeof project.project_path === "string" ? project.project_path : "";
+      const meta = projectPath
+        ? await loadSceneVideoMetaFromProject(projectPath, row.block_number, row.shot_id)
+        : null;
+      if (meta) {
+        console.log(chalk.yellow(`${tag} Job ${shortId}... HF falhou — tentando Veo → Magnific...`));
+        try {
+          const fallback = await renderVideoAfterHfFailure({
+            prompt: meta.prompt,
+            outPathNoExt: row.out_path_no_ext,
+            referenceImageUrl: meta.referenceImagePath,
+            magnificKeywords: meta.searchKeywords,
+          });
+          const now = new Date().toISOString();
+          updateHfCliJobPoll(row.id, {
+            hf_status: st,
+            outcome: "done",
+            error_message: `hf_failed; fallback=${fallback.provider}`,
+            downloaded_at: now,
+          });
+          console.log(
+            chalk.green(
+              `${tag} Job ${shortId}... fallback ${fallback.provider} → ${path.basename(fallback.localPath)}`
+            )
+          );
+          return;
+        } catch (fbErr) {
+          const fbMsg = fbErr instanceof Error ? fbErr.message : String(fbErr);
+          console.log(chalk.red(`${tag} Job ${shortId}... fallback falhou: ${fbMsg}`));
+        }
+      }
+    }
     console.log(chalk.red(`${tag} Job ${shortId}... FALHOU (status=${st})`));
     updateHfCliJobPoll(row.id, {
       hf_status: st,

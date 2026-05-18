@@ -218,6 +218,23 @@ export function listMediaBlocks(projectId: number): Array<{ block_number: number
     .all(projectId) as Array<{ block_number: number; plan_status: string; renders_status: string }>;
 }
 
+export type MediaBlockDetailRow = MediaBlockRow & {
+  plan_error: string | null;
+  finished_at: string | null;
+  updated_at: string;
+};
+
+export function listMediaBlocksDetailed(projectId: number): MediaBlockDetailRow[] {
+  const db = getDb();
+  return db
+    .prepare(
+      `SELECT block_number, plan_status, renders_status, renders_done_count, renders_total_count,
+              assets_json_path, plan_error, finished_at, updated_at
+       FROM media_blocks WHERE project_id = ? ORDER BY block_number`
+    )
+    .all(projectId) as MediaBlockDetailRow[];
+}
+
 export type MediaBlockRow = {
   block_number: number;
   plan_status: string;
@@ -326,6 +343,54 @@ export function listHfCliJobsPending(projectId?: number, limit = 50): HfCliJobRo
       .all(projectId, limit) as HfCliJobRow[];
   }
   return db.prepare(`SELECT * FROM hf_cli_jobs WHERE outcome = 'pending' ORDER BY id LIMIT ?`).all(limit) as HfCliJobRow[];
+}
+
+export function countHfCliJobsByProjectOutcome(
+  projectId: number,
+  outcome: "pending" | "done" | "failed",
+  assetType?: "image" | "video"
+): number {
+  const db = getDb();
+  if (assetType) {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) as n FROM hf_cli_jobs WHERE project_id = ? AND outcome = ? AND asset_type = ?`
+      )
+      .get(projectId, outcome, assetType) as { n: number };
+    return row.n;
+  }
+  const row = db
+    .prepare(`SELECT COUNT(*) as n FROM hf_cli_jobs WHERE project_id = ? AND outcome = ?`)
+    .get(projectId, outcome) as { n: number };
+  return row.n;
+}
+
+export function listHfCliJobsByProject(
+  projectId: number,
+  filters?: {
+    outcome?: "pending" | "done" | "failed";
+    assetType?: "image" | "video";
+    blockNumber?: number;
+  }
+): HfCliJobRow[] {
+  const db = getDb();
+  const clauses = ["project_id = ?"];
+  const params: Array<string | number> = [projectId];
+  if (filters?.outcome) {
+    clauses.push("outcome = ?");
+    params.push(filters.outcome);
+  }
+  if (filters?.assetType) {
+    clauses.push("asset_type = ?");
+    params.push(filters.assetType);
+  }
+  if (filters?.blockNumber !== undefined) {
+    clauses.push("block_number = ?");
+    params.push(filters.blockNumber);
+  }
+  return db
+    .prepare(`SELECT * FROM hf_cli_jobs WHERE ${clauses.join(" AND ")} ORDER BY block_number, id`)
+    .all(...params) as HfCliJobRow[];
 }
 
 export function countHfCliJobsPending(projectId?: number): number {

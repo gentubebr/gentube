@@ -34,7 +34,7 @@ IMPORTANTE: O ROTEIRO INTEIRO QUE VAI PARA O VÍDEO É EM **INGLÊS** (narraçã
 
 - **Penúltimo bloco (N−1), se N ≥ 2**  
   - Consolidação, **recap** do encadeamento, ou módulo avançado que prepara o fecho.  
-  - Se fizer sentido no tema, **CTA de comunidade** (subscrever, recursos) pode aparecer **aqui de forma breve**, desde que não sufoque o conteúdo — em tutoriais costuma concentrar-se mais no **último** bloco.
+  - **CTA de Inscricao no Canal** (subscrever, recursos) pode aparecer **aqui de forma breve**, desde que não sufoque o conteúdo — em tutoriais costuma concentrar-se mais no **último** bloco.
 
 - **Bloco N (fecho)**  
   - **Resumo** do caminho (“We covered A, then B, then C…”).  

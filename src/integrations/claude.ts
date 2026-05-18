@@ -20,6 +20,22 @@ function getClient(): Anthropic {
   return client;
 }
 
+/** Chamadas que exigem JSON no corpo: effort baixo evita thinking esgotar max_tokens (Opus 4.7). */
+function applyStructuredJsonCallParams(
+  createParams: MessageCreateParamsNonStreaming & {
+    thinking?: { type: "adaptive" };
+    output_config?: { effort: "low" };
+    temperature?: number;
+  }
+): void {
+  if (CLAUDE_THINKING === "adaptive") {
+    createParams.thinking = { type: "adaptive" };
+    createParams.output_config = { effort: "low" };
+  } else {
+    createParams.temperature = 0.35;
+  }
+}
+
 export async function generateScriptBlock(input: {
   promptBase: string;
   title: string;
@@ -203,17 +219,16 @@ ${input.blockText}
 Return ONLY JSON following segmenta01 schema (schema_version "2.0-segmentation", stage "segmentation").
 `.trim();
 
-  const createParams: MessageCreateParamsNonStreaming = {
+  const createParams: MessageCreateParamsNonStreaming & {
+    thinking?: { type: "adaptive" };
+    output_config?: { effort: "low" };
+    temperature?: number;
+  } = {
     model: CLAUDE_MODEL,
     max_tokens: CLAUDE_MAX_TOKENS,
     messages: [{ role: "user" as const, content: userPrompt }],
   };
-
-  if (CLAUDE_THINKING === "adaptive") {
-    (createParams as MessageCreateParamsNonStreaming & { thinking: unknown }).thinking = { type: "adaptive" };
-  } else {
-    createParams.temperature = 0.35;
-  }
+  applyStructuredJsonCallParams(createParams);
 
   const response = await anthropic.messages.create(createParams);
   const textOut = response.content
@@ -222,7 +237,12 @@ Return ONLY JSON following segmenta01 schema (schema_version "2.0-segmentation",
     .join("\n")
     .trim();
 
-  if (!textOut) throw new Error(`Claude retornou segmentacao vazia para bloco ${input.blockNumber}`);
+  if (!textOut) {
+    const reason = "stop_reason" in response ? String(response.stop_reason) : "unknown";
+    throw new Error(
+      `Claude retornou segmentacao vazia para bloco ${input.blockNumber} (stop_reason=${reason})`
+    );
+  }
   return textOut;
 }
 
@@ -259,17 +279,16 @@ ${input.segmentationJson}
 Return ONLY JSON following visualiza01 schema (schema_version "2.0-visualization").
 `.trim();
 
-  const createParams: MessageCreateParamsNonStreaming = {
+  const createParams: MessageCreateParamsNonStreaming & {
+    thinking?: { type: "adaptive" };
+    output_config?: { effort: "low" };
+    temperature?: number;
+  } = {
     model: CLAUDE_MODEL,
     max_tokens: CLAUDE_MAX_TOKENS,
     messages: [{ role: "user" as const, content: userPrompt }],
   };
-
-  if (CLAUDE_THINKING === "adaptive") {
-    (createParams as MessageCreateParamsNonStreaming & { thinking: unknown }).thinking = { type: "adaptive" };
-  } else {
-    createParams.temperature = 0.35;
-  }
+  applyStructuredJsonCallParams(createParams);
 
   const response = await anthropic.messages.create(createParams);
   const textOut = response.content
@@ -278,7 +297,12 @@ Return ONLY JSON following visualiza01 schema (schema_version "2.0-visualization
     .join("\n")
     .trim();
 
-  if (!textOut) throw new Error(`Claude retornou visualizacao vazia para bloco ${input.blockNumber}`);
+  if (!textOut) {
+    const reason = "stop_reason" in response ? String(response.stop_reason) : "unknown";
+    throw new Error(
+      `Claude retornou visualizacao vazia para bloco ${input.blockNumber} (stop_reason=${reason})`
+    );
+  }
   return textOut;
 }
 

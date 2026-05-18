@@ -8,7 +8,7 @@ CLI em **Node.js** para organizar projetos de vídeo no estilo YouTube: **roteir
 
 - Estrutura fixa de pastas por canal e por vídeo (`Videos/<canal>/<data>-<titulo>/`).
 - Roteiro em blocos (`block01.md`, …) a partir do prompt em `Prompts/matriz.md` ou **`matriz_tutorial.md`** (`GENTUBE_ROTEIRO_MODE=tutorial`, `GENTUBE_PROMPT_MATRIX` ou `--prompt-matrix`). No **bloco 1**, o ficheiro opcional `Prompts/canal_voice.md` fixa voz/persona do canal; nos **blocos seguintes**, o texto dos `.md` anteriores entra como contexto de coesão (configurável; ver tabela de variáveis).
-- Áudio por bloco (`block01.mp3`, …) alinhado ao roteiro.
+- Áudio por bloco (`block01.mp3`, …) ou **por cena** (`02 - Narracao/block01/sc01.mp3`, …) quando existe plano v2; concat com `ffmpeg` → `help run-step` (etapa narracao).
 - Status de cada etapa e de cada bloco gravados localmente (sem depender só de arquivos soltos).
 
 ## Pré-requisitos: contas, chaves e ferramentas
@@ -62,7 +62,7 @@ No `.env` do GenTube pode definir:
 
 ### Google GenAI / Gemini (imagens IA e thumbnails)
 
-Segundo provedor de **imagens** (Nano Banana via `@google/genai`). **Vídeos** continuam só no Higgsfield (`kling3_0`).
+Segundo provedor de **imagens** (Nano Banana via `@google/genai`). **Vídeos IA**: Higgsfield (`kling3_0`) com fallback **Veo** (`veo-3.1-lite-generate-preview`, 1080p, sem áudio, poll sync) e depois **Magnific** (stock) se faltar crédito/cota.
 
 1. Chave em [Google AI Studio](https://aistudio.google.com/apikey) ou Vertex; no `.env`: `GEMINI_API_KEY` (o alias `google_api_key` também é aceite).
 2. Batch oficial (produção, menor custo): `GENTUBE_IMAGE_DELIVERY=google_batch` ou flag `--google-batch-mode`.
@@ -181,12 +181,19 @@ Todos os exemplos abaixo usam `npm run gentube --`, que repassa os argumentos ao
 
 ### Ajuda
 
+A documentação **principal do CLI** está em `gentube help` (texto embutido em `src/cli-help.ts`): fluxo por etapa, flags de imagens v2, narração por cena, fallback de vídeo HF→Veo→Magnific e variáveis `.env` frequentes.
+
 ```bash
-npm run gentube -- --help          # ajuda geral (com exemplos no final)
-npm run gentube -- help            # equivalente ao help do Commander
-npm run gentube -- help run-step   # ajuda só do comando run-step
-npm run gentube -- <comando> --help
+npm run gentube -- --help              # visão geral + fluxo típico + exemplos
+npm run gentube -- help run-step       # roteiro, narração, imagens (plan-only / enqueue-only), thumbnails
+npm run gentube -- help retry          # reprocessar etapa ou bloco
+npm run gentube -- help video:retry    # HF → Veo → Magnific
+npm run gentube -- help image:sync     # poll image_jobs (HF + Gemini batch)
+npm run gentube -- help sync-from-disk # alinhar SQLite com disco
+npm run gentube -- <comando> --help    # equivalente a help <comando>
 ```
+
+Comandos com secção **Exemplos** no final do help: `run-step`, `retry`, `video:retry`, e a ajuda geral (`--help`).
 
 Se você rodar só `npm run gentube --` (sem subcomando), o programa mostra um resumo, sugere `init` e lista todos os comandos.
 
@@ -233,10 +240,20 @@ npm run gentube -- run-all --project 1
 npm run gentube -- status --project 1
 
 # 6b) Imagens IA — batch Google (produção) ou HF async legado
-npm run gentube -- run-step --project 1 --step imagens --google-batch-mode
+npm run gentube -- run-step --project 1 --step imagens --google-batch-mode --scene-plan-v2
 npm run gentube -- image:sync --project 1 --watch --interval 60s
 # HF legado (hf_cli_jobs → migrar para image_jobs):
 npm run gentube -- higgsfield:sync --project 1
+
+# 6b-i) Imagens v2 em 3 fases (planos de todos os blocos → enqueue → submit N batches)
+npm run gentube -- run-step --project 10 --step imagens --scene-plan-v2 --plan-only
+npm run gentube -- run-step --project 10 --step imagens --scene-plan-v2 --google-batch-mode --enqueue-only
+npm run gentube -- image:sync --project 10 --watch --interval 60s
+# Ou submit manual antes do sync:
+npm run gentube -- image:batch-submit --project 10
+
+# 6b-ii) So bloco 1 (retry)
+npm run gentube -- retry --project 10 --stage imagens --block 1 --scene-plan-v2 --google-batch-mode
 
 # 6c) Teste avulso Gemini (planeado)
 npm run gentube -- gemini:image --prompt "cinematic 16:9 ..." --out ./out/teste.png
@@ -355,6 +372,8 @@ O Claude decide **quais** shots são IA vs stock no plano de direção (`blockXX
 
 Com `GENTUBE_HF_ASYNC` e backend HF, imagens `ai_generated` vão para a fila sem `--wait`. Conclua com **`image:sync`** (recomendado) ou **`higgsfield:sync`** (alias HF). Com `--google-batch-mode`, o submit é Batch API Google por **bloco** no pipeline; poll via `image:sync`. Stock Magnific continua imediato.
 
+**Fases do step imagens (schema 2.0):** `--plan-only` (só Claude → `blockNN.assets.json`, todos os blocos); `--enqueue-only` (stock + filas + vídeos HF, **sem** submit por bloco); no fim do `enqueue-only` o CLI submete **N batches** Google (1 por bloco). Modo legado sem essas flags: plano + enqueue + submit **por bloco** como antes. `--plan-only` e `--enqueue-only` exigem `--scene-plan-v2` e são mutuamente exclusivas.
+
 Requisitos:
 
 - Binário **`hf`** instalado (ex.: pacote `@higgsfield/cli`) no `PATH`, ou variável **`HIGGSFIELD_CLI_PATH`** no `.env` com o caminho absoluto do executável.
@@ -383,6 +402,7 @@ Regras de negócio, modelo de dados, contratos de comandos e decisões de implem
 - Implementar `image_jobs`, `gemini:image`, `image:sync` e flags `--google-batch-mode` / `--batch-local` (spec sec. 22).
 - Migrar imagens de `hf_cli_jobs` → `image_jobs`.
 - Incluir steps no `run-all` ou comando `run-all --with-imagens`.
+- Step **montagem** (FFmpeg): clipes por cena + bloco com **Ken Burns zoom-in** em imagens e **xfade 0,1 s** (`fade`) entre cenas — ver **sec. 23** de `ESPECIFICACAO_TECNICA.md` (prototipo em `experiments/ffmpeg-scene-tests/`).
 
 ## Licença
 

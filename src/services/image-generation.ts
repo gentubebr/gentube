@@ -151,6 +151,12 @@ export async function renderSceneImage(
   const delivery = input.forceSync ? "sync" : resolveImageDelivery(effectiveFlags);
   const backend = resolveImageBackend(effectiveFlags, delivery);
 
+  // Bootstrap de video (forceSync) deve concluir na hora; HF async nao serve aqui.
+  if (input.forceSync) {
+    const localPath = await renderGeminiSync(input, input.referenceImageUrl);
+    return { provider: "gemini", doneSync: true, queued: false, localPath };
+  }
+
   if (delivery === "google_batch") {
     const bid = batchId ?? crypto.randomUUID();
     return queueGeminiBatchJob({ ...input, flags: effectiveFlags }, bid);

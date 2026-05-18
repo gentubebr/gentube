@@ -14,6 +14,7 @@ import {
   DEFAULT_MAX_VIDEOS_OTHER_BLOCKS,
   ELEVENLABS_VOICE_ID,
   GEMINI_LOCAL_BATCH_CONCURRENCY,
+  assertImagensPhaseFlagsExclusive,
   imageRunFlagsFromCli,
   ROOT_DIR,
   VIDEOS_DIR,
@@ -41,10 +42,14 @@ import type { ImageJobRow } from "./types/image-jobs.js";
 import {
   countAllImageJobsPending,
   GEMINI_BATCH_POLL_INTERVAL_MS,
+  submitPendingGoogleBatches,
   syncImageJobsOnce,
 } from "./services/image-sync.js";
+import type { ImagensVideosOptions } from "./services/pipeline.js";
 import { processLocalImageBatch } from "./services/image-local-batch.js";
 import { syncHiggsfieldCliJobsOnce } from "./services/hf-cli-sync.js";
+import { printVideoProjectStatus } from "./services/video-status-cli.js";
+import { retryMissingVideos } from "./services/video-retry.js";
 import { runInit } from "./init-setup.js";
 import {
   runImagensVideos,
@@ -65,6 +70,7 @@ import {
   runHiggsfieldCli,
 } from "./integrations/higgsfield-agents.js";
 import { getSubscriptionInfo } from "./integrations/elevenlabs.js";
+import { CLI_HELP } from "./cli-help.js";
 
 type ProjectRow = Record<string, unknown>;
 
@@ -96,8 +102,9 @@ const program = new Command();
 program
   .name("gentube")
   .description(
-    "Organiza projetos de video por canal, gera roteiro (Claude) e narracao (ElevenLabs), " +
-      "com status no SQLite. Veja o README.md para o fluxo completo."
+    "CLI de producao de video por canal: roteiro (Claude), narracao (ElevenLabs), " +
+      "imagens/videos (HF, Gemini, Magnific, Veo), thumbnails e status no SQLite. " +
+      "Use: gentube help <comando> para detalhes de cada etapa."
   )
   .version(VERSION, "-V, --version", "Exibe a versao e encerra")
   .helpOption("-h, --help", "Exibe ajuda geral (ou use: help <comando>)");
@@ -106,40 +113,10 @@ program.configureHelp({ sortSubcommands: true });
 
 program.helpCommand(
   "help [comando]",
-  "Mostra esta ajuda ou a ajuda de um subcomando (ex.: help run-step)"
+  "Ajuda detalhada de um subcomando (ex.: help run-step, help video:retry)"
 );
 
-program.addHelpText(
-  "after",
-  `
-${chalk.bold("Exemplos")}
-  npm run gentube -- init
-  npm run gentube -- channel:list
-  npm run gentube -- projects:list
-  npm run gentube -- create-video
-  npm run gentube -- run-step --project 1 --step roteiro
-  npm run gentube -- run-step --project 1 --step roteiro --prompt-matrix matriz_tutorial.md
-  npm run gentube -- run-step --project 1 --step roteiro --prompt-canal-voice canal_voice.md
-  npm run gentube -- run-all --project 1
-  npm run gentube -- status --project 20260508-meu-video
-  npm run gentube -- retry --project 1 --stage narracao --block 2
-  npm run gentube -- elevenlabs:status
-  npm run gentube -- higgsfield:status
-  npm run gentube -- higgsfield:generate nano_banana_flash --prompt "..." --aspect_ratio 16:9 --resolution 1k --wait
-  GENTUBE_HF_ASYNC=1 npm run gentube -- run-step --project 1 --step imagens
-  npm run gentube -- run-step --project 1 --step imagens --max-videos-block1 8 --max-images-block1 12
-  npm run gentube -- run-step --project 1 --step thumbnails --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" --avatar-file Avatars/seu-avatar.jpg --count 2
-  npm run gentube -- run-step --project 1 --step thumbnails --avatar-file Avatars/seu-avatar.jpg --count 2
-  npm run gentube -- higgsfield:sync --project 1
-  npm run gentube -- higgsfield:sync --project 1 --watch --interval 20s
-  npm run gentube -- copy-cmd --project 1 --remote-host dev-development
-  npm run gentube -- copy-cmd --project 1
-  npm run gentube -- sync-from-disk --project 6 --dry-run
-  npm run gentube -- sync-from-disk --project 6 --only roteiro
-
-${chalk.bold("Documentacao")}  README.md  ·  ESPECIFICACAO_TECNICA.md
-`.trimStart()
-);
+program.addHelpText("after", CLI_HELP.main);
 
 program.showHelpAfterError(chalk.dim("(use --help ou help <comando> para mais detalhes)"));
 
@@ -257,9 +234,8 @@ type CreateVideoCliOptions = {
 
 program
   .command("create-video")
-  .description(
-    "Cria projeto de video: interativo, ou preencha com flags (--channel, --title, --transcript-file, etc.)"
-  )
+  .description("Cria pasta do projeto + SQLite; modo iterativo ou sequencial apos criar")
+  .addHelpText("after", CLI_HELP.createVideo)
   .option("--channel <id>", "ID do canal (channel:list). Sem flag, abre menu")
   .option("--title <texto>", "Titulo do video")
   .option("--niche <texto>", "Nicho ([NOME DO NICHO] no prompt de roteiro)")
@@ -426,11 +402,12 @@ program
 program
   .command("run-step")
   .description(
-    "Roda uma etapa do projeto: roteiro, narracao, imagens ou thumbnails. Step imagens: defina GENTUBE_HF_ASYNC=1 para enfileirar jobs HF sem --wait; conclua com gentube higgsfield:sync"
+    "Executa uma etapa do pipeline: roteiro | narracao | imagens | thumbnails (ver help run-step)"
   )
-  .requiredOption("--project <idOuSlug>", "ID numerico (ex.: 1) ou slug da pasta (ex.: 20260508-meu-titulo)")
-  .requiredOption("--step <etapa>", "roteiro | narracao | imagens | thumbnails")
-  .option("--voice-id <id>", "Voice ElevenLabs; se omitido, usa ELEVENLABS_VOICE_ID do .env ou pede no terminal")
+  .addHelpText("after", CLI_HELP.runStep)
+  .requiredOption("--project <idOuSlug>", "ID numerico (ex.: 10) ou slug da pasta (ex.: 20260518-meu-titulo)")
+  .requiredOption("--step <etapa>", "Etapa: roteiro | narracao | imagens | thumbnails")
+  .option("--voice-id <id>", "Narracao: voice ElevenLabs (padrao: ELEVENLABS_VOICE_ID ou prompt)")
   .option("--avatar-file <caminho>", "Opcional: avatar para consistencia visual (imagens e thumbnails)")
   .option("--reference-url <url>", "Step thumbnails: URL do video YouTube cuja thumbnail sera usada como referencia")
   .option("--count <n>", "Step thumbnails: quantidade de thumbnails a gerar (padrao 2)", "2")
@@ -447,9 +424,20 @@ program
     "--prompt-canal-voice <ficheiro>",
     "Step roteiro bloco 1: voz do canal (Prompts/; padrao canal_voice.md). Sobrescreve GENTUBE_PROMPT_CANAL_VOICE"
   )
-  .option("--scene-plan-v2", "Step imagens: plano por cenas (Claude em 2 passos, schema 2.0)")
-  .option("--google-batch-mode", "Imagens/thumbnails: Batch API Google (um batch por bloco no pipeline)")
-  .option("--batch-local", "Imagens/thumbnails: batch local Gemini (testes; mutuamente exclusivo com --google-batch-mode)")
+  .option(
+    "--scene-plan-v2",
+    "Imagens: plano por cenas (segmentacao + visualizacao Claude → blockNN.assets.json schema 2.0)"
+  )
+  .option(
+    "--google-batch-mode",
+    "Imagens/thumbnails: entrega via Batch API Google (1 batch por bloco; poll com image:sync)"
+  )
+  .option("--batch-local", "Imagens/thumbnails: batch paralelo local Gemini (testes; exclusivo com --google-batch-mode)")
+  .option("--plan-only", "Imagens v2: apenas Claude → assets.json em todos os blocos (exige --scene-plan-v2)")
+  .option(
+    "--enqueue-only",
+    "Imagens v2: stock + filas + videos HF; submit N batches Google no fim (exige plano + --scene-plan-v2)"
+  )
   .action(async (options: {
     project: string;
     step: "roteiro" | "narracao" | "imagens" | "thumbnails";
@@ -467,6 +455,8 @@ program
     scenePlanV2?: boolean;
     googleBatchMode?: boolean;
     batchLocal?: boolean;
+    planOnly?: boolean;
+    enqueueOnly?: boolean;
   }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
@@ -477,8 +467,8 @@ program
     }
     if (options.step === "imagens") {
       const limits = parseStep3Limits(options);
-      const imageFlags = imageRunFlagsFromCli(options);
-      await executeImagens(project, options.avatarFile, limits, options.scenePlanV2, imageFlags);
+      const imagensOpts = buildImagensVideosOpts(options);
+      await executeImagens(project, options.avatarFile, limits, imagensOpts);
       return;
     }
     if (options.step === "thumbnails") {
@@ -499,7 +489,8 @@ program
 
 program
   .command("run-all")
-  .description("Pipeline completo: roteiro todos os blocos, depois narracao (mesma ordem que create-video sequencial)")
+  .description("Roteiro (todos os blocos) e narracao em sequencia — nao inclui imagens/thumbnails")
+  .addHelpText("after", CLI_HELP.runAll)
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto em video_projects")
   .option("--voice-id <id>", "Voice ElevenLabs (ou .env ELEVENLABS_VOICE_ID)")
   .option(
@@ -519,9 +510,8 @@ program
 
 program
   .command("sync-from-disk")
-  .description(
-    "Alinha o SQLite com ficheiros ja existentes no disco (roteiro .md, narracao .mp3, imagens plano+renders). Ver README / ESPECIFICACAO secao 21"
-  )
+  .description("Sincroniza SQLite com ficheiros no disco (roteiro, narracao, plano/renders de imagens)")
+  .addHelpText("after", CLI_HELP.syncFromDisk)
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
   .option("--dry-run", "Lista alteracoes sem escrever no SQLite")
   .option("--force", "Reimportar blocos que ja estao success no DB")
@@ -547,7 +537,8 @@ program
 
 program
   .command("shot-list-manual")
-  .description("Gera shot_list_manual.md e shot_list_manual.csv (capturas manuais) a partir de block*.assets.json schema 2.0")
+  .description("Exporta lista de capturas manuais (MD + CSV) a partir de block*.assets.json v2")
+  .addHelpText("after", CLI_HELP.shotListManual)
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
   .action(async (opts: { project: string }) => {
     const project = getProjectByIdOrSlug(opts.project);
@@ -560,7 +551,8 @@ program
 
 program
   .command("status")
-  .description("Resumo das etapas (roteiro, narracao, etc.) e caminho da pasta do projeto")
+  .description("Status das etapas do projeto e caminho da pasta no disco")
+  .addHelpText("after", CLI_HELP.status)
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
   .action(async (options: { project: string }) => {
     const project = getProjectByIdOrSlug(options.project);
@@ -575,7 +567,8 @@ program
 
 program
   .command("elevenlabs:status")
-  .description("Uso de caracteres da conta ElevenLabs no periodo atual")
+  .description("Cota de caracteres ElevenLabs no periodo atual (antes/depois da narracao)")
+  .addHelpText("after", CLI_HELP.elevenlabsStatus)
   .option("--json", "Imprime JSON bruto")
   .action(async (options: { json?: boolean }) => {
     try {
@@ -790,9 +783,8 @@ program
 
 program
   .command("image:sync")
-  .description(
-    "Poll/download jobs de imagem (image_jobs: HF + Gemini batch). Videos HF continuam em higgsfield:sync"
-  )
+  .description("Poll/download de image_jobs (HF + Gemini batch); videos HF usam higgsfield:sync")
+  .addHelpText("after", CLI_HELP.imageSync)
   .option("--project <idOuSlug>", "Somente jobs deste projeto")
   .option("--provider <nome>", "all | higgsfield | gemini", "all")
   .option("--max-jobs <n>", "Maximo de jobs HF por rodada", "30")
@@ -857,8 +849,29 @@ program
   );
 
 program
+  .command("image:batch-submit")
+  .description("Submete batches Google pendentes (1 operacao por bloco) apos --enqueue-only")
+  .addHelpText("after", CLI_HELP.imageBatchSubmit)
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .action(async (options: { project: string }) => {
+    const p = getProjectByIdOrSlug(options.project.trim());
+    if (!p) throw new Error("Projeto nao encontrado");
+    const projectId = Number(p.id);
+    const submitted = await submitPendingGoogleBatches(projectId);
+    console.log(chalk.cyan(`image:batch-submit: ${submitted} batch(es) Google submetido(s) (projeto ${projectId}).`));
+    if (submitted > 0) {
+      console.log(
+        chalk.yellow(`Rode: npm run gentube -- image:sync --project ${projectId} --watch --interval 60s`)
+      );
+    } else {
+      console.log(chalk.dim("Nenhum image_job google_batch aguardando submit (sem external_id)."));
+    }
+  });
+
+program
   .command("image:status")
-  .description("Resumo de image_jobs pendentes/concluidos por projeto")
+  .description("Fila de image_jobs (HF/Gemini) e hf_cli_jobs de video por projeto")
+  .addHelpText("after", CLI_HELP.imageStatus)
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
   .action(async (options: { project: string }) => {
     const p = getProjectByIdOrSlug(options.project.trim());
@@ -874,13 +887,57 @@ program
     if (pending > 0) {
       console.log(chalk.yellow(`  Rode: npm run gentube -- image:sync --project ${projectId} --watch`));
     }
+    if (hfVideos > 0) {
+      console.log(chalk.yellow(`  Videos HF: npm run gentube -- higgsfield:sync --project ${projectId} --watch`));
+    }
+    console.log(chalk.dim(`  Detalhe videos/blocos: npm run gentube -- video:status --project ${projectId}`));
+  });
+
+program
+  .command("video:status")
+  .description("Visao de blocos, jobs HF de video e cenas IA sem arquivo no disco")
+  .addHelpText("after", CLI_HELP.videoStatus)
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .action(async (options: { project: string }) => {
+    await printVideoProjectStatus(options.project);
+  });
+
+program
+  .command("video:retry")
+  .description("Regera videos IA em falta: HF → Veo → Magnific (padrao: credito/cota ou sem arquivo)")
+  .addHelpText("after", CLI_HELP.videoRetry)
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .option("--block <n>", "Limita ao bloco N (1-based)")
+  .option("--dry-run", "Lista cenas retentaveis sem chamar APIs")
+  .option("--all-failed", "Inclui falhas HF que nao sao claramente credito/cota")
+  .action(async (options: { project: string; block?: string; dryRun?: boolean; allFailed?: boolean }) => {
+    const blockNumber = options.block !== undefined ? parseInt(options.block, 10) : undefined;
+    if (options.block !== undefined && (!Number.isFinite(blockNumber!) || blockNumber! < 1)) {
+      throw new Error("--block deve ser um numero >= 1");
+    }
+    const result = await retryMissingVideos({
+      projectIdOrSlug: options.project,
+      blockNumber,
+      creditsOnly: !options.allFailed,
+      dryRun: Boolean(options.dryRun),
+    });
+    console.log(
+      chalk.cyan(
+        `\nvideo:retry: tentados=${result.attempted}, ok=${result.succeeded}, falhas=${result.failed.length}`
+      )
+    );
+    if (result.failed.length > 0) {
+      for (const f of result.failed) {
+        console.log(chalk.red(`  bloco ${f.shot.blockNumber} ${f.shot.shotId}: ${f.error}`));
+      }
+      process.exitCode = 1;
+    }
   });
 
 program
   .command("higgsfield:sync")
-  .description(
-    "Poll/download jobs HF em hf_cli_jobs (videos e thumbs HF legado). Imagens em image_jobs: use image:sync"
-  )
+  .description("Poll/download hf_cli_jobs (videos IA e thumbs HF); imagens → image:sync")
+  .addHelpText("after", CLI_HELP.higgsfieldSync)
   .option("--project <idOuSlug>", "Somente jobs deste projeto (omitir = todos os pendentes)")
   .option("--max-jobs <n>", "Maximo de jobs a processar por rodada", "30")
   .option("--watch", "Repete ate nao restar job com outcome=pending (Ctrl+C encerra)")
@@ -1002,9 +1059,10 @@ program
 
 program
   .command("retry")
-  .description("Gera de novo roteiro, narracao, imagens ou thumbnails (etapa inteira ou so um bloco com --block)")
+  .description("Reprocessa roteiro | narracao | imagens | thumbnails (etapa ou --block N)")
+  .addHelpText("after", CLI_HELP.retry)
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
-  .requiredOption("--stage <etapa>", "roteiro | narracao | imagens | thumbnails")
+  .requiredOption("--stage <etapa>", "Etapa: roteiro | narracao | imagens | thumbnails")
   .option("--block <N>", "Somente o bloco N (base 1). Sem esta opcao, refaz todos os blocos da etapa")
   .option("--voice-id <id>", "Obrigatorio implicitamente para narracao: .env ou flag")
   .option("--avatar-file <caminho>", "Opcional para stage imagens/thumbnails: avatar de consistencia")
@@ -1026,6 +1084,8 @@ program
   .option("--scene-plan-v2", "Stage imagens: plano por cenas (schema 2.0)")
   .option("--google-batch-mode", "Stage imagens/thumbnails: Batch API Google")
   .option("--batch-local", "Stage imagens/thumbnails: batch local Gemini (testes)")
+  .option("--plan-only", "Stage imagens v2: so plano Claude (exige --scene-plan-v2)")
+  .option("--enqueue-only", "Stage imagens v2: enqueue + submit batch no fim (exige --scene-plan-v2)")
   .action(
     async (options: {
       project: string;
@@ -1045,6 +1105,8 @@ program
       scenePlanV2?: boolean;
       googleBatchMode?: boolean;
       batchLocal?: boolean;
+      planOnly?: boolean;
+      enqueueOnly?: boolean;
     }) => {
       const project = getProjectByIdOrSlug(options.project);
       if (!project) throw new Error("Projeto nao encontrado");
@@ -1067,11 +1129,11 @@ program
       }
       if (options.stage === "imagens") {
         const limits = parseStep3Limits(options);
-        const imageFlags = imageRunFlagsFromCli(options);
+        const imagensOpts = buildImagensVideosOpts(options);
         if (blockNumber !== undefined) {
-          await executeImagensBlock(project, blockNumber, options.avatarFile, limits, options.scenePlanV2, imageFlags);
+          await executeImagensBlock(project, blockNumber, options.avatarFile, limits, imagensOpts);
         } else {
-          await executeImagens(project, options.avatarFile, limits, options.scenePlanV2, imageFlags);
+          await executeImagens(project, options.avatarFile, limits, imagensOpts);
         }
         return;
       }
@@ -1127,19 +1189,31 @@ async function executeNarracao(project: ProjectRow, voiceId: string): Promise<vo
   }
 }
 
+function buildImagensVideosOpts(options: {
+  scenePlanV2?: boolean;
+  googleBatchMode?: boolean;
+  batchLocal?: boolean;
+  planOnly?: boolean;
+  enqueueOnly?: boolean;
+}): ImagensVideosOptions {
+  assertImagensPhaseFlagsExclusive(options);
+  return {
+    scenePlanV2: resolveScenePlanV2(options.scenePlanV2),
+    imageFlags: imageRunFlagsFromCli(options),
+    planOnly: Boolean(options.planOnly),
+    enqueueOnly: Boolean(options.enqueueOnly),
+  };
+}
+
 async function executeImagens(
   project: ProjectRow,
   avatarFile?: string,
   limits?: Step3Limits,
-  scenePlanV2Cli?: boolean,
-  imageFlags?: ReturnType<typeof imageRunFlagsFromCli>,
+  opts?: ImagensVideosOptions,
 ): Promise<void> {
   try {
     const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
-    await runImagensVideos(project, avatarAbs, limits, {
-      scenePlanV2: resolveScenePlanV2(scenePlanV2Cli),
-      imageFlags,
-    });
+    await runImagensVideos(project, avatarAbs, limits, opts);
     console.log(chalk.green.bold("Step 3 (imagens/videos) concluido com sucesso."));
   } catch (error) {
     console.log(chalk.red.bold("Falha no step 3 (imagens/videos)."));
@@ -1200,15 +1274,11 @@ async function executeImagensBlock(
   blockNumber: number,
   avatarFile?: string,
   limits?: Step3Limits,
-  scenePlanV2Cli?: boolean,
-  imageFlags?: ReturnType<typeof imageRunFlagsFromCli>,
+  opts?: ImagensVideosOptions,
 ): Promise<void> {
   try {
     const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
-    await runImagensVideosBlock(project, blockNumber, avatarAbs, limits, {
-      scenePlanV2: resolveScenePlanV2(scenePlanV2Cli),
-      imageFlags,
-    });
+    await runImagensVideosBlock(project, blockNumber, avatarAbs, limits, opts);
     console.log(chalk.green.bold(`Step 3 do bloco ${blockNumber} concluido.`));
   } catch (error) {
     console.log(chalk.red.bold(`Falha no step 3 do bloco ${blockNumber}.`));

@@ -35,8 +35,8 @@ import {
   enqueueVideoWithDefaultsCli,
   generateImageWithDefaultsCli,
   generateThumbnailCli,
-  generateVideoWithDefaultsCli,
 } from "../integrations/higgsfield-cli.js";
+import { renderVideoWithFallback } from "./video-generation.js";
 import {
   addProjectLog,
   countBlocksByStatus,
@@ -62,6 +62,10 @@ import {
   isGoogleBatchMode,
   renderSceneImage,
 } from "./image-generation.js";
+import {
+  flushPendingLocalBatchesForProject,
+  submitPendingGoogleBatches,
+} from "./image-sync.js";
 import { parseAndValidateAssetsPlan } from "../utils/assets-plan.js";
 import { tryConcatMp3WithFfmpeg } from "../utils/mp3-concat.js";
 import {
@@ -74,6 +78,7 @@ import {
   writePlanParseError,
 } from "../utils/scenes-plan.js";
 import { searchAndDownload } from "../integrations/magnific.js";
+import { sceneRenderOutputExists } from "../utils/media-output.js";
 import { Step3Limits } from "../types/step3-limits.js";
 import type { BlockScenesPlanV2, SceneVisualPlanV2, SegmentationPlanV2 } from "../types/scenes-plan.js";
 
@@ -102,22 +107,6 @@ async function tryLoadBlockScenesPlanV2(projectPath: string, blockNumber: number
   return plan;
 }
 
-async function sceneRenderOutputExists(
-  rendersDir: string,
-  sceneId: string,
-  type: "image" | "video"
-): Promise<boolean> {
-  const exts = type === "image" ? [".jpg", ".jpeg", ".png", ".webp"] : [".mp4", ".mov"];
-  for (const ext of exts) {
-    try {
-      await fs.access(path.join(rendersDir, `${sceneId}${ext}`));
-      return true;
-    } catch {
-      /* ausente */
-    }
-  }
-  return false;
-}
 
 function forceScenePlanVizRegen(): boolean {
   return ["1", "true", "yes"].includes(String(process.env.GENTUBE_FORCE_VIZ_REGEN ?? "").toLowerCase());
@@ -152,7 +141,68 @@ const GENTUBE_HF_ASYNC = ["1", "true", "yes"].includes(
   String(process.env.GENTUBE_HF_ASYNC ?? "").toLowerCase()
 );
 
-export type ImagensVideosOptions = { scenePlanV2?: boolean; imageFlags?: ImageRunFlags };
+export type ImagensVideosOptions = {
+  scenePlanV2?: boolean;
+  imageFlags?: ImageRunFlags;
+  /** So Claude v2 → blockNN.assets.json; sem stock, filas nem submit. */
+  planOnly?: boolean;
+  /** Plano existente → stock/filas; submit Google/local no fim do run (nao por bloco). */
+  enqueueOnly?: boolean;
+};
+
+function assertImagensPhaseRequiresV2(opts?: ImagensVideosOptions): void {
+  if ((opts?.planOnly || opts?.enqueueOnly) && !scenePlanV2Enabled(opts)) {
+    throw new Error("--plan-only e --enqueue-only exigem --scene-plan-v2 (ou GENTUBE_SCENE_PLAN_V2=1)");
+  }
+}
+
+function shouldSkipImagensBlock(projectId: number, blockNumber: number, opts?: ImagensVideosOptions): boolean {
+  if (opts?.planOnly) {
+    const row = getMediaBlock(projectId, blockNumber);
+    return row?.plan_status === "success";
+  }
+  if (opts?.enqueueOnly) {
+    const row = getMediaBlock(projectId, blockNumber);
+    if (row?.renders_status === "success") return true;
+    if (row?.renders_status === "awaiting_hf") {
+      const pendingImg = countImageJobsByBlockOutcome(projectId, blockNumber, "pending");
+      const pendingHf = countHfCliJobsByBlockOutcome(projectId, blockNumber, "pending");
+      if (pendingImg + pendingHf > 0) return true;
+    }
+    return false;
+  }
+  return shouldSkipCompletedImagensBlock(projectId, blockNumber);
+}
+
+async function finalizeDeferredBatchSubmits(
+  projectId: number,
+  imageFlags?: ImageRunFlags,
+  opts?: ImagensVideosOptions
+): Promise<void> {
+  if (!opts?.enqueueOnly) return;
+  const delivery = resolveImageDelivery(imageFlags);
+  if (isGoogleBatchMode(imageFlags)) {
+    const submitted = await submitPendingGoogleBatches(projectId);
+    console.log(
+      chalk.bold.cyan(
+        `Submit diferido: ${submitted} batch(es) Google submetido(s) para o projeto. ` +
+          `Rode: npm run gentube -- image:sync --project ${projectId} --watch`
+      )
+    );
+    addProjectLog(
+      projectId,
+      "imagens_videos",
+      "info",
+      `Enqueue-only: ${submitted} batch(es) Google submetidos (scope=block)`,
+      { submitted }
+    );
+  }
+  if (delivery === "local_batch") {
+    const batches = await flushPendingLocalBatchesForProject(projectId);
+    console.log(chalk.bold.cyan(`Batch local: ${batches} lote(s) processado(s) no projeto.`));
+    addProjectLog(projectId, "imagens_videos", "info", `Enqueue-only: batch-local concluido`, { batches });
+  }
+}
 
 function imagensUsesAsyncQueue(opts?: ImagensVideosOptions): boolean {
   const delivery = resolveImageDelivery(opts?.imageFlags);
@@ -625,25 +675,28 @@ async function generateAndRenderShot(params: {
   prompt: string;
   outPathNoExt: string;
   referenceImageUrl?: string;
-}): Promise<{ localPath: string; mediaUrl: string }> {
-  const maxAttempts = 3; // inicial + 2 retries (mesmo payload)
+  magnificKeywords?: string | null;
+}): Promise<{ localPath: string; mediaUrl?: string; provider?: string }> {
+  if (params.type === "video") {
+    const out = await renderVideoWithFallback({
+      prompt: params.prompt,
+      outPathNoExt: params.outPathNoExt,
+      referenceImageUrl: params.referenceImageUrl,
+      magnificKeywords: params.magnificKeywords,
+    });
+    return { localPath: out.localPath, mediaUrl: out.mediaUrl, provider: out.provider };
+  }
+
+  const maxAttempts = 3;
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      if (params.type === "image") {
-        const out = await generateImageWithDefaultsCli({
-          prompt: params.prompt,
-          referenceImageUrl: params.referenceImageUrl,
-        });
-        const localPath = await downloadMedia(out.mediaUrl, params.outPathNoExt, ".png");
-        return { localPath, mediaUrl: out.mediaUrl };
-      }
-      const out = await generateVideoWithDefaultsCli({
+      const out = await generateImageWithDefaultsCli({
         prompt: params.prompt,
-        referenceImageUrl: params.referenceImageUrl ?? "",
+        referenceImageUrl: params.referenceImageUrl,
       });
-      const localPath = await downloadMedia(out.mediaUrl, params.outPathNoExt, ".mp4");
-      return { localPath, mediaUrl: out.mediaUrl };
+      const localPath = await downloadMedia(out.mediaUrl, params.outPathNoExt, ".png");
+      return { localPath, mediaUrl: out.mediaUrl, provider: "higgsfield" };
     } catch (error) {
       lastError = error;
       if (attempt === maxAttempts) break;
@@ -712,6 +765,8 @@ async function imagensBlockPlanAndRenderV2(input: {
   stockRatio: number;
   manualCaptureSignals: string[];
   imageFlags?: ImageRunFlags;
+  planOnly?: boolean;
+  enqueueOnly?: boolean;
 }): Promise<{
   hfJobTotal: number;
   sceneCount: number;
@@ -748,7 +803,24 @@ async function imagensBlockPlanAndRenderV2(input: {
 
   let plan: BlockScenesPlanV2;
 
-  if (existingPlan) {
+  if (input.enqueueOnly && !existingPlan && !errorResume) {
+    throw new Error(
+      `--enqueue-only: plano ausente em ${path.basename(input.jsonPath)}. Rode antes com --plan-only.`
+    );
+  }
+
+  if (input.enqueueOnly && existingPlan) {
+    console.log(
+      chalk.yellow(
+        `${blockTag(input.blockNumber, input.totalBlocos)} Enqueue-only: plano existente em ${path.basename(input.jsonPath)}`
+      )
+    );
+    plan = existingPlan;
+  } else if (input.enqueueOnly && errorResume) {
+    throw new Error(
+      `--enqueue-only: existe ${path.basename(input.jsonPath)}.error — resolva ou use GENTUBE_FORCE_VIZ_REGEN=1 com --plan-only`
+    );
+  } else if (existingPlan) {
     console.log(
       chalk.yellow(
         `${blockTag(input.blockNumber, input.totalBlocos)} Reutilizando plano em ${path.basename(input.jsonPath)} (sem Claude). GENTUBE_FORCE_VIZ_REGEN=1 para regerar.`
@@ -823,13 +895,42 @@ async function imagensBlockPlanAndRenderV2(input: {
   const planImages = plan.scenes.filter((s) => s.visual.type === "image").length;
   const planVideos = plan.scenes.filter((s) => s.visual.type === "video").length;
 
+  if (input.planOnly) {
+    upsertMediaBlock(input.projectId, input.blockNumber, {
+      assets_json_path: input.jsonPath,
+      plan_status: "success",
+      plan_error: null,
+      renders_status: "pending",
+      renders_total_count: plan.scenes.length,
+      renders_done_count: 0,
+    });
+    console.log(
+      chalk.green(
+        `${blockTag(input.blockNumber, input.totalBlocos)} Plano v2 gravado (plan-only): ` +
+          `${planImages} imagens + ${planVideos} videos → ${path.basename(input.jsonPath)}`
+      )
+    );
+    addProjectLog(input.projectId, "imagens_videos", "info", `Bloco ${input.blockNumber}: plan-only concluido`, {
+      planImages,
+      planVideos,
+      sceneCount: plan.scenes.length,
+    });
+    return {
+      hfJobTotal: 0,
+      sceneCount: plan.scenes.length,
+      doneSync: 0,
+      planImages,
+      planVideos,
+    };
+  }
+
   upsertMediaBlock(input.projectId, input.blockNumber, {
     assets_json_path: input.jsonPath,
     plan_status: "success",
     plan_error: null,
     renders_status: "processing",
     renders_total_count: plan.scenes.length,
-    ...(existingPlan ? {} : { renders_done_count: 0 }),
+    ...(existingPlan && !input.enqueueOnly ? {} : { renders_done_count: 0 }),
   });
 
   await fs.mkdir(input.rendersDir, { recursive: true });
@@ -977,17 +1078,48 @@ async function imagensBlockPlanAndRenderV2(input: {
     }
 
     if (GENTUBE_HF_ASYNC) {
-      const enq = await enqueueRenderShotTracked(input.projectId, bn, scene.id, {
-        type: v.type,
-        prompt: hfPrompt,
-        outPathNoExt: path.join(input.rendersDir, scene.id),
-        referenceImageUrl,
-      });
-      hfJobTotal += 1;
-      console.log(chalk.dim(`  ${blockTag(bn, tb)} HF enfileirado: ${scene.id} (${v.type}) → ${enq.hfJobId.slice(0, 8)}...`));
-      addProjectLog(input.projectId, "imagens_videos", "info", `HF job enfileirado bloco ${bn} cena ${scene.id}`, {
-        hfJobId: enq.hfJobId,
-      });
+      try {
+        const enq = await enqueueRenderShotTracked(input.projectId, bn, scene.id, {
+          type: v.type,
+          prompt: hfPrompt,
+          outPathNoExt: path.join(input.rendersDir, scene.id),
+          referenceImageUrl,
+        });
+        hfJobTotal += 1;
+        console.log(chalk.dim(`  ${blockTag(bn, tb)} HF enfileirado: ${scene.id} (${v.type}) → ${enq.hfJobId.slice(0, 8)}...`));
+        addProjectLog(input.projectId, "imagens_videos", "info", `HF job enfileirado bloco ${bn} cena ${scene.id}`, {
+          hfJobId: enq.hfJobId,
+        });
+      } catch (hfEnqErr) {
+        const msg = hfEnqErr instanceof Error ? hfEnqErr.message : String(hfEnqErr);
+        console.log(chalk.yellow(`  ${blockTag(bn, tb)} HF nao enfileirou ${scene.id} (video): ${msg} — tentando sync (Veo/Magnific)...`));
+        addProjectLog(input.projectId, "imagens_videos", "info", `HF enqueue falhou bloco ${bn} cena ${scene.id}`, {
+          error: msg,
+        });
+        try {
+          const out = await generateAndRenderShot({
+            type: "video",
+            prompt: hfPrompt,
+            outPathNoExt: path.join(input.rendersDir, scene.id),
+            referenceImageUrl,
+            magnificKeywords: v.search_keywords,
+          });
+          done += 1;
+          console.log(
+            chalk.green(
+              `  ${blockTag(bn, tb)} ${scene.id} (${out.provider ?? "?"}) → ${path.basename(out.localPath)} (${done}/${plan.scenes.length})`
+            )
+          );
+          addProjectLog(input.projectId, "imagens_videos", "info", `Render video fallback bloco ${bn} cena ${scene.id}`, {
+            mediaPath: out.localPath,
+            provider: out.provider,
+          });
+          upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
+        } catch (syncErr) {
+          const sMsg = syncErr instanceof Error ? syncErr.message : String(syncErr);
+          console.log(chalk.red(`  ${blockTag(bn, tb)} Fallback video ${scene.id} falhou: ${sMsg}`));
+        }
+      }
     } else {
       console.log(chalk.dim(`  ${blockTag(bn, tb)} Renderizando ${scene.id} (${v.type}, --wait)...`));
       const out = await generateAndRenderShot({
@@ -995,21 +1127,25 @@ async function imagensBlockPlanAndRenderV2(input: {
         prompt: hfPrompt,
         outPathNoExt: path.join(input.rendersDir, scene.id),
         referenceImageUrl,
+        magnificKeywords: v.search_keywords,
       });
       done += 1;
       console.log(chalk.green(`  ${blockTag(bn, tb)} ${scene.id} concluido → ${path.basename(out.localPath)} (${done}/${plan.scenes.length})`));
       addProjectLog(input.projectId, "imagens_videos", "info", `Render concluido bloco ${bn} cena ${scene.id}`, {
         mediaPath: out.localPath,
+        provider: out.provider,
       });
       upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
     }
   }
 
-  if (isGoogleBatchMode(input.imageFlags) && batchIds.length > 0) {
-    await flushPendingGoogleBatches(batchIds);
-  }
-  if (delivery === "local_batch" && batchIds.length > 0) {
-    await flushPendingLocalBatches(batchIds);
+  if (!input.enqueueOnly) {
+    if (isGoogleBatchMode(input.imageFlags) && batchIds.length > 0) {
+      await flushPendingGoogleBatches(batchIds);
+    }
+    if (delivery === "local_batch" && batchIds.length > 0) {
+      await flushPendingLocalBatches(batchIds);
+    }
   }
 
   const asyncQueue = imagensUsesAsyncQueue({ imageFlags: input.imageFlags }) || hfJobTotal > 0;
@@ -1037,29 +1173,44 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
   const roteiroDir = path.join(String(project.project_path), "01 - Roteiro");
   const promptBase = await fs.readFile(PROMPT_MATRIX02_PATH, "utf-8");
 
+  assertImagensPhaseRequiresV2(opts);
+
   updateProjectAnyStageStatus(projectId, "status_imagens_videos", "processing");
   const asyncQueue = imagensUsesAsyncQueue(opts);
-  console.log(
-    chalk.bold.cyan(
+  if (opts?.planOnly) {
+    console.log(chalk.bold.cyan(`Step 3 — plan-only (${totalBlocos} blocos): so Claude → blockNN.assets.json`));
+    addProjectLog(projectId, "imagens_videos", "info", "Step 3 plan-only (schema 2.0)");
+  } else if (opts?.enqueueOnly) {
+    console.log(
+      chalk.bold.cyan(
+        `Step 3 — enqueue-only (${totalBlocos} blocos): stock/filas; submit Google no fim (1 batch/bloco)`
+      )
+    );
+    addProjectLog(projectId, "imagens_videos", "info", "Step 3 enqueue-only; submit batch diferido no fim");
+  } else {
+    console.log(
+      chalk.bold.cyan(
+        asyncQueue
+          ? `Step 3 — modo assincrono (${totalBlocos} blocos). Jobs enfileirados; depois rode image:sync`
+          : `Step 3 — modo sincrono (${totalBlocos} blocos)`
+      )
+    );
+    addProjectLog(
+      projectId,
+      "imagens_videos",
+      "info",
       asyncQueue
-        ? `Step 3 — modo assincrono (${totalBlocos} blocos). Jobs enfileirados; depois rode image:sync`
-        : `Step 3 — modo sincrono (${totalBlocos} blocos)`
-    )
-  );
-  addProjectLog(
-    projectId,
-    "imagens_videos",
-    "info",
-    asyncQueue
-      ? "Iniciando step 3 (direcao + producao) — modo assincrono; depois rode gentube image:sync"
-      : "Iniciando step 3 (direcao + producao)"
-  );
+        ? "Iniciando step 3 (direcao + producao) — modo assincrono; depois rode gentube image:sync"
+        : "Iniciando step 3 (direcao + producao)"
+    );
+  }
 
   let grandTotalJobs = 0;
   for (let i = 1; i <= totalBlocos; i += 1) {
-    if (shouldSkipCompletedImagensBlock(projectId, i)) {
-      console.log(chalk.dim(`${blockTag(i, totalBlocos)} Step 3 completo no registo, pulando bloco`));
-      addProjectLog(projectId, "imagens_videos", "info", `Bloco ${i} do step 3 saltado (ja concluido)`);
+    if (shouldSkipImagensBlock(projectId, i, opts)) {
+      const skipReason = opts?.planOnly ? "plano ja existe" : opts?.enqueueOnly ? "ja enfileirado/concluido" : "ja concluido";
+      console.log(chalk.dim(`${blockTag(i, totalBlocos)} Saltando bloco (${skipReason})`));
+      addProjectLog(projectId, "imagens_videos", "info", `Bloco ${i} saltado (${skipReason})`);
       continue;
     }
     const maxVideos = limits ? (i === 1 ? limits.maxVideosBlock1 : limits.maxVideosOtherBlocks) : 999;
@@ -1095,6 +1246,8 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
           stockRatio,
           manualCaptureSignals: [],
           imageFlags: opts?.imageFlags,
+          planOnly: opts?.planOnly,
+          enqueueOnly: opts?.enqueueOnly,
         });
         console.log(
           chalk.green(
@@ -1256,12 +1409,14 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
               prompt: shot.description,
               outPathNoExt: path.join(rendersDir, shot.id),
               referenceImageUrl,
+              magnificKeywords: shot.search_keywords,
             });
-            if (shot.type === "image") lastImageRef = out.mediaUrl;
+            if (shot.type === "image") lastImageRef = out.mediaUrl ?? out.localPath;
             done += 1;
             console.log(chalk.green(`  ${blockTag(i, totalBlocos)} ${shot.id} concluido → ${path.basename(out.localPath)} (${done}/${plan.shots.length})`));
             addProjectLog(projectId, "imagens_videos", "info", `Render concluido bloco ${i} shot ${shot.id}`, {
               mediaPath: out.localPath,
+              provider: out.provider,
             });
             upsertMediaBlock(projectId, i, { renders_done_count: done });
           }
@@ -1306,11 +1461,24 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
     }
   }
 
-  if (imagensUsesAsyncQueue(opts) && grandTotalJobs > 0) {
+  await finalizeDeferredBatchSubmits(projectId, opts?.imageFlags, opts);
+
+  if (!opts?.planOnly && imagensUsesAsyncQueue(opts) && grandTotalJobs > 0) {
+    const syncHint = opts?.enqueueOnly
+      ? "image:sync (batches ja submetidos no fim do enqueue-only)"
+      : "image:sync";
     console.log(
       chalk.bold.yellow(
         `\nStep 3 concluido: ${grandTotalJobs} jobs enfileirados. Rode:\n` +
-          `  npm run gentube -- image:sync --project ${projectId} --watch --interval 30s`
+          `  npm run gentube -- ${syncHint} --project ${projectId} --watch --interval 30s`
+      )
+    );
+  }
+  if (opts?.planOnly) {
+    console.log(
+      chalk.bold.green(
+        `\nPlan-only concluido. Proximo passo:\n` +
+          `  npm run gentube -- run-step --project ${projectId} --step imagens --scene-plan-v2 --google-batch-mode --enqueue-only`
       )
     );
   }
@@ -1329,9 +1497,11 @@ export async function runImagensVideosBlock(
   if (blockNumber < 1 || blockNumber > totalBlocos) {
     throw new Error(`Bloco invalido: ${blockNumber} (esperado entre 1 e ${totalBlocos})`);
   }
-  if (shouldSkipCompletedImagensBlock(projectId, blockNumber)) {
-    console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} Step 3 completo no registo, pulando bloco`));
-    addProjectLog(projectId, "imagens_videos", "info", `Bloco ${blockNumber} saltado (ja concluido)`);
+  assertImagensPhaseRequiresV2(opts);
+
+  if (shouldSkipImagensBlock(projectId, blockNumber, opts)) {
+    console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} Bloco saltado (ja concluido ou plano existente)`));
+    addProjectLog(projectId, "imagens_videos", "info", `Bloco ${blockNumber} saltado`);
     recomputeImagensVideosStage(projectId, totalBlocos);
     return;
   }
@@ -1386,12 +1556,15 @@ export async function runImagensVideosBlock(
         stockRatio,
         manualCaptureSignals: [],
         imageFlags: opts?.imageFlags,
+        planOnly: opts?.planOnly,
+        enqueueOnly: opts?.enqueueOnly,
       });
       console.log(
         chalk.green(
           `${blockTag(blockNumber, totalBlocos)} Plano v2: ${r.planImages} imagens + ${r.planVideos} videos (${r.sceneCount} cenas)`
         )
       );
+      await finalizeDeferredBatchSubmits(projectId, opts?.imageFlags, opts);
       if (asyncQueue || r.hfJobTotal > 0) {
         const pendingHf = countHfCliJobsByBlockOutcome(projectId, blockNumber, "pending");
         const pendingImg = countImageJobsByBlockOutcome(projectId, blockNumber, "pending");
@@ -1532,8 +1705,9 @@ export async function runImagensVideosBlock(
             prompt: shot.description,
             outPathNoExt: path.join(rendersDir, shot.id),
             referenceImageUrl,
+            magnificKeywords: shot.search_keywords,
           });
-          if (shot.type === "image") lastImageRef = out.mediaUrl;
+          if (shot.type === "image") lastImageRef = out.mediaUrl ?? out.localPath;
           done += 1;
           console.log(chalk.green(`  ${blockTag(blockNumber, totalBlocos)} ${shot.id} concluido (${done}/${plan.shots.length})`));
           upsertMediaBlock(projectId, blockNumber, { renders_done_count: done });

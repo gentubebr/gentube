@@ -111,7 +111,7 @@ function groupByBatchId(jobs: ImageJobRow[]): Map<string, ImageJobRow[]> {
   return map;
 }
 
-async function submitPendingGoogleBatches(projectId?: number): Promise<number> {
+export async function submitPendingGoogleBatches(projectId?: number): Promise<number> {
   const awaiting = listImageJobsAwaitingGoogleBatchSubmit(projectId);
   if (awaiting.length === 0) return 0;
   let submitted = 0;
@@ -308,6 +308,20 @@ export async function syncImageJobsOnce(options: {
 
 export function countAllImageJobsPending(projectId?: number): number {
   return listImageJobsPending(projectId, undefined, 10_000).length;
+}
+
+/** Processa todos os batch-local pendentes do projeto (apos --enqueue-only). */
+export async function flushPendingLocalBatchesForProject(projectId: number): Promise<number> {
+  const pending = listImageJobsPending(projectId, "gemini", 10_000).filter(
+    (j) => j.delivery_mode === "local_batch" && j.outcome === "pending"
+  );
+  if (pending.length === 0) return 0;
+  let batches = 0;
+  for (const [, jobs] of groupByBatchId(pending)) {
+    await processLocalImageBatch(jobs);
+    batches += 1;
+  }
+  return batches;
 }
 
 export { GEMINI_BATCH_POLL_INTERVAL_MS };

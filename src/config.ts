@@ -231,6 +231,31 @@ export function parseDurationMs(raw: string | undefined, fallbackMs: number): nu
 
 export const GEMINI_BATCH_POLL_INTERVAL_MS = parseDurationMs(process.env.GENTUBE_GEMINI_BATCH_POLL_INTERVAL, 60_000);
 
+/** Veo — video IA (fallback quando HF sem creditos). */
+export const GEMINI_VEO_MODEL = (
+  process.env.GEMINI_VEO_MODEL ?? "veo-3.1-lite-generate-preview"
+).trim();
+export const GEMINI_VEO_RESOLUTION = (process.env.GEMINI_VEO_RESOLUTION ?? "1080p").trim();
+/** Veo 3.1 lite: API aceita 4–8s (valores discretos; padrao 8). */
+export const GEMINI_VEO_DURATION_SECONDS = (() => {
+  const n = parseInt(process.env.GENTUBE_VEO_DURATION_SECONDS ?? "8", 10);
+  const v = Number.isFinite(n) ? n : 8;
+  if (v <= 4) return 4;
+  if (v <= 5) return 4;
+  if (v <= 7) return 6;
+  return 8;
+})();
+export const GEMINI_VEO_POLL_INTERVAL_MS = parseDurationMs(process.env.GENTUBE_VEO_POLL_INTERVAL, 15_000);
+export const GEMINI_VEO_TIMEOUT_MS = parseDurationMs(process.env.GENTUBE_VEO_TIMEOUT, 10 * 60_000);
+
+export type VideoBackend = "auto" | "higgsfield" | "veo" | "magnific";
+
+export function videoBackendFromEnv(): VideoBackend {
+  const v = (process.env.GENTUBE_VIDEO_BACKEND ?? "auto").trim().toLowerCase();
+  if (v === "higgsfield" || v === "veo" || v === "magnific") return v;
+  return "auto";
+}
+
 export type ImageRunFlags = {
   googleBatchMode?: boolean;
   batchLocal?: boolean;
@@ -269,4 +294,11 @@ export function imageRunFlagsFromCli(opts: {
   };
   assertImageFlagsExclusive(flags);
   return flags;
+}
+
+/** `--plan-only` e `--enqueue-only` sao mutuamente exclusivas. */
+export function assertImagensPhaseFlagsExclusive(opts: { planOnly?: boolean; enqueueOnly?: boolean }): void {
+  if (opts.planOnly && opts.enqueueOnly) {
+    throw new Error("--plan-only e --enqueue-only sao mutuamente exclusivas");
+  }
 }

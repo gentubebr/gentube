@@ -945,8 +945,28 @@ Resumo no `README.md` (secção dedicada) e referência cruzada a esta secção 
 
 **Escopo do batch:**
 
-- **Pipeline** (`run-step` / `retry` imagens e thumbnails): agrupar por **bloco** (`GENTUBE_GEMINI_BATCH_SCOPE=block`).
+- **Pipeline** (`run-step` / `retry` imagens e thumbnails): agrupar por **bloco** (`GENTUBE_GEMINI_BATCH_SCOPE=block` — implementado; default).
 - **CLI** `gemini:image`: pode agrupar por **projeto** ou lote manual definido no comando.
+
+**Fases do pipeline imagens v2 (flags mutuamente exclusivas):**
+
+| Flag | Efeito |
+|------|--------|
+| `--plan-only` | So segmentacao + visualizacao Claude → `blockNN.assets.json`; `renders_status=pending`; sem stock, `image_jobs`, HF nem submit. Exige `--scene-plan-v2`. |
+| `--enqueue-only` | Le planos existentes; stock, placeholder, filas `image_jobs` (google_batch por bloco), videos HF; **nao** chama `submitGoogleImageBatch` por bloco. No **fim** do `run-step`/`retry` (todos os blocos): `submitPendingGoogleBatches(project_id)` → **N** operacoes Batch API (1 por bloco). Exige `--scene-plan-v2`. |
+| (nenhuma) | Comportamento legado: apos cada bloco, `flushPendingGoogleBatches` daquele bloco. |
+
+Comandos auxiliares:
+
+- `gentube image:batch-submit --project <id>` — submete batches Google pendentes (sem poll).
+- `gentube image:sync --project <id>` — submit pendentes (se houver) + poll HF + poll Gemini + download.
+
+Fluxo recomendado producao multi-bloco:
+
+1. `run-step --step imagens --scene-plan-v2 --plan-only`
+2. Rever `blockNN.assets.json`
+3. `run-step --step imagens --scene-plan-v2 --google-batch-mode --enqueue-only`
+4. `image:sync --watch`
 
 ### 22.4 Tabela `image_jobs` (schema alvo)
 
@@ -1015,6 +1035,7 @@ CREATE INDEX idx_image_jobs_project_block ON image_jobs(project_id, block_number
 | 1c | `gemini-batch.ts` + `gemini:image --google-batch-mode` |
 | 2 | `image-generation.ts` + fallback `auto` no pipeline |
 | 3 | Enfileirar pipeline + `image:sync` |
+| 3b | `--plan-only` + `--enqueue-only` + submit diferido + `image:batch-submit` |
 | 4 | Flags pipeline + thumbnails |
 | 5 | Referencia multimodal (avatar) |
 | 6 | Deprecar `hf_cli_jobs` para imagens; docs finais |
@@ -1032,6 +1053,84 @@ gentube gemini:image --google-batch-mode --prompts-file prompts.txt --out-dir ./
 gentube gemini:image --batch-local --prompts-file prompts.txt --out-dir ./out --concurrency 4
 
 # Pipeline producao
-gentube run-step --project 1 --step imagens --google-batch-mode --scene-plan-v2
+gentube run-step --project 1 --step imagens --scene-plan-v2 --plan-only
+gentube run-step --project 1 --step imagens --google-batch-mode --scene-plan-v2 --enqueue-only
+gentube image:batch-submit --project 1
 gentube image:sync --project 1 --watch --interval 60s
 ```
+
+## 23) Montagem por cena — FFmpeg (aprovado, pendente implementacao)
+
+**Estado:** requisitos e defaults **aprovados** apos testes em `experiments/ffmpeg-scene-tests/` (referencia: `output/20260518-183855/bloco3-kenburns-zoom-in-xfade-0.1s.mp4`). **Nao implementado** no CLI `src/` nesta fase.
+
+### 23.1 Objetivo
+
+Novo step (proposta: `06 - Montagem/` ou `montagem` no `run-step`) que, por cena e por bloco, combina narracao + visual ja produzidos em clipes MP4 e monta o bloco final, sem re-chamar Claude, ElevenLabs nem Higgsfield.
+
+**Pre-requisito:** `--scene-plan-v2` / `GENTUBE_SCENE_PLAN_V2` (par 1:1 `scXX.mp3` ↔ `renders/blockNN/scXX.*`).
+
+### 23.2 Entradas e saidas
+
+| Entrada | Caminho |
+|---------|---------|
+| Plano | `03 - Imagens e Videos/blockNN.assets.json` (`scenes[]` define ordem) |
+| Audio por cena | `02 - Narracao/blockNN/scXX.mp3` |
+| Visual por cena | `03 - Imagens e Videos/renders/blockNN/scXX.{mp4,mov,jpg,png,...}` |
+
+| Saida (proposta) | Caminho |
+|------------------|---------|
+| Clipe por cena | `06 - Montagem/scenes/blockNN/scXX.mp4` |
+| Bloco montado | `06 - Montagem/blocks/blockNN.mp4` |
+
+### 23.3 Resolucao do visual por cena
+
+1. Se `visual.type === "image"` ou `manual_capture` → ficheiro imagem (`png`, `jpg`, `webp`).
+2. Se `visual.type === "video"` → preferir `scXX.mp4` / `scXX.mov`; se ausente → fallback `scXX__bootstrap.png` (ou `.jpg`) com tratamento de **imagem** (Ken Burns).
+3. Ignorar ficheiros auxiliares `scXX__bootstrap` quando existir video final da cena.
+
+### 23.4 Estrategias de duracao (audio manda)
+
+Medir `T_audio` e `T_video` com **ffprobe**. O trilho final de cada clipe e **sempre** o MP3 da cena (sem audio do stock).
+
+| Caso | Regra | FFmpeg (resumo) |
+|------|-------|------------------|
+| **4.1** Imagem / bootstrap | Duracao = `T_audio` | **Ken Burns zoom-in** (padrao aprovado); ver **23.5** |
+| **4.2** `T_audio > T_video` | Loop sem audio do video | `-stream_loop -1`, `-map` video + audio MP3, `-shortest` |
+| **4.3** `T_audio < T_video` | Cortar ou acelerar | Se `T_video/T_audio > 1.25` → **trim** `-t T_audio`; senao acelerar com `setpts` ate max **2.0×**, acima disso trim |
+
+Normalizar clipes: `fps=30`, `1920x1080`, `yuv420p`, AAC 192k antes de concatenar / xfade.
+
+### 23.5 Ken Burns (imagem estatica) — **padrao aprovado: zoom-in**
+
+- **Efeito:** zoom lento do centro, ~**100% → 112%** ao longo de `T_audio`.
+- **Implementacao de referencia:** filtro `zoompan` com `d = round(T_audio * fps)`, `fps=30`, `s=1920x1080`.
+- **Descartado para producao:** imagem totalmente estatica (baseline de teste apenas); **zoom-out** nao e padrao (opcional futuro por flag).
+- **Bootstrap PNG** sem `.mov`/`.mp4`: mesmo tratamento Ken Burns zoom-in.
+
+Variaveis alvo (`.env`): `GENTUBE_KEN_BURNS_ZOOM_END=1.12`, `GENTUBE_KEN_BURNS_FPS=30`, `GENTUBE_KEN_BURNS_MODE=zoom_in` (default).
+
+### 23.6 Montagem do bloco — **padrao aprovado**
+
+- Concatenar clipes na ordem de `scenes[]` com **xfade** entre pares.
+- **Duracao da transicao:** **0.1 s** (fixo).
+- **Tipo de transicao (default):** `fade` (video `xfade` + audio `acrossfade` com mesma duracao).
+- Antes de cada `xfade`: normalizar timebase (`fps=30`, `settb=AVTB`) — obrigatorio; ver testes.
+- **Descartado:** efeito **reverso** (video + audio invertidos); nao entra no pipeline.
+
+Transicoes alternativas (fase opcional): `dissolve`, `fadefast` — catalogo completo no filtro FFmpeg `xfade`; amostras em `experiments/ffmpeg-scene-tests/output/xfade-*/`.
+
+### 23.7 Dependencias e retoma
+
+- **ffmpeg** e **ffprobe** no `PATH` (ou `GENTUBE_FFMPEG_PATH`); step falha com mensagem clara se ausente.
+- Idempotencia: saltar cena/bloco se saida existir e entradas nao mudaram (hash ou mtime).
+- SQLite: novo status em `video_projects` (ex. `status_montagem`) e tabela opcional `assembly_blocks` espelhando `media_blocks`.
+
+### 23.8 Prototipo e validacao visual
+
+```bash
+./experiments/ffmpeg-scene-tests/run-tests.sh
+# Referencia aprovada:
+# experiments/ffmpeg-scene-tests/output/20260518-183855/bloco3-kenburns-zoom-in-xfade-0.1s.mp4
+```
+
+Guia de avaliacao: `PARA-AVALIAR.md` gerado em cada corrida de testes.
