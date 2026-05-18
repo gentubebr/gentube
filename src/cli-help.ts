@@ -45,7 +45,7 @@ ${chalk.bold("Variaveis .env frequentes")}  (detalhe em .env.example)
   GENTUBE_IMAGE_DELIVERY=google_batch · GENTUBE_VIDEO_BACKEND=auto
   GEMINI_VEO_* · GENTUBE_VEO_DURATION_SECONDS
 
-${chalk.bold("Documentacao")}  README.md · ESPECIFICACAO_TECNICA.md · experiments/ffmpeg-scene-tests/
+${chalk.bold("Documentacao")}  README.md · ESPECIFICACAO_TECNICA.md
 `),
 
   runStep: cliHelpAfter(`

@@ -9,8 +9,8 @@ data/
 # Saídas de testes CLI (gemini:image, batch local, etc.)
 /out/
 
-# Protótipos FFmpeg — só versionar scripts/README; renders ficam locais
-/experiments/**/output/
+# Protótipos locais (FFmpeg, testes) — não versionar
+/experiments/
 
 # SQLite local (cada máquina)
 gentube.db

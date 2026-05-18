@@ -402,7 +402,7 @@ Regras de negócio, modelo de dados, contratos de comandos e decisões de implem
 - Implementar `image_jobs`, `gemini:image`, `image:sync` e flags `--google-batch-mode` / `--batch-local` (spec sec. 22).
 - Migrar imagens de `hf_cli_jobs` → `image_jobs`.
 - Incluir steps no `run-all` ou comando `run-all --with-imagens`.
-- Step **montagem** (FFmpeg): clipes por cena + bloco com **Ken Burns zoom-in** em imagens e **xfade 0,1 s** (`fade`) entre cenas — ver **sec. 23** de `ESPECIFICACAO_TECNICA.md` (prototipo em `experiments/ffmpeg-scene-tests/`).
+- Step **montagem** (FFmpeg): clipes por cena + bloco com **Ken Burns zoom-in** em imagens e **xfade 0,1 s** (`fade`) entre cenas — ver **sec. 23** de `ESPECIFICACAO_TECNICA.md` (protótipo local opcional em `experiments/`, fora do Git).
 
 ## Licença
 
