@@ -181,3 +181,92 @@ export const DEFAULT_MAX_IMAGES_BLOCK1 = envNonNegativeInt("GENTUBE_MAX_IMAGES_B
  */
 export const DEFAULT_MAX_VIDEOS_OTHER_BLOCKS = envNonNegativeInt("GENTUBE_MAX_VIDEOS_OTHER_BLOCKS", 10);
 export const DEFAULT_MAX_IMAGES_OTHER_BLOCKS = envNonNegativeInt("GENTUBE_MAX_IMAGES_OTHER_BLOCKS", 40);
+
+/** Google GenAI — chave (GEMINI_API_KEY ou alias google_api_key). */
+export function geminiApiKey(): string {
+  return (process.env.GEMINI_API_KEY ?? process.env.google_api_key ?? "").trim();
+}
+
+export const GEMINI_IMAGE_MODEL = (process.env.GEMINI_IMAGE_MODEL ?? "gemini-2.5-flash-image").trim();
+export const GEMINI_IMAGE_MODEL_PRO = (process.env.GEMINI_IMAGE_MODEL_PRO ?? "gemini-3-pro-image-preview").trim();
+export const GEMINI_PROJECT_NAME = (process.env.google_project_name ?? process.env.GEMINI_PROJECT_NAME ?? "").trim();
+export const GEMINI_PARENT_FOLDER_ID = (
+  process.env.google_parent_folder_id ?? process.env.GEMINI_PARENT_FOLDER_ID ?? ""
+).trim();
+
+export type ImageBackend = "auto" | "higgsfield" | "gemini";
+export type ImageDeliveryMode = "sync" | "google_batch" | "local_batch";
+
+export function imageBackendFromEnv(): ImageBackend {
+  const v = (process.env.GENTUBE_IMAGE_BACKEND ?? "auto").trim().toLowerCase();
+  if (v === "higgsfield" || v === "gemini") return v;
+  return "auto";
+}
+
+export function imageDeliveryFromEnv(): ImageDeliveryMode {
+  const v = (process.env.GENTUBE_IMAGE_DELIVERY ?? "google_batch").trim().toLowerCase();
+  if (v === "sync" || v === "local_batch") return v;
+  return "google_batch";
+}
+
+export const GEMINI_IMAGE_ASPECT_RATIO = (process.env.GENTUBE_GEMINI_IMAGE_ASPECT_RATIO ?? "16:9").trim();
+export const GEMINI_IMAGE_SIZE = (process.env.GENTUBE_GEMINI_IMAGE_SIZE ?? "1K").trim();
+export const GEMINI_LOCAL_BATCH_CONCURRENCY = Math.max(
+  1,
+  envNonNegativeInt("GENTUBE_GEMINI_LOCAL_CONCURRENCY", 4) || 4,
+);
+
+export function parseDurationMs(raw: string | undefined, fallbackMs: number): number {
+  const s = (raw ?? "").trim();
+  if (!s) return fallbackMs;
+  const m = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/i.exec(s);
+  if (!m) return fallbackMs;
+  const n = parseFloat(m[1]!);
+  const unit = (m[2] ?? "s").toLowerCase();
+  if (unit === "ms") return n;
+  if (unit === "m") return n * 60_000;
+  if (unit === "h") return n * 3_600_000;
+  return n * 1000;
+}
+
+export const GEMINI_BATCH_POLL_INTERVAL_MS = parseDurationMs(process.env.GENTUBE_GEMINI_BATCH_POLL_INTERVAL, 60_000);
+
+export type ImageRunFlags = {
+  googleBatchMode?: boolean;
+  batchLocal?: boolean;
+};
+
+/** Resolve delivery: flags CLI > env. Mutuamente exclusivas (validar no CLI). */
+export function resolveImageDelivery(flags?: ImageRunFlags): ImageDeliveryMode {
+  if (flags?.batchLocal) return "local_batch";
+  if (flags?.googleBatchMode) return "google_batch";
+  return imageDeliveryFromEnv();
+}
+
+export function resolveImageBackend(flags?: ImageRunFlags, delivery?: ImageDeliveryMode): ImageBackend {
+  if (flags?.googleBatchMode || flags?.batchLocal || delivery === "google_batch" || delivery === "local_batch") {
+    const env = imageBackendFromEnv();
+    if (env === "higgsfield") return "gemini";
+    return env === "auto" ? "gemini" : "gemini";
+  }
+  return imageBackendFromEnv();
+}
+
+/** Flags --google-batch-mode e --batch-local nao podem ser usadas juntas. */
+export function assertImageFlagsExclusive(flags?: ImageRunFlags): void {
+  if (flags?.googleBatchMode && flags?.batchLocal) {
+    throw new Error("--google-batch-mode e --batch-local sao mutuamente exclusivas");
+  }
+}
+
+export function imageRunFlagsFromCli(opts: {
+  googleBatchMode?: boolean;
+  batchLocal?: boolean;
+}): ImageRunFlags {
+  const flags: ImageRunFlags = {
+    googleBatchMode: Boolean(opts.googleBatchMode),
+    batchLocal: Boolean(opts.batchLocal),
+  };
+  assertImageFlagsExclusive(flags);
+  return flags;
+}

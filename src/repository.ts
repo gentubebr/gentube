@@ -1,4 +1,5 @@
 import { getDb, nowIso } from "./db.js";
+import type { ImageJobDeliveryMode, ImageJobOutcome, ImageJobProvider, ImageJobRow } from "./types/image-jobs.js";
 
 export type BlockStatus = "pending" | "processing" | "success" | "error";
 
@@ -366,9 +367,189 @@ export function deleteHfCliJobsForBlock(projectId: number, blockNumber: number):
   db.prepare("DELETE FROM hf_cli_jobs WHERE project_id = ? AND block_number = ?").run(projectId, blockNumber);
 }
 
+export function insertImageJob(input: {
+  projectId: number;
+  blockNumber: number;
+  shotId: string;
+  provider: ImageJobProvider;
+  deliveryMode: ImageJobDeliveryMode;
+  outPathNoExt: string;
+  externalId?: string | null;
+  batchId?: string | null;
+  referenceImagePath?: string | null;
+  promptText?: string | null;
+  status?: string;
+  outcome?: ImageJobOutcome;
+}): number {
+  const db = getDb();
+  const now = nowIso();
+  const r = db
+    .prepare(
+      `INSERT INTO image_jobs (
+        project_id, block_number, shot_id, asset_type, provider, delivery_mode,
+        external_id, batch_id, out_path_no_ext, status, outcome,
+        reference_image_path, prompt_text, created_at, updated_at
+      ) VALUES (?, ?, ?, 'image', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      input.projectId,
+      input.blockNumber,
+      input.shotId,
+      input.provider,
+      input.deliveryMode,
+      input.externalId ?? null,
+      input.batchId ?? null,
+      input.outPathNoExt,
+      input.status ?? "pending",
+      input.outcome ?? "pending",
+      input.referenceImagePath ?? null,
+      input.promptText ?? null,
+      now,
+      now
+    );
+  return Number(r.lastInsertRowid);
+}
+
+export function updateImageJob(
+  id: number,
+  fields: {
+    external_id?: string | null;
+    batch_id?: string | null;
+    status?: string;
+    outcome?: ImageJobOutcome;
+    result_mime?: string | null;
+    error_message?: string | null;
+    downloaded_at?: string | null;
+  }
+): void {
+  const db = getDb();
+  const now = nowIso();
+  const keys = Object.keys(fields).filter((k) => fields[k as keyof typeof fields] !== undefined);
+  if (keys.length === 0) {
+    db.prepare("UPDATE image_jobs SET updated_at = ? WHERE id = ?").run(now, id);
+    return;
+  }
+  const set = [...keys.map((k) => `${k} = ?`), "updated_at = ?"].join(", ");
+  const vals = [...keys.map((k) => fields[k as keyof typeof fields]), now, id];
+  db.prepare(`UPDATE image_jobs SET ${set} WHERE id = ?`).run(...vals);
+}
+
+export function listImageJobsPending(
+  projectId?: number,
+  provider?: ImageJobProvider,
+  limit = 50
+): ImageJobRow[] {
+  const db = getDb();
+  if (projectId !== undefined && provider) {
+    return db
+      .prepare(
+        `SELECT * FROM image_jobs WHERE outcome = 'pending' AND project_id = ? AND provider = ? ORDER BY id LIMIT ?`
+      )
+      .all(projectId, provider, limit) as ImageJobRow[];
+  }
+  if (projectId !== undefined) {
+    return db
+      .prepare(`SELECT * FROM image_jobs WHERE outcome = 'pending' AND project_id = ? ORDER BY id LIMIT ?`)
+      .all(projectId, limit) as ImageJobRow[];
+  }
+  if (provider) {
+    return db
+      .prepare(`SELECT * FROM image_jobs WHERE outcome = 'pending' AND provider = ? ORDER BY id LIMIT ?`)
+      .all(provider, limit) as ImageJobRow[];
+  }
+  return db.prepare(`SELECT * FROM image_jobs WHERE outcome = 'pending' ORDER BY id LIMIT ?`).all(limit) as ImageJobRow[];
+}
+
+export function countImageJobsPending(projectId?: number, provider?: ImageJobProvider): number {
+  const db = getDb();
+  if (projectId !== undefined && provider) {
+    const row = db
+      .prepare(
+        `SELECT COUNT(*) as n FROM image_jobs WHERE outcome = 'pending' AND project_id = ? AND provider = ?`
+      )
+      .get(projectId, provider) as { n: number };
+    return row.n;
+  }
+  if (projectId !== undefined) {
+    const row = db
+      .prepare(`SELECT COUNT(*) as n FROM image_jobs WHERE outcome = 'pending' AND project_id = ?`)
+      .get(projectId) as { n: number };
+    return row.n;
+  }
+  if (provider) {
+    const row = db
+      .prepare(`SELECT COUNT(*) as n FROM image_jobs WHERE outcome = 'pending' AND provider = ?`)
+      .get(provider) as { n: number };
+    return row.n;
+  }
+  const row = db.prepare(`SELECT COUNT(*) as n FROM image_jobs WHERE outcome = 'pending'`).get() as { n: number };
+  return row.n;
+}
+
+export function countImageJobsByBlockOutcome(
+  projectId: number,
+  blockNumber: number,
+  outcome: ImageJobOutcome
+): number {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) as n FROM image_jobs WHERE project_id = ? AND block_number = ? AND outcome = ?`
+    )
+    .get(projectId, blockNumber, outcome) as { n: number };
+  return row.n;
+}
+
+export function countImageJobsByBlock(projectId: number, blockNumber: number): number {
+  const db = getDb();
+  const row = db
+    .prepare(`SELECT COUNT(*) as n FROM image_jobs WHERE project_id = ? AND block_number = ?`)
+    .get(projectId, blockNumber) as { n: number };
+  return row.n;
+}
+
+export function listImageJobsByBatchId(batchId: string): ImageJobRow[] {
+  const db = getDb();
+  return db
+    .prepare(`SELECT * FROM image_jobs WHERE batch_id = ? ORDER BY id`)
+    .all(batchId) as ImageJobRow[];
+}
+
+export function listImageJobsAwaitingGoogleBatchSubmit(projectId?: number): ImageJobRow[] {
+  const db = getDb();
+  const sql = `SELECT * FROM image_jobs
+    WHERE outcome = 'pending' AND provider = 'gemini' AND delivery_mode = 'google_batch'
+    AND (external_id IS NULL OR external_id = '')
+    ${projectId !== undefined ? "AND project_id = ?" : ""}
+    ORDER BY batch_id, id`;
+  if (projectId !== undefined) {
+    return db.prepare(sql).all(projectId) as ImageJobRow[];
+  }
+  return db.prepare(sql).all() as ImageJobRow[];
+}
+
+export function listDistinctGoogleBatchExternalIds(projectId?: number): string[] {
+  const db = getDb();
+  const sql = `SELECT DISTINCT external_id FROM image_jobs
+    WHERE outcome = 'pending' AND provider = 'gemini' AND delivery_mode = 'google_batch'
+    AND external_id IS NOT NULL AND external_id != ''
+    ${projectId !== undefined ? "AND project_id = ?" : ""}`;
+  const rows =
+    projectId !== undefined
+      ? (db.prepare(sql).all(projectId) as Array<{ external_id: string }>)
+      : (db.prepare(sql).all() as Array<{ external_id: string }>);
+  return rows.map((r) => r.external_id).filter(Boolean);
+}
+
+export function deleteImageJobsForBlock(projectId: number, blockNumber: number): void {
+  const db = getDb();
+  db.prepare("DELETE FROM image_jobs WHERE project_id = ? AND block_number = ?").run(projectId, blockNumber);
+}
+
 export function deleteProject(projectId: number): void {
   const db = getDb();
   const tx = db.transaction(() => {
+    db.prepare("DELETE FROM image_jobs WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM hf_cli_jobs WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM project_logs WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM media_blocks WHERE project_id = ?").run(projectId);

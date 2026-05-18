@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
@@ -12,6 +13,8 @@ import {
   DEFAULT_MAX_VIDEOS_BLOCK1,
   DEFAULT_MAX_VIDEOS_OTHER_BLOCKS,
   ELEVENLABS_VOICE_ID,
+  GEMINI_LOCAL_BATCH_CONCURRENCY,
+  imageRunFlagsFromCli,
   ROOT_DIR,
   VIDEOS_DIR,
 } from "./config.js";
@@ -20,6 +23,7 @@ import { getDb } from "./db.js";
 import {
   addProjectLog,
   countHfCliJobsPending,
+  countImageJobsPending,
   createChannel,
   createProject,
   deleteProject,
@@ -27,6 +31,20 @@ import {
   listChannels,
   listProjectsSummary,
 } from "./repository.js";
+import { generateGeminiImageSync } from "./integrations/gemini-image.js";
+import {
+  applyGoogleBatchResults,
+  pollGoogleBatchOnce,
+  submitGoogleImageBatch,
+} from "./integrations/gemini-batch.js";
+import type { ImageJobRow } from "./types/image-jobs.js";
+import {
+  countAllImageJobsPending,
+  GEMINI_BATCH_POLL_INTERVAL_MS,
+  syncImageJobsOnce,
+} from "./services/image-sync.js";
+import { processLocalImageBatch } from "./services/image-local-batch.js";
+import { syncHiggsfieldCliJobsOnce } from "./services/hf-cli-sync.js";
 import { runInit } from "./init-setup.js";
 import {
   runImagensVideos,
@@ -37,7 +55,6 @@ import {
   runRoteiroBlock,
   runThumbnails,
 } from "./services/pipeline.js";
-import { syncHiggsfieldCliJobsOnce } from "./services/hf-cli-sync.js";
 import { syncProjectFromDisk, type SyncFromDiskScope } from "./services/sync-from-disk.js";
 import { writeShotListManualFiles } from "./services/shot-list-manual.js";
 import { ensureDir, ensureTemplateStructure, formatDateYYYYMMDD, toSlug, writeModelagemTranscript } from "./utils/fs.js";
@@ -431,6 +448,8 @@ program
     "Step roteiro bloco 1: voz do canal (Prompts/; padrao canal_voice.md). Sobrescreve GENTUBE_PROMPT_CANAL_VOICE"
   )
   .option("--scene-plan-v2", "Step imagens: plano por cenas (Claude em 2 passos, schema 2.0)")
+  .option("--google-batch-mode", "Imagens/thumbnails: Batch API Google (um batch por bloco no pipeline)")
+  .option("--batch-local", "Imagens/thumbnails: batch local Gemini (testes; mutuamente exclusivo com --google-batch-mode)")
   .action(async (options: {
     project: string;
     step: "roteiro" | "narracao" | "imagens" | "thumbnails";
@@ -446,6 +465,8 @@ program
     promptMatrix?: string;
     promptCanalVoice?: string;
     scenePlanV2?: boolean;
+    googleBatchMode?: boolean;
+    batchLocal?: boolean;
   }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
@@ -456,11 +477,20 @@ program
     }
     if (options.step === "imagens") {
       const limits = parseStep3Limits(options);
-      await executeImagens(project, options.avatarFile, limits, options.scenePlanV2);
+      const imageFlags = imageRunFlagsFromCli(options);
+      await executeImagens(project, options.avatarFile, limits, options.scenePlanV2, imageFlags);
       return;
     }
     if (options.step === "thumbnails") {
-      await executeThumbnails(project, options.referenceUrl, options.avatarFile, options.count, options.prompt);
+      const imageFlags = imageRunFlagsFromCli(options);
+      await executeThumbnails(
+        project,
+        options.referenceUrl,
+        options.avatarFile,
+        options.count,
+        options.prompt,
+        imageFlags
+      );
       return;
     }
     const voiceId = await resolveVoiceId(options.voiceId);
@@ -633,10 +663,223 @@ Credenciais: ~/.config/higgsfield/credentials.json (ou HIGGSFIELD_CREDENTIALS_PA
     process.exitCode = code;
   });
 
+function cliImageJobRow(id: number, prompt: string, outPathNoExt: string, batchId: string): ImageJobRow {
+  const now = new Date().toISOString();
+  return {
+    id,
+    project_id: 0,
+    block_number: 0,
+    shot_id: `cli_${id}`,
+    asset_type: "image",
+    provider: "gemini",
+    delivery_mode: "google_batch",
+    external_id: null,
+    batch_id: batchId,
+    out_path_no_ext: outPathNoExt,
+    status: "pending",
+    outcome: "pending",
+    result_mime: null,
+    error_message: null,
+    reference_image_path: null,
+    prompt_text: prompt,
+    downloaded_at: null,
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+async function readPromptsFile(filePath: string): Promise<string[]> {
+  const raw = await fs.readFile(filePath, "utf-8");
+  return raw
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith("#"));
+}
+
+program
+  .command("gemini:image")
+  .description("Gera imagem(ns) via Google Gemini (sync, batch local ou Batch API Google)")
+  .option("--prompt <texto>", "Um prompt (modo sync; requer --out)")
+  .option("--out <caminho>", "Arquivo de saida sem extensao ou com extensao (modo sync)")
+  .option("--prompts-file <arquivo>", "Um prompt por linha (batch; requer --out-dir)")
+  .option("--out-dir <dir>", "Diretorio de saida para batch")
+  .option("--reference <caminho>", "Imagem de referencia opcional (sync ou batch)")
+  .option("--google-batch-mode", "Usa Batch API Google (requer --prompts-file)")
+  .option("--batch-local", "Processa prompts em paralelo localmente (testes)")
+  .option("--concurrency <n>", `Concorrencia do batch-local (padrao ${GEMINI_LOCAL_BATCH_CONCURRENCY})`)
+  .action(
+    async (options: {
+      prompt?: string;
+      out?: string;
+      promptsFile?: string;
+      outDir?: string;
+      reference?: string;
+      googleBatchMode?: boolean;
+      batchLocal?: boolean;
+      concurrency?: string;
+    }) => {
+      imageRunFlagsFromCli(options);
+
+      const ref = options.reference?.trim() ? path.resolve(options.reference.trim()) : undefined;
+
+      if (options.prompt?.trim() && options.out?.trim()) {
+        if (options.googleBatchMode || options.batchLocal) {
+          throw new Error("Com --prompt use modo sync (sem --google-batch-mode nem --batch-local)");
+        }
+        const outRaw = path.resolve(options.out.trim());
+        const outNoExt = /\.(png|jpe?g|webp)$/i.test(outRaw) ? outRaw.replace(/\.(png|jpe?g|webp)$/i, "") : outRaw;
+        const result = await generateGeminiImageSync({
+          prompt: options.prompt.trim(),
+          outPathNoExt: outNoExt,
+          referenceImagePath: ref,
+        });
+        console.log(chalk.green(`Imagem salva: ${result.localPath}`));
+        return;
+      }
+
+      const promptsPath = options.promptsFile?.trim();
+      const outDir = options.outDir?.trim();
+      if (!promptsPath || !outDir) {
+        throw new Error("Batch requer --prompts-file e --out-dir (ou use --prompt com --out para sync)");
+      }
+      if (!options.googleBatchMode && !options.batchLocal) {
+        throw new Error("Batch requer --google-batch-mode ou --batch-local");
+      }
+
+      const prompts = await readPromptsFile(path.resolve(promptsPath));
+      if (prompts.length === 0) throw new Error("Nenhum prompt em --prompts-file");
+
+      await fs.mkdir(path.resolve(outDir), { recursive: true });
+      const batchId = crypto.randomUUID();
+
+      if (options.batchLocal) {
+        const jobs = prompts.map((p, i) => {
+          const outPathNoExt = path.join(path.resolve(outDir), `img_${String(i + 1).padStart(3, "0")}`);
+          return cliImageJobRow(i + 1, p, outPathNoExt, batchId);
+        });
+        const concurrency = Math.max(1, parseInt(String(options.concurrency ?? ""), 10) || GEMINI_LOCAL_BATCH_CONCURRENCY);
+        await processLocalImageBatch(jobs, concurrency, { skipDb: true });
+        console.log(chalk.green(`Batch local: ${jobs.length} imagem(ns) em ${path.resolve(outDir)}`));
+        return;
+      }
+
+      const jobs = prompts.map((p, i) => {
+        const outPathNoExt = path.join(path.resolve(outDir), `img_${String(i + 1).padStart(3, "0")}`);
+        return cliImageJobRow(i + 1, p, outPathNoExt, batchId);
+      });
+      console.log(chalk.cyan(`Submetendo Google batch (${jobs.length} prompts)...`));
+      const batchName = await submitGoogleImageBatch(jobs, { skipDb: true });
+      console.log(chalk.dim(`Batch: ${batchName}`));
+
+      while (true) {
+        const { done, failed, state } = await pollGoogleBatchOnce(batchName);
+        if (failed) {
+          await applyGoogleBatchResults(batchName, jobs, { skipDb: true });
+          throw new Error(`Google batch falhou: ${state}`);
+        }
+        if (done) {
+          await applyGoogleBatchResults(batchName, jobs, { skipDb: true });
+          console.log(chalk.green(`Batch Google concluido: ${jobs.length} imagem(ns) em ${path.resolve(outDir)}`));
+          break;
+        }
+        console.log(chalk.dim(`Aguardando batch (${state})...`));
+        await new Promise((r) => setTimeout(r, GEMINI_BATCH_POLL_INTERVAL_MS));
+      }
+    }
+  );
+
+program
+  .command("image:sync")
+  .description(
+    "Poll/download jobs de imagem (image_jobs: HF + Gemini batch). Videos HF continuam em higgsfield:sync"
+  )
+  .option("--project <idOuSlug>", "Somente jobs deste projeto")
+  .option("--provider <nome>", "all | higgsfield | gemini", "all")
+  .option("--max-jobs <n>", "Maximo de jobs HF por rodada", "30")
+  .option("--watch", "Repete ate nao restar job pendente em image_jobs")
+  .option("--interval <dur>", "Pausa entre rodadas no --watch", "60s")
+  .action(
+    async (options: {
+      project?: string;
+      provider?: string;
+      maxJobs?: string;
+      watch?: boolean;
+      interval?: string;
+    }) => {
+      let projectId: number | undefined;
+      if (options.project?.trim()) {
+        const p = getProjectByIdOrSlug(options.project.trim());
+        if (!p) throw new Error("Projeto nao encontrado");
+        projectId = Number(p.id);
+      }
+      const providerRaw = (options.provider ?? "all").trim().toLowerCase();
+      if (!["all", "higgsfield", "gemini"].includes(providerRaw)) {
+        throw new Error("--provider deve ser all, higgsfield ou gemini");
+      }
+      const provider = providerRaw as "all" | "higgsfield" | "gemini";
+      const maxJobs = Math.max(1, parseInt(String(options.maxJobs ?? "30"), 10) || 30);
+      const intervalMs = parseHfSyncIntervalMs(options.interval ?? "60s");
+
+      const runOnce = () => syncImageJobsOnce({ projectId, maxJobs, provider });
+
+      if (!options.watch) {
+        const { processed, errors } = await runOnce();
+        console.log(chalk.cyan(`image:sync: processados ${processed} lote(s)/job(s).`));
+        if (errors.length > 0) {
+          for (const e of errors) console.error(chalk.yellow(e));
+          process.exitCode = 1;
+        }
+        return;
+      }
+
+      let round = 0;
+      while (true) {
+        const pending = countAllImageJobsPending(projectId);
+        if (pending === 0) {
+          console.log(chalk.green("image:sync --watch: nenhum image_job pendente; encerrando."));
+          break;
+        }
+        round += 1;
+        const { processed, errors } = await runOnce();
+        console.log(
+          chalk.cyan(
+            `image:sync --watch [rodada ${round}] processados=${processed}, pendentes≈${countAllImageJobsPending(projectId)}`
+          )
+        );
+        if (errors.length > 0) {
+          for (const e of errors) console.error(chalk.yellow(e));
+          process.exitCode = 1;
+        }
+        if (countAllImageJobsPending(projectId) === 0) break;
+        await new Promise((r) => setTimeout(r, intervalMs));
+      }
+    }
+  );
+
+program
+  .command("image:status")
+  .description("Resumo de image_jobs pendentes/concluidos por projeto")
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .action(async (options: { project: string }) => {
+    const p = getProjectByIdOrSlug(options.project.trim());
+    if (!p) throw new Error("Projeto nao encontrado");
+    const projectId = Number(p.id);
+    const pending = countImageJobsPending(projectId);
+    const pendingHf = countImageJobsPending(projectId, "higgsfield");
+    const pendingGemini = countImageJobsPending(projectId, "gemini");
+    const hfVideos = countHfCliJobsPending(projectId);
+    console.log(chalk.cyan(`Projeto ${p.titulo} (id=${projectId})`));
+    console.log(`  image_jobs pendentes: ${pending} (HF: ${pendingHf}, Gemini: ${pendingGemini})`);
+    console.log(`  hf_cli_jobs pendentes (videos HF): ${hfVideos}`);
+    if (pending > 0) {
+      console.log(chalk.yellow(`  Rode: npm run gentube -- image:sync --project ${projectId} --watch`));
+    }
+  });
+
 program
   .command("higgsfield:sync")
   .description(
-    "Poll/download jobs HF enfileirados (GENTUBE_HF_ASYNC): `hf generate get` + download para disco; atualiza SQLite"
+    "Poll/download jobs HF em hf_cli_jobs (videos e thumbs HF legado). Imagens em image_jobs: use image:sync"
   )
   .option("--project <idOuSlug>", "Somente jobs deste projeto (omitir = todos os pendentes)")
   .option("--max-jobs <n>", "Maximo de jobs a processar por rodada", "30")
@@ -781,6 +1024,8 @@ program
     "Stage roteiro bloco 1: voz do canal (Prompts/). Sobrescreve GENTUBE_PROMPT_CANAL_VOICE"
   )
   .option("--scene-plan-v2", "Stage imagens: plano por cenas (schema 2.0)")
+  .option("--google-batch-mode", "Stage imagens/thumbnails: Batch API Google")
+  .option("--batch-local", "Stage imagens/thumbnails: batch local Gemini (testes)")
   .action(
     async (options: {
       project: string;
@@ -798,6 +1043,8 @@ program
       promptMatrix?: string;
       promptCanalVoice?: string;
       scenePlanV2?: boolean;
+      googleBatchMode?: boolean;
+      batchLocal?: boolean;
     }) => {
       const project = getProjectByIdOrSlug(options.project);
       if (!project) throw new Error("Projeto nao encontrado");
@@ -820,15 +1067,24 @@ program
       }
       if (options.stage === "imagens") {
         const limits = parseStep3Limits(options);
+        const imageFlags = imageRunFlagsFromCli(options);
         if (blockNumber !== undefined) {
-          await executeImagensBlock(project, blockNumber, options.avatarFile, limits, options.scenePlanV2);
+          await executeImagensBlock(project, blockNumber, options.avatarFile, limits, options.scenePlanV2, imageFlags);
         } else {
-          await executeImagens(project, options.avatarFile, limits, options.scenePlanV2);
+          await executeImagens(project, options.avatarFile, limits, options.scenePlanV2, imageFlags);
         }
         return;
       }
       if (options.stage === "thumbnails") {
-        await executeThumbnails(project, options.referenceUrl, options.avatarFile, options.count, options.prompt);
+        const imageFlags = imageRunFlagsFromCli(options);
+        await executeThumbnails(
+          project,
+          options.referenceUrl,
+          options.avatarFile,
+          options.count,
+          options.prompt,
+          imageFlags
+        );
         return;
       }
 
@@ -876,11 +1132,13 @@ async function executeImagens(
   avatarFile?: string,
   limits?: Step3Limits,
   scenePlanV2Cli?: boolean,
+  imageFlags?: ReturnType<typeof imageRunFlagsFromCli>,
 ): Promise<void> {
   try {
     const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
     await runImagensVideos(project, avatarAbs, limits, {
       scenePlanV2: resolveScenePlanV2(scenePlanV2Cli),
+      imageFlags,
     });
     console.log(chalk.green.bold("Step 3 (imagens/videos) concluido com sucesso."));
   } catch (error) {
@@ -924,12 +1182,13 @@ async function executeThumbnails(
   referenceUrl?: string,
   avatarFile?: string,
   countRaw?: string,
-  prompt?: string
+  prompt?: string,
+  imageFlags?: ReturnType<typeof imageRunFlagsFromCli>,
 ): Promise<void> {
   const count = Math.max(1, parseInt(countRaw ?? "2", 10) || 2);
   const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
   try {
-    await runThumbnails(project, { referenceUrl, avatarPath: avatarAbs, count, prompt });
+    await runThumbnails(project, { referenceUrl, avatarPath: avatarAbs, count, prompt, imageFlags });
   } catch (error) {
     console.log(chalk.red.bold("Falha na geracao de thumbnails."));
     throw error;
@@ -942,11 +1201,13 @@ async function executeImagensBlock(
   avatarFile?: string,
   limits?: Step3Limits,
   scenePlanV2Cli?: boolean,
+  imageFlags?: ReturnType<typeof imageRunFlagsFromCli>,
 ): Promise<void> {
   try {
     const avatarAbs = avatarFile ? path.resolve(process.cwd(), avatarFile) : undefined;
     await runImagensVideosBlock(project, blockNumber, avatarAbs, limits, {
       scenePlanV2: resolveScenePlanV2(scenePlanV2Cli),
+      imageFlags,
     });
     console.log(chalk.green.bold(`Step 3 do bloco ${blockNumber} concluido.`));
   } catch (error) {

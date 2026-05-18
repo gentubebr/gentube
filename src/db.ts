@@ -122,9 +122,48 @@ export function getDb(): Database.Database {
 
     CREATE INDEX IF NOT EXISTS idx_hf_cli_jobs_project_block ON hf_cli_jobs(project_id, block_number);
     CREATE INDEX IF NOT EXISTS idx_hf_cli_jobs_outcome ON hf_cli_jobs(outcome);
+
+    CREATE TABLE IF NOT EXISTS image_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      block_number INTEGER NOT NULL,
+      shot_id TEXT NOT NULL,
+      asset_type TEXT NOT NULL DEFAULT 'image' CHECK(asset_type = 'image'),
+      provider TEXT NOT NULL CHECK(provider IN ('higgsfield', 'gemini')),
+      delivery_mode TEXT NOT NULL CHECK(delivery_mode IN ('sync', 'google_batch', 'local_batch')),
+      external_id TEXT,
+      batch_id TEXT,
+      out_path_no_ext TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      outcome TEXT NOT NULL DEFAULT 'pending' CHECK(outcome IN ('pending', 'done', 'failed')),
+      result_mime TEXT,
+      error_message TEXT,
+      reference_image_path TEXT,
+      prompt_text TEXT,
+      downloaded_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(project_id) REFERENCES video_projects(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_image_jobs_outcome ON image_jobs(outcome);
+    CREATE INDEX IF NOT EXISTS idx_image_jobs_batch ON image_jobs(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_image_jobs_project_block ON image_jobs(project_id, block_number);
+    CREATE INDEX IF NOT EXISTS idx_image_jobs_provider ON image_jobs(provider, outcome);
   `);
 
+  migrateImageJobsColumns(db);
+
   return db;
+}
+
+/** Colunas adicionadas apos deploy inicial — idempotente. */
+function migrateImageJobsColumns(database: Database.Database): void {
+  const cols = database.prepare("PRAGMA table_info(image_jobs)").all() as { name: string }[];
+  const names = new Set(cols.map((c) => c.name));
+  if (!names.has("prompt_text")) {
+    database.exec("ALTER TABLE image_jobs ADD COLUMN prompt_text TEXT");
+  }
 }
 
 export function nowIso(): string {

@@ -6,6 +6,9 @@ dist/
 ._.DS_Store
 data/
 
+# Saídas de testes CLI (gemini:image, batch local, etc.)
+/out/
+
 # Runbook local — não versionar (cada máquina mantém o seu)
 /EXAMPLE.md
 

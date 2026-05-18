@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import chalk from "chalk";
@@ -10,6 +11,7 @@ import {
   PROMPT_MATRIX02_PATH,
   PROMPT_SEGMENTA01_PATH,
   PROMPT_VISUALIZA01_PATH,
+  resolveImageDelivery,
   resolvePromptMatrixPath,
   resolveCanalVoicePath,
   ROOT_DIR,
@@ -17,6 +19,7 @@ import {
   roteiroPrevContextEnabled,
   STOCK_RATIO_BLOCK1,
   STOCK_RATIO_OTHER,
+  type ImageRunFlags,
 } from "../config.js";
 import {
   generateAssetsPlanJson,
@@ -38,7 +41,9 @@ import {
   addProjectLog,
   countBlocksByStatus,
   countHfCliJobsByBlockOutcome,
+  countImageJobsByBlockOutcome,
   deleteHfCliJobsForBlock,
+  deleteImageJobsForBlock,
   getMediaBlock,
   getNarrationBlock,
   getScriptBlock,
@@ -51,6 +56,12 @@ import {
   upsertMediaBlock,
   upsertScriptBlock,
 } from "../repository.js";
+import {
+  flushPendingGoogleBatches,
+  flushPendingLocalBatches,
+  isGoogleBatchMode,
+  renderSceneImage,
+} from "./image-generation.js";
 import { parseAndValidateAssetsPlan } from "../utils/assets-plan.js";
 import { tryConcatMp3WithFfmpeg } from "../utils/mp3-concat.js";
 import {
@@ -130,8 +141,9 @@ function shouldSkipCompletedImagensBlock(projectId: number, blockNumber: number)
   if (!row || row.plan_status !== "success") return false;
   if (row.renders_status === "success") return true;
   if (row.renders_status === "awaiting_hf") {
-    const pending = countHfCliJobsByBlockOutcome(projectId, blockNumber, "pending");
-    return pending === 0;
+    const pendingHf = countHfCliJobsByBlockOutcome(projectId, blockNumber, "pending");
+    const pendingImg = countImageJobsByBlockOutcome(projectId, blockNumber, "pending");
+    return pendingHf === 0 && pendingImg === 0;
   }
   return false;
 }
@@ -140,7 +152,14 @@ const GENTUBE_HF_ASYNC = ["1", "true", "yes"].includes(
   String(process.env.GENTUBE_HF_ASYNC ?? "").toLowerCase()
 );
 
-export type ImagensVideosOptions = { scenePlanV2?: boolean };
+export type ImagensVideosOptions = { scenePlanV2?: boolean; imageFlags?: ImageRunFlags };
+
+function imagensUsesAsyncQueue(opts?: ImagensVideosOptions): boolean {
+  const delivery = resolveImageDelivery(opts?.imageFlags);
+  if (delivery === "google_batch" || delivery === "local_batch") return true;
+  if (isGoogleBatchMode(opts?.imageFlags)) return true;
+  return GENTUBE_HF_ASYNC;
+}
 
 function scenePlanV2Enabled(opts?: ImagensVideosOptions): boolean {
   if (opts?.scenePlanV2 === true) return true;
@@ -692,6 +711,7 @@ async function imagensBlockPlanAndRenderV2(input: {
   limits?: Step3Limits;
   stockRatio: number;
   manualCaptureSignals: string[];
+  imageFlags?: ImageRunFlags;
 }): Promise<{
   hfJobTotal: number;
   sceneCount: number;
@@ -814,6 +834,11 @@ async function imagensBlockPlanAndRenderV2(input: {
 
   await fs.mkdir(input.rendersDir, { recursive: true });
 
+  const delivery = resolveImageDelivery(input.imageFlags);
+  const blockBatchId =
+    delivery === "google_batch" || delivery === "local_batch" ? crypto.randomUUID() : undefined;
+  const batchIds: string[] = blockBatchId ? [blockBatchId] : [];
+
   let done = 0;
   let hfJobTotal = 0;
   let lastImageRef: string | undefined;
@@ -882,34 +907,73 @@ async function imagensBlockPlanAndRenderV2(input: {
     }
 
     if (v.type === "video" && !referenceImageUrl) {
-      if (GENTUBE_HF_ASYNC) {
-        console.log(chalk.dim(`  ${blockTag(bn, tb)} Bootstrap sincrono para video ${scene.id} (--wait)...`));
-        const bootstrap = await generateAndRenderShot({
-          type: "image",
+      console.log(chalk.dim(`  ${blockTag(bn, tb)} Bootstrap imagem para video ${scene.id}...`));
+      const bootstrap = await renderSceneImage(
+        {
+          projectId: input.projectId,
+          blockNumber: bn,
+          shotId: `${scene.id}__bootstrap`,
           prompt: hfPrompt,
           outPathNoExt: path.join(input.rendersDir, `${scene.id}__bootstrap`),
           referenceImageUrl: avatarRef,
-        });
-        lastImageRefLocal = bootstrap.localPath;
-        referenceImageUrl = bootstrap.localPath;
-        console.log(chalk.dim(`  ${blockTag(bn, tb)} Bootstrap pronto → ${path.basename(bootstrap.localPath)}`));
-        addProjectLog(input.projectId, "imagens_videos", "info", `Bootstrap sincrono video cena ${scene.id}`, {
-          mediaPath: bootstrap.localPath,
-        });
-      } else {
-        console.log(chalk.dim(`  ${blockTag(bn, tb)} Bootstrap img para video ${scene.id} (--wait)...`));
-        const bootstrap = await generateAndRenderShot({
-          type: "image",
-          prompt: hfPrompt,
-          outPathNoExt: path.join(input.rendersDir, `${scene.id}__bootstrap`),
-          referenceImageUrl: avatarRef,
-        });
-        lastImageRef = bootstrap.mediaUrl;
-        referenceImageUrl = bootstrap.mediaUrl;
-        addProjectLog(input.projectId, "imagens_videos", "info", `Bootstrap imagem video cena ${scene.id}`, {
-          mediaPath: bootstrap.localPath,
-        });
+          flags: input.imageFlags,
+          forceSync: true,
+        },
+        blockBatchId
+      );
+      if (!bootstrap.doneSync || !bootstrap.localPath) {
+        throw new Error(`Bootstrap imagem nao concluiu em sync para cena ${scene.id}`);
       }
+      lastImageRefLocal = bootstrap.localPath;
+      lastImageRef = bootstrap.localPath;
+      referenceImageUrl = bootstrap.localPath;
+      console.log(chalk.dim(`  ${blockTag(bn, tb)} Bootstrap pronto → ${path.basename(bootstrap.localPath)}`));
+      addProjectLog(input.projectId, "imagens_videos", "info", `Bootstrap imagem video cena ${scene.id}`, {
+        mediaPath: bootstrap.localPath,
+        provider: bootstrap.provider,
+      });
+    }
+
+    if (v.type === "image") {
+      const imgResult = await renderSceneImage(
+        {
+          projectId: input.projectId,
+          blockNumber: bn,
+          shotId: scene.id,
+          prompt: hfPrompt,
+          outPathNoExt: path.join(input.rendersDir, scene.id),
+          referenceImageUrl,
+          flags: input.imageFlags,
+        },
+        blockBatchId
+      );
+      if (imgResult.queued) {
+        hfJobTotal += 1;
+        console.log(
+          chalk.dim(
+            `  ${blockTag(bn, tb)} Imagem enfileirada: ${scene.id} (${imgResult.provider})`
+          )
+        );
+        addProjectLog(input.projectId, "imagens_videos", "info", `Job imagem enfileirado bloco ${bn} cena ${scene.id}`, {
+          provider: imgResult.provider,
+          batchId: imgResult.batchId,
+        });
+      } else if (imgResult.localPath) {
+        lastImageRefLocal = imgResult.localPath;
+        lastImageRef = imgResult.localPath;
+        done += 1;
+        console.log(
+          chalk.green(
+            `  ${blockTag(bn, tb)} ${scene.id} concluido → ${path.basename(imgResult.localPath)} (${done}/${plan.scenes.length})`
+          )
+        );
+        addProjectLog(input.projectId, "imagens_videos", "info", `Render imagem bloco ${bn} cena ${scene.id}`, {
+          mediaPath: imgResult.localPath,
+          provider: imgResult.provider,
+        });
+        upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
+      }
+      continue;
     }
 
     if (GENTUBE_HF_ASYNC) {
@@ -932,7 +996,6 @@ async function imagensBlockPlanAndRenderV2(input: {
         outPathNoExt: path.join(input.rendersDir, scene.id),
         referenceImageUrl,
       });
-      if (v.type === "image") lastImageRef = out.mediaUrl;
       done += 1;
       console.log(chalk.green(`  ${blockTag(bn, tb)} ${scene.id} concluido → ${path.basename(out.localPath)} (${done}/${plan.scenes.length})`));
       addProjectLog(input.projectId, "imagens_videos", "info", `Render concluido bloco ${bn} cena ${scene.id}`, {
@@ -942,7 +1005,15 @@ async function imagensBlockPlanAndRenderV2(input: {
     }
   }
 
-  if (!GENTUBE_HF_ASYNC) {
+  if (isGoogleBatchMode(input.imageFlags) && batchIds.length > 0) {
+    await flushPendingGoogleBatches(batchIds);
+  }
+  if (delivery === "local_batch" && batchIds.length > 0) {
+    await flushPendingLocalBatches(batchIds);
+  }
+
+  const asyncQueue = imagensUsesAsyncQueue({ imageFlags: input.imageFlags }) || hfJobTotal > 0;
+  if (!asyncQueue) {
     upsertMediaBlock(input.projectId, input.blockNumber, {
       renders_status: "success",
       renders_done_count: done,
@@ -967,10 +1038,11 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
   const promptBase = await fs.readFile(PROMPT_MATRIX02_PATH, "utf-8");
 
   updateProjectAnyStageStatus(projectId, "status_imagens_videos", "processing");
+  const asyncQueue = imagensUsesAsyncQueue(opts);
   console.log(
     chalk.bold.cyan(
-      GENTUBE_HF_ASYNC
-        ? `Step 3 — modo assincrono (${totalBlocos} blocos). Jobs serao enfileirados; depois rode higgsfield:sync`
+      asyncQueue
+        ? `Step 3 — modo assincrono (${totalBlocos} blocos). Jobs enfileirados; depois rode image:sync`
         : `Step 3 — modo sincrono (${totalBlocos} blocos)`
     )
   );
@@ -978,8 +1050,8 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
     projectId,
     "imagens_videos",
     "info",
-    GENTUBE_HF_ASYNC
-      ? "Iniciando step 3 (direcao + producao) — modo assincrono HF (GENTUBE_HF_ASYNC=1); depois rode gentube higgsfield:sync"
+    asyncQueue
+      ? "Iniciando step 3 (direcao + producao) — modo assincrono; depois rode gentube image:sync"
       : "Iniciando step 3 (direcao + producao)"
   );
 
@@ -1006,8 +1078,9 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
       const stockRatio = i === 1 ? STOCK_RATIO_BLOCK1 : STOCK_RATIO_OTHER;
 
       if (scenePlanV2Enabled(opts)) {
-        if (GENTUBE_HF_ASYNC && forceScenePlanVizRegen()) {
+        if (imagensUsesAsyncQueue(opts) && forceScenePlanVizRegen()) {
           deleteHfCliJobsForBlock(projectId, i);
+          deleteImageJobsForBlock(projectId, i);
         }
         const r = await imagensBlockPlanAndRenderV2({
           projectId,
@@ -1021,6 +1094,7 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
           limits,
           stockRatio,
           manualCaptureSignals: [],
+          imageFlags: opts?.imageFlags,
         });
         console.log(
           chalk.green(
@@ -1028,7 +1102,7 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
           )
         );
         addProjectLog(projectId, "imagens_videos", "info", `Bloco ${i}: plano por cenas (schema 2.0) gravado`);
-        if (GENTUBE_HF_ASYNC) {
+        if (imagensUsesAsyncQueue(opts) || r.hfJobTotal > 0) {
           upsertMediaBlock(projectId, i, {
             renders_total_count: r.hfJobTotal,
             renders_done_count: 0,
@@ -1036,12 +1110,12 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
             finished_at: null,
           });
           grandTotalJobs += r.hfJobTotal;
-          console.log(chalk.yellow(`${blockTag(i, totalBlocos)} ${r.hfJobTotal} jobs HF enfileirados (total acumulado: ${grandTotalJobs})`));
+          console.log(chalk.yellow(`${blockTag(i, totalBlocos)} ${r.hfJobTotal} jobs enfileirados (total acumulado: ${grandTotalJobs})`));
           addProjectLog(
             projectId,
             "imagens_videos",
             "info",
-            `Bloco ${i}: jobs HF enfileirados. Rode: npm run gentube -- higgsfield:sync --project ${projectId}`
+            `Bloco ${i}: jobs enfileirados. Rode: npm run gentube -- image:sync --project ${projectId}`
           );
         } else {
           console.log(chalk.green(`${blockTag(i, totalBlocos)} Bloco finalizado (${r.doneSync} renders)`));
@@ -1232,11 +1306,11 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
     }
   }
 
-  if (GENTUBE_HF_ASYNC && grandTotalJobs > 0) {
+  if (imagensUsesAsyncQueue(opts) && grandTotalJobs > 0) {
     console.log(
       chalk.bold.yellow(
-        `\nStep 3 concluido: ${grandTotalJobs} jobs HF enfileirados. Rode:\n` +
-          `  npm run gentube -- higgsfield:sync --project ${projectId} --watch --interval 30s`
+        `\nStep 3 concluido: ${grandTotalJobs} jobs enfileirados. Rode:\n` +
+          `  npm run gentube -- image:sync --project ${projectId} --watch --interval 30s`
       )
     );
   }
@@ -1270,10 +1344,11 @@ export async function runImagensVideosBlock(
   const rendersDir = path.join(imagesDir, "renders", `block${block}`);
   const startedAt = new Date().toISOString();
 
+  const asyncQueue = imagensUsesAsyncQueue(opts);
   updateProjectAnyStageStatus(projectId, "status_imagens_videos", "processing");
   console.log(
     chalk.bold.cyan(
-      GENTUBE_HF_ASYNC
+      asyncQueue
         ? `Step 3 — bloco ${blockNumber} (modo assincrono)`
         : `Step 3 — bloco ${blockNumber} (modo sincrono)`
     )
@@ -1282,8 +1357,8 @@ export async function runImagensVideosBlock(
     projectId,
     "imagens_videos",
     "info",
-    GENTUBE_HF_ASYNC
-      ? `Reprocessando bloco ${blockNumber} (HF assincrono; depois higgsfield:sync)`
+    asyncQueue
+      ? `Reprocessando bloco ${blockNumber} (assincrono; depois image:sync)`
       : `Reprocessando bloco ${blockNumber} do step 3`
   );
 
@@ -1294,8 +1369,9 @@ export async function runImagensVideosBlock(
     const stockRatio = blockNumber === 1 ? STOCK_RATIO_BLOCK1 : STOCK_RATIO_OTHER;
 
     if (scenePlanV2Enabled(opts)) {
-      if (GENTUBE_HF_ASYNC && forceScenePlanVizRegen()) {
+      if (asyncQueue && forceScenePlanVizRegen()) {
         deleteHfCliJobsForBlock(projectId, blockNumber);
+        deleteImageJobsForBlock(projectId, blockNumber);
       }
       const r = await imagensBlockPlanAndRenderV2({
         projectId,
@@ -1309,28 +1385,30 @@ export async function runImagensVideosBlock(
         limits,
         stockRatio,
         manualCaptureSignals: [],
+        imageFlags: opts?.imageFlags,
       });
       console.log(
         chalk.green(
           `${blockTag(blockNumber, totalBlocos)} Plano v2: ${r.planImages} imagens + ${r.planVideos} videos (${r.sceneCount} cenas)`
         )
       );
-      if (GENTUBE_HF_ASYNC) {
-        const pending = countHfCliJobsByBlockOutcome(projectId, blockNumber, "pending");
+      if (asyncQueue || r.hfJobTotal > 0) {
+        const pendingHf = countHfCliJobsByBlockOutcome(projectId, blockNumber, "pending");
+        const pendingImg = countImageJobsByBlockOutcome(projectId, blockNumber, "pending");
         upsertMediaBlock(projectId, blockNumber, {
-          renders_total_count: Math.max(r.hfJobTotal, pending),
+          renders_total_count: Math.max(r.hfJobTotal, pendingHf + pendingImg),
           renders_status: "awaiting_hf",
           finished_at: null,
         });
-        console.log(chalk.yellow(`${blockTag(blockNumber, totalBlocos)} ${r.hfJobTotal} jobs HF enfileirados`));
+        console.log(chalk.yellow(`${blockTag(blockNumber, totalBlocos)} ${r.hfJobTotal} jobs enfileirados`));
         console.log(
-          chalk.bold.yellow(`Rode: npm run gentube -- higgsfield:sync --project ${projectId} --watch --interval 30s`)
+          chalk.bold.yellow(`Rode: npm run gentube -- image:sync --project ${projectId} --watch --interval 30s`)
         );
         addProjectLog(
           projectId,
           "imagens_videos",
           "info",
-          `Bloco ${blockNumber}: jobs HF enfileirados. Rode: npm run gentube -- higgsfield:sync --project ${projectId}`
+          `Bloco ${blockNumber}: jobs enfileirados. Rode: npm run gentube -- image:sync --project ${projectId}`
         );
       } else {
         console.log(chalk.green(`${blockTag(blockNumber, totalBlocos)} Bloco finalizado (${r.doneSync} renders)`));
@@ -1508,6 +1586,7 @@ export async function runThumbnails(
     avatarPath?: string;
     count: number;
     prompt?: string;
+    imageFlags?: ImageRunFlags;
   }
 ): Promise<void> {
   const projectId = Number(project.id);
@@ -1555,17 +1634,26 @@ export async function runThumbnails(
 
   await fs.mkdir(thumbnailsDir, { recursive: true });
 
+  const delivery = resolveImageDelivery(opts.imageFlags);
+  const thumbBatchId =
+    delivery === "google_batch" || delivery === "local_batch" ? crypto.randomUUID() : undefined;
+  const batchIds: string[] = thumbBatchId ? [thumbBatchId] : [];
+  const thumbRef = referenceImagePath ?? avatarRef;
+  const useLegacyHfThumb =
+    imageFiles.length > 1 && delivery === "sync" && !isGoogleBatchMode(opts.imageFlags) && GENTUBE_HF_ASYNC;
+
   const generated: string[] = [];
+  let queuedCount = 0;
   for (let i = 1; i <= opts.count; i += 1) {
     const tag = chalk.dim(`[thumb ${i}/${opts.count}]`);
-    console.log(chalk.cyan(`${tag} Gerando thumbnail via Higgsfield...`));
+    console.log(chalk.cyan(`${tag} Gerando thumbnail...`));
 
     try {
       const suffix = referenceImagePath ? "ref" : "gen";
       const shotId = `thumb_${suffix}_${String(i).padStart(2, "0")}`;
       const outPathNoExt = path.join(thumbnailsDir, shotId);
 
-      if (GENTUBE_HF_ASYNC) {
+      if (useLegacyHfThumb) {
         const hfJobId = await enqueueThumbnailCli({ prompt, imageFiles });
         insertHfCliJob({
           projectId,
@@ -1578,12 +1666,30 @@ export async function runThumbnails(
         console.log(chalk.dim(`${tag} HF enfileirado → ${hfJobId.slice(0, 8)}...`));
         addProjectLog(projectId, "thumbnails", "info", `HF job enfileirado thumb #${i}`, { hfJobId });
         generated.push(shotId);
+        queuedCount += 1;
       } else {
-        const out = await generateThumbnailCli({ prompt, imageFiles });
-        const localPath = await downloadMedia(out.mediaUrl, outPathNoExt, ".png");
-        console.log(chalk.green(`${tag} Thumbnail salva → ${path.basename(localPath)}`));
-        addProjectLog(projectId, "thumbnails", "info", `Thumbnail #${i} gerada`, { path: localPath });
-        generated.push(localPath);
+        const result = await renderSceneImage(
+          {
+            projectId,
+            blockNumber: 0,
+            shotId,
+            prompt,
+            outPathNoExt,
+            referenceImageUrl: thumbRef,
+            flags: opts.imageFlags,
+          },
+          thumbBatchId
+        );
+        if (result.queued) {
+          queuedCount += 1;
+          generated.push(shotId);
+          console.log(chalk.dim(`${tag} enfileirado (${result.provider})`));
+          addProjectLog(projectId, "thumbnails", "info", `Thumb #${i} enfileirada`, { provider: result.provider });
+        } else if (result.localPath) {
+          console.log(chalk.green(`${tag} Thumbnail salva → ${path.basename(result.localPath)}`));
+          addProjectLog(projectId, "thumbnails", "info", `Thumbnail #${i} gerada`, { path: result.localPath });
+          generated.push(result.localPath);
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Erro desconhecido";
@@ -1594,15 +1700,23 @@ export async function runThumbnails(
     }
   }
 
-  if (GENTUBE_HF_ASYNC) {
+  if (isGoogleBatchMode(opts.imageFlags) && batchIds.length > 0) {
+    await flushPendingGoogleBatches(batchIds);
+  }
+  if (delivery === "local_batch" && batchIds.length > 0) {
+    await flushPendingLocalBatches(batchIds);
+  }
+
+  const asyncThumb = queuedCount > 0 || imagensUsesAsyncQueue({ imageFlags: opts.imageFlags });
+  if (asyncThumb && queuedCount > 0) {
     console.log(
       chalk.bold.yellow(
-        `\nThumbnails: ${generated.length} job(s) HF enfileirados. Rode:\n` +
-          `  npm run gentube -- higgsfield:sync --project ${projectId} --watch --interval 30s`
+        `\nThumbnails: ${queuedCount} job(s) enfileirados. Rode:\n` +
+          `  npm run gentube -- image:sync --project ${projectId} --watch --interval 30s`
       )
     );
     updateProjectAnyStageStatus(projectId, "status_thumbnails", "processing");
-  } else {
+  } else if (!asyncThumb) {
     console.log(chalk.green.bold(`\n${generated.length} thumbnail(s) gerada(s) com sucesso.`));
     updateProjectAnyStageStatus(projectId, "status_thumbnails", "success");
   }
