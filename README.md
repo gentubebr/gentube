@@ -10,6 +10,7 @@ CLI em **Node.js** para organizar projetos de vídeo no estilo YouTube: **roteir
 - Roteiro em blocos (`block01.md`, …) a partir do prompt em `Prompts/matriz.md` ou **`matriz_tutorial.md`** (`GENTUBE_ROTEIRO_MODE=tutorial`, `GENTUBE_PROMPT_MATRIX` ou `--prompt-matrix`). No **bloco 1**, o ficheiro opcional `Prompts/canal_voice.md` fixa voz/persona do canal; nos **blocos seguintes**, o texto dos `.md` anteriores entra como contexto de coesão (configurável; ver tabela de variáveis).
 - Áudio por bloco (`block01.mp3`, …) ou **por cena** (`02 - Narracao/block01/sc01.mp3`, …) quando existe plano v2; concat com `ffmpeg` → `help run-step` (etapa narracao).
 - Status de cada etapa e de cada bloco gravados localmente (sem depender só de arquivos soltos).
+- Modalidade visual **Wojak** (opt-in): avatar line-art com referências PNG e bootstrap de vídeo — ver **[wojak.md](wojak.md)** e secção **18.10** de `ESPECIFICACAO_TECNICA.md`.
 
 ## Pré-requisitos: contas, chaves e ferramentas
 
@@ -161,6 +162,8 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS` | Opcional | Máx. vídeos nos **blocos 2..N** (default `10`) |
 | `GENTUBE_MAX_IMAGES_OTHER_BLOCKS` | Opcional | Máx. imagens nos **blocos 2..N** (default `40`) |
 | `GENTUBE_SCENE_PLAN_V2` | Opcional | `1` / `true` / `yes`: step **imagens** em modo plano por cenas (dois passos Claude). A flag `--scene-plan-v2` tem prioridade quando passada |
+| `GENTUBE_VISUAL_MODALITY` | Opcional | `default` (comportamento atual) ou `wojak` — ver [wojak.md](wojak.md) |
+| `GENTUBE_PROMPT_VISUALIZA` | Opcional | Ficheiro em `Prompts/` para visualização (ex.: `visualiza_wojak.md`); em modo `wojak` o default é `visualiza01.md` + addon `visualiza_wojak.md` |
 | `GENTUBE_FORCE_VIZ_REGEN` | Opcional | `1` / `true` / `yes`: força **nova** segmentação/visualização Claude e apaga jobs HF do bloco no retry (ignora `blockNN.assets.json` e `.error` no disco) |
 | `GENTUBE_REMOTE_HOST` | Opcional | Host SSH remoto para `copy-cmd` (ex.: `dev-development`); evita `--remote-host` toda vez |
 | `GENTUBE_HF_ASYNC` | Opcional | `1`, `true` ou `yes`: no step **imagens**, enfileira jobs no Higgsfield sem esperar no mesmo comando; use `image:sync` / `higgsfield:sync` (ou `--watch`) para baixar resultados |
@@ -260,7 +263,15 @@ npm run gentube -- gemini:image --prompt "cinematic 16:9 ..." --out ./out/teste.
 npm run gentube -- gemini:image --google-batch-mode --prompts-file prompts.txt --out-dir ./out
 npm run gentube -- gemini:image --batch-local --prompts-file prompts.txt --out-dir ./out --concurrency 4
 
-# 7) Gerar thumbnails (mesma política de imagem: --google-batch-mode, auto, etc.)
+# 7) Montagem FFmpeg — primeiro por bloco, depois o step todo
+npm run gentube -- run-step --project 1 --step montagem --block 1
+npm run gentube -- run-step --project 1 --step montagem --block 2
+# Quando todos os blocos estiverem prontos (ou para reprocessar o que falta):
+npm run gentube -- run-step --project 1 --step montagem
+# Bloco incompleto → block01_sc01-sc05.mp4 + block01.err.txt · completo → 06 - Montagem/blocks/block01.mp4
+npm run gentube -- retry --project 1 --stage montagem --block 2 --force
+
+# 8) Gerar thumbnails (mesma política de imagem: --google-batch-mode, auto, etc.)
 # (A) Com referência de outro canal (baixa thumbnail + avatar → HF ou Gemini)
 npm run gentube -- run-step --project 1 --step thumbnails --google-batch-mode \
   --reference-url "https://www.youtube.com/watch?v=VIDEO_ID" \
@@ -324,7 +335,7 @@ npm run gentube -- sync-from-disk --project 6 --force     # reimportar mesmo com
 
 **Lista de capturas manuais:** `npm run gentube -- shot-list-manual --project <id>` gera `shot_list_manual.md` / `.csv` a partir dos planos 2.0.
 
-Detalhes: **secções 18.9 e 21** de `ESPECIFICACAO_TECNICA.md`.
+Detalhes: **secções 18.9, 18.10 e 21** de `ESPECIFICACAO_TECNICA.md`. Modalidade Wojak: **[wojak.md](wojak.md)**.
 
 ### Build (TypeScript → `dist/`)
 
@@ -402,7 +413,7 @@ Regras de negócio, modelo de dados, contratos de comandos e decisões de implem
 - Implementar `image_jobs`, `gemini:image`, `image:sync` e flags `--google-batch-mode` / `--batch-local` (spec sec. 22).
 - Migrar imagens de `hf_cli_jobs` → `image_jobs`.
 - Incluir steps no `run-all` ou comando `run-all --with-imagens`.
-- Step **montagem** (FFmpeg): clipes por cena + bloco com **Ken Burns zoom-in** em imagens e **xfade 0,1 s** (`fade`) entre cenas — ver **sec. 23** de `ESPECIFICACAO_TECNICA.md` (protótipo local opcional em `experiments/`, fora do Git).
+- Step **montagem** implementado: `run-step --step montagem` (ver **sec. 23** e `.env.example`).
 
 ## Licença
 

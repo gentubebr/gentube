@@ -14,6 +14,7 @@ Automatizar, via terminal, a criacao de projetos de video YouTube com pipeline p
 2. Narracao
 3. Imagens ou Videos (implementado: direcao + producao Higgsfield; ver secao 18 e 16)
 4. Thumbnails (implementado: com/sem referencia YouTube + Higgsfield direto; ver secao 19)
+5. Montagem (FFmpeg: clipes por cena + bloco; ver secao 23)
 
 Escopo da primeira entrega:
 
@@ -48,6 +49,7 @@ Cada projeto deve conter:
 - `03 - Imagens e Videos/`
 - `04 - Thumbnails/`
 - `05 - Modelagem/` — arquivos de apoio (ex.: `transcript.txt` da transcricao usada como referencia de outro canal; gravado na criacao do projeto quando houver transcricao)
+- `06 - Montagem/` — clipes por cena e blocos montados (step montagem; ver secao 23)
 
 ### 2.4 Estrutura de referencia do template
 
@@ -670,6 +672,20 @@ Gravado ao falhar parse/validacao em segmentacao ou visualizacao (`writePlanPars
 
 **Comando auxiliar:** `gentube shot-list-manual --project <id>` — exporta capturas `manual_capture` para `shot_list_manual.md` / `.csv` (`src/services/shot-list-manual.ts`).
 
+### 18.10 Modalidade visual Wojak (opt-in)
+
+**Documento mestre:** [wojak.md](wojak.md) (plano, ficheiros, testes, rollout).
+
+**Objetivo:** canais com avatar **Wojak** (line art) em cenas `character_required: true`, com referencia PNG canonica (`src/assets/wojak/`), style token no render e bootstrap obrigatorio antes de video (Veo).
+
+**Ativacao:** `GENTUBE_VISUAL_MODALITY=wojak` (default `default` — sem impacto em projetos existentes). Opcional: `GENTUBE_PROMPT_VISUALIZA`. `--avatar-file` continua disponivel e faz override da PNG da variant em modo Wojak.
+
+**Prompts:** `segmenta01.md` inalterado. Visualizacao: `visualiza01.md` + addon `Prompts/visualiza_wojak.md` (schema `2.0-visualization` igual; campo opcional `character_variant`).
+
+**Implementacao:** `src/config.ts` (`resolveVisualModality`, `resolveVisualizaPromptContent`), `src/utils/wojak-prompt.ts`, ramo em `imagensBlockPlanAndRenderV2` (`src/services/pipeline.ts`). Nao altera `image-generation.ts`, `video-generation.ts` nem montagem.
+
+**Pre-requisito:** plano v2 (`--scene-plan-v2` / `GENTUBE_SCENE_PLAN_V2`).
+
 ## 19) Politica aprovada — Step 4 (Thumbnails)
 
 ### 19.1 Objetivo
@@ -1059,9 +1075,9 @@ gentube image:batch-submit --project 1
 gentube image:sync --project 1 --watch --interval 60s
 ```
 
-## 23) Montagem por cena — FFmpeg (aprovado, pendente implementacao)
+## 23) Montagem por cena — FFmpeg (implementado)
 
-**Estado:** requisitos e defaults **aprovados** apos testes em `experiments/ffmpeg-scene-tests/` (referencia: `output/20260518-183855/bloco3-kenburns-zoom-in-xfade-0.1s.mp4`). **Nao implementado** no CLI `src/` nesta fase.
+**Estado:** implementado no CLI (`run-step --step montagem`, `retry --stage montagem`, `sync-from-disk --only montagem`). Prototipo visual: `experiments/ffmpeg-scene-tests/output/20260518-183855/bloco3-kenburns-zoom-in-xfade-0.1s.mp4`.
 
 ### 23.1 Objetivo
 
@@ -1119,18 +1135,43 @@ Variaveis alvo (`.env`): `GENTUBE_KEN_BURNS_ZOOM_END=1.12`, `GENTUBE_KEN_BURNS_F
 
 Transicoes alternativas (fase opcional): `dissolve`, `fadefast` — catalogo completo no filtro FFmpeg `xfade`; amostras em `experiments/ffmpeg-scene-tests/output/xfade-*/`.
 
-### 23.7 Dependencias e retoma
+### 23.7 Montagem por bloco — segmentos parciais e erros
 
-- **ffmpeg** e **ffprobe** no `PATH` (ou `GENTUBE_FFMPEG_PATH`); step falha com mensagem clara se ausente.
-- Idempotencia: saltar cena/bloco se saida existir e entradas nao mudaram (hash ou mtime).
-- SQLite: novo status em `video_projects` (ex. `status_montagem`) e tabela opcional `assembly_blocks` espelhando `media_blocks`.
+Iterar `scenes[]` na ordem do plano. Cena **completa** = `scXX.mp3` (≥ `GENTUBE_MONTAGEM_MIN_MP3_BYTES`) + visual resolvido (render ou bootstrap).
 
-### 23.8 Prototipo e validacao visual
+| Situacao | Saida |
+|----------|--------|
+| Todas as cenas completas | `blocks/blockNN.mp4` + `blockNN.assembly.json` |
+| Buraco no meio (ex. falta sc06) | `blockNN_sc01-sc05.mp4`, `blockNN_sc07-sc29.mp4`, … |
+| Uma cena isolada | `blockNN_sc06.mp4` |
+| Qualquer falha / incompleto | `blocks/blockNN.err.txt` (lista cenas, segmentos gerados, erros ffmpeg) |
+
+**Politica:** por defeito **nao interrompe** o projeto (`GENTUBE_MONTAGEM_STOP_ON_BLOCK_ERROR=0`); avanca ao bloco seguinte.
+
+**SQLite:** `video_projects.status_montagem` = `pending | processing | success | partial | error`; tabela `assembly_blocks` por `(project_id, block_number)`.
+
+### 23.8 Variaveis de ambiente e flags CLI
+
+Todas as chaves em `.env.example` (prefixo `GENTUBE_MONTAGEM_*`, `GENTUBE_KEN_BURNS_*`, `GENTUBE_FFMPEG_PATH`).
+
+Flags CLI (sobrescrevem `.env` na corrida): `--force`, `--block N` (retry), `--xfade-duration`, `--xfade-transition`, `--no-partial-segments`.
+
+### 23.9 Comandos
+
+```bash
+npm run gentube -- run-step --project <id> --step montagem
+npm run gentube -- retry --project <id> --stage montagem [--block N] [--force]
+npm run gentube -- sync-from-disk --project <id> --only montagem
+```
+
+### 23.10 Dependencias e retoma
+
+- **ffmpeg** / **ffprobe** no `PATH`, ou `GENTUBE_FFMPEG_PATH` / `GENTUBE_FFPROBE_PATH` (fallback: `experiments/ffmpeg-bin/` no clone).
+- Idempotencia: `GENTUBE_MONTAGEM_SKIP_EXISTING=1` — saltar se saida mais recente que entradas (`--force` re-encode).
+- `create-video` / template criam pasta `06 - Montagem/`.
+
+### 23.11 Prototipo local
 
 ```bash
 ./experiments/ffmpeg-scene-tests/run-tests.sh
-# Referencia aprovada:
-# experiments/ffmpeg-scene-tests/output/20260518-183855/bloco3-kenburns-zoom-in-xfade-0.1s.mp4
 ```
-
-Guia de avaliacao: `PARA-AVALIAR.md` gerado em cada corrida de testes.
