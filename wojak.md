@@ -194,9 +194,9 @@ Lógica:
 
 | Etapa | Estado |
 |-------|--------|
-| Documentação (`wojak.md`, README, ESPECIFICACAO) | Em curso |
-| Implementação código | Pendente após commit deste plano |
-| Assets PNG no repo | Pendente |
+| Documentação (`wojak.md`, README, ESPECIFICACAO) | Concluído (commit `478a363`) |
+| Implementação código | Concluído |
+| Assets PNG em `src/assets/wojak/` | Concluído (×8) |
 | Testes manuais | Pendente |
 
-*Última atualização: commit inicial deste documento.*
+*Última atualização: implementação modalidade Wojak (opt-in).*

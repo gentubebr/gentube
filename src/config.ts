@@ -15,8 +15,77 @@ export const PROMPT_MATRIX02_PATH = path.join(PROMPTS_DIR, "matriz02.md");
 export const PROMPT_SEGMENTA01_PATH = path.join(PROMPTS_DIR, "segmenta01.md");
 /** Direcao visual por cena (schema 2.0). */
 export const PROMPT_VISUALIZA01_PATH = path.join(PROMPTS_DIR, "visualiza01.md");
+/** Addon Wojak (composicao com visualiza01 quando modality=wojak). */
+export const PROMPT_VISUALIZA_WOJAK_PATH = path.join(PROMPTS_DIR, "visualiza_wojak.md");
 /** PNG dummy copiado para renders quando visual.source === manual_capture */
 export const MANUAL_CAPTURE_PLACEHOLDER_PATH = path.join(ROOT_DIR, "src", "assets", "manual_capture", "placeholder.png");
+
+export type VisualModality = "default" | "wojak";
+
+export type WojakCharacterVariant =
+  | "neutral"
+  | "happy"
+  | "smiling"
+  | "tired"
+  | "doomer"
+  | "frontal"
+  | "impressed"
+  | "pain";
+
+const WOJAK_ASSETS_DIR = path.join(ROOT_DIR, "src", "assets", "wojak");
+
+export const WOJAK_REF_PATHS: Record<WojakCharacterVariant, string> = {
+  neutral: path.join(WOJAK_ASSETS_DIR, "wojak_neutral.png"),
+  happy: path.join(WOJAK_ASSETS_DIR, "wojak_happy.png"),
+  smiling: path.join(WOJAK_ASSETS_DIR, "wojak_smiling.png"),
+  tired: path.join(WOJAK_ASSETS_DIR, "wojak_tired.png"),
+  doomer: path.join(WOJAK_ASSETS_DIR, "wojak_doomer.png"),
+  frontal: path.join(WOJAK_ASSETS_DIR, "wojak_frontal.png"),
+  impressed: path.join(WOJAK_ASSETS_DIR, "wojak_impressed.png"),
+  pain: path.join(WOJAK_ASSETS_DIR, "wojak_pain.png"),
+};
+
+const DEFAULT_WOJAK_STYLE_TOKEN = [
+  "minimalist line drawing character, bold black outlines, white fill, subtle gray shading,",
+  "bald head, no hair, small beady eyes, flat nose, thin lips,",
+  "clean white background, wojak meme face style, channel avatar,",
+].join(" ");
+
+export function wojakStyleToken(): string {
+  const fromEnv = (process.env.GENTUBE_WOJAK_STYLE_TOKEN ?? "").trim();
+  return fromEnv || DEFAULT_WOJAK_STYLE_TOKEN;
+}
+
+export function resolveVisualModality(): VisualModality {
+  const raw = (process.env.GENTUBE_VISUAL_MODALITY ?? "default").trim().toLowerCase();
+  return raw === "wojak" ? "wojak" : "default";
+}
+
+function resolvePromptFileInPromptsDir(raw: string): string {
+  const nameIn = raw.trim();
+  const baseName = path.basename(nameIn.replace(/^\.\//, ""));
+  const withMd = baseName.toLowerCase().endsWith(".md") ? baseName : `${baseName}.md`;
+  const resolved = path.isAbsolute(nameIn) ? path.normalize(nameIn) : path.resolve(PROMPTS_DIR, withMd);
+  const rel = path.relative(path.resolve(PROMPTS_DIR), resolved);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`Prompt de visualizacao deve estar dentro de ${PROMPTS_DIR}. Recebido: ${raw}`);
+  }
+  return resolved;
+}
+
+/** Conteudo do prompt Claude de visualizacao (v2). */
+export async function resolveVisualizaPromptContent(): Promise<string> {
+  const fs = await import("node:fs/promises");
+  const fromEnv = (process.env.GENTUBE_PROMPT_VISUALIZA ?? "").trim();
+  if (fromEnv) {
+    const p = resolvePromptFileInPromptsDir(fromEnv);
+    return fs.readFile(p, "utf-8");
+  }
+  const base = await fs.readFile(PROMPT_VISUALIZA01_PATH, "utf-8");
+  if (resolveVisualModality() !== "wojak") return base;
+  const addon = await fs.readFile(PROMPT_VISUALIZA_WOJAK_PATH, "utf-8");
+  return `${base}\n\n---\n\n${addon}`;
+}
 
 /**
  * Ficheiro de prompt da etapa roteiro (sob `Prompts/`).

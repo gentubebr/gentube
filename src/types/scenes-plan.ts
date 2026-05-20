@@ -1,4 +1,5 @@
 import type { IpRisk } from "./assets-plan.js";
+import type { WojakCharacterVariant } from "../config.js";
 
 export type VisualSourceV2 = "ai_generated" | "stock" | "manual_capture";
 
@@ -21,6 +22,8 @@ export type SceneVisualPlanV2 = {
   capture_brief?: CaptureBrief | null;
   ip_risk: IpRisk;
   character_required?: boolean;
+  /** Modo Wojak: expressao da referencia PNG (opcional; pipeline infere se ausente). */
+  character_variant?: WojakCharacterVariant;
 };
 
 export type ScenePlanV2 = {

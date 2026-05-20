@@ -10,8 +10,9 @@ import {
   MANUAL_CAPTURE_PLACEHOLDER_PATH,
   PROMPT_MATRIX02_PATH,
   PROMPT_SEGMENTA01_PATH,
-  PROMPT_VISUALIZA01_PATH,
   resolveImageDelivery,
+  resolveVisualModality,
+  resolveVisualizaPromptContent,
   resolvePromptMatrixPath,
   resolveCanalVoicePath,
   ROOT_DIR,
@@ -80,7 +81,8 @@ import {
 import { searchAndDownload } from "../integrations/magnific.js";
 import { sceneRenderOutputExists } from "../utils/media-output.js";
 import { Step3Limits } from "../types/step3-limits.js";
-import type { BlockScenesPlanV2, SceneVisualPlanV2, SegmentationPlanV2 } from "../types/scenes-plan.js";
+import type { BlockScenesPlanV2, SegmentationPlanV2 } from "../types/scenes-plan.js";
+import { prepareSceneVisualRender } from "../utils/wojak-prompt.js";
 
 type ProjectRow = Record<string, unknown>;
 
@@ -214,13 +216,6 @@ function imagensUsesAsyncQueue(opts?: ImagensVideosOptions): boolean {
 function scenePlanV2Enabled(opts?: ImagensVideosOptions): boolean {
   if (opts?.scenePlanV2 === true) return true;
   return ["1", "true", "yes"].includes(String(process.env.GENTUBE_SCENE_PLAN_V2 ?? "").toLowerCase());
-}
-
-function promptForSceneVisual(v: SceneVisualPlanV2): string {
-  let p = v.description.trim();
-  const neg = v.negative_prompt?.trim();
-  if (neg) p += ` Avoid: ${neg}`;
-  return p;
 }
 
 export type RoteiroPromptOptions = { promptMatrix?: string; promptCanalVoice?: string };
@@ -832,7 +827,7 @@ async function imagensBlockPlanAndRenderV2(input: {
     plan = existingPlan;
   } else {
     const segPrompt = await fs.readFile(PROMPT_SEGMENTA01_PATH, "utf-8");
-    const vizPrompt = await fs.readFile(PROMPT_VISUALIZA01_PATH, "utf-8");
+    const vizPrompt = await resolveVisualizaPromptContent();
 
     let seg: SegmentationPlanV2;
     let rawViz: string;
@@ -944,6 +939,10 @@ async function imagensBlockPlanAndRenderV2(input: {
   let hfJobTotal = 0;
   let lastImageRef: string | undefined;
   let lastImageRefLocal: string | undefined;
+  const visualModality = resolveVisualModality();
+  if (visualModality === "wojak") {
+    console.log(chalk.cyan(`  ${blockTag(bn, tb)} Modalidade visual: wojak (referencias em src/assets/wojak/)`));
+  }
   const avatarRef =
     input.avatarPath && String(input.avatarPath).trim()
       ? /^https?:\/\//i.test(String(input.avatarPath))
@@ -996,10 +995,11 @@ async function imagensBlockPlanAndRenderV2(input: {
 
     if (effectiveSource !== "ai_generated") continue;
 
-    const hfPrompt = promptForSceneVisual(v);
-    let referenceImageUrl = v.character_required ? avatarRef : undefined;
+    const renderPrep = prepareSceneVisualRender(v, scene.narration_text, visualModality, avatarRef);
+    const hfPrompt = renderPrep.hfPrompt;
+    let referenceImageUrl = renderPrep.referenceImageUrl;
 
-    if (v.type === "video" && !referenceImageUrl) {
+    if (v.type === "video" && !referenceImageUrl && !renderPrep.wojakVideoBootstrap) {
       if (GENTUBE_HF_ASYNC) {
         referenceImageUrl = avatarRef ?? lastImageRefLocal;
       } else {
@@ -1007,7 +1007,10 @@ async function imagensBlockPlanAndRenderV2(input: {
       }
     }
 
-    if (v.type === "video" && !referenceImageUrl) {
+    const needsVideoBootstrap =
+      v.type === "video" && (renderPrep.wojakVideoBootstrap || !referenceImageUrl);
+
+    if (needsVideoBootstrap) {
       console.log(chalk.dim(`  ${blockTag(bn, tb)} Bootstrap imagem para video ${scene.id}...`));
       const bootstrap = await renderSceneImage(
         {
@@ -1016,7 +1019,7 @@ async function imagensBlockPlanAndRenderV2(input: {
           shotId: `${scene.id}__bootstrap`,
           prompt: hfPrompt,
           outPathNoExt: path.join(input.rendersDir, `${scene.id}__bootstrap`),
-          referenceImageUrl: avatarRef,
+          referenceImageUrl: renderPrep.wojakVideoBootstrap ? renderPrep.referenceImageUrl : avatarRef,
           flags: input.imageFlags,
           forceSync: true,
         },

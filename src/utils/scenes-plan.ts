@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Step3Limits } from "../types/step3-limits.js";
+import { isWojakCharacterVariant } from "./wojak-prompt.js";
 import type { BlockScenesPlanV2, ScenePlanV2, SceneVisualPlanV2, SegmentationPlanV2 } from "../types/scenes-plan.js";
 import {
   estimatedSpeechSecondsFromWordCount,
@@ -241,6 +242,15 @@ function assertVisual(v: unknown, sceneId: string): asserts v is SceneVisualPlan
     if (typeof v.search_keywords !== "string" || !v.search_keywords.trim()) {
       throw new Error(`Visual ${sceneId}: search_keywords obrigatorio para stock`);
     }
+  }
+  if (v.character_variant !== undefined && v.character_variant !== null && v.character_variant !== "") {
+    const cv = String(v.character_variant).trim().toLowerCase();
+    if (!isWojakCharacterVariant(cv)) {
+      throw new Error(
+        `Visual ${sceneId}: character_variant invalido (${String(v.character_variant)}). Use neutral|happy|smiling|tired|doomer|frontal|impressed|pain`,
+      );
+    }
+    (v as { character_variant: string }).character_variant = cv;
   }
   if (v.source === "manual_capture") {
     const brief = v.capture_brief;
