@@ -11,6 +11,8 @@ import {
   PROMPT_MATRIX02_PATH,
   PROMPT_SEGMENTA01_PATH,
   resolveImageDelivery,
+  resolveSceneImageDelivery,
+  resolveStockRatioForBlock,
   resolveVisualModality,
   resolveVisualizaPromptContent,
   resolvePromptMatrixPath,
@@ -18,8 +20,6 @@ import {
   ROOT_DIR,
   ROTEIRO_PREV_CONTEXT_MAX_CHARS,
   roteiroPrevContextEnabled,
-  STOCK_RATIO_BLOCK1,
-  STOCK_RATIO_OTHER,
   type ImageRunFlags,
 } from "../config.js";
 import {
@@ -82,7 +82,7 @@ import { searchAndDownload } from "../integrations/magnific.js";
 import { sceneRenderOutputExists } from "../utils/media-output.js";
 import { Step3Limits } from "../types/step3-limits.js";
 import type { BlockScenesPlanV2, SegmentationPlanV2 } from "../types/scenes-plan.js";
-import { prepareSceneVisualRender } from "../utils/wojak-prompt.js";
+import { assertWojakBlockPlan, prepareSceneVisualRender } from "../utils/wojak-prompt.js";
 
 type ProjectRow = Record<string, unknown>;
 
@@ -126,6 +126,15 @@ async function narrationSceneMp3Cached(sceneMp3Path: string): Promise<boolean> {
   }
 }
 
+export type NarracaoOptions = {
+  /** Regenera todos os scXX.mp3 do plano v2 (ignora MP3 >= 1 KiB no disco). */
+  forceRegenScenes?: boolean;
+};
+
+function narracaoForceRegen(opts?: NarracaoOptions): boolean {
+  return Boolean(opts?.forceRegenScenes);
+}
+
 /** Nao voltar a gerar plano/renders se o bloco ja esta concluido no SQLite (e, em async HF, sem jobs pendentes). */
 function shouldSkipCompletedImagensBlock(projectId: number, blockNumber: number): boolean {
   const row = getMediaBlock(projectId, blockNumber);
@@ -134,7 +143,8 @@ function shouldSkipCompletedImagensBlock(projectId: number, blockNumber: number)
   if (row.renders_status === "awaiting_hf") {
     const pendingHf = countHfCliJobsByBlockOutcome(projectId, blockNumber, "pending");
     const pendingImg = countImageJobsByBlockOutcome(projectId, blockNumber, "pending");
-    return pendingHf === 0 && pendingImg === 0;
+    // So saltar se ainda ha jobs; se zero, reprocessar (ex.: plan-only deixou awaiting_hf sem fila).
+    return pendingHf + pendingImg > 0;
   }
   return false;
 }
@@ -160,6 +170,7 @@ function assertImagensPhaseRequiresV2(opts?: ImagensVideosOptions): void {
 
 function shouldSkipImagensBlock(projectId: number, blockNumber: number, opts?: ImagensVideosOptions): boolean {
   if (opts?.planOnly) {
+    if (forceScenePlanVizRegen()) return false;
     const row = getMediaBlock(projectId, blockNumber);
     return row?.plan_status === "success";
   }
@@ -207,7 +218,7 @@ async function finalizeDeferredBatchSubmits(
 }
 
 function imagensUsesAsyncQueue(opts?: ImagensVideosOptions): boolean {
-  const delivery = resolveImageDelivery(opts?.imageFlags);
+  const delivery = resolveSceneImageDelivery(opts?.imageFlags);
   if (delivery === "google_batch" || delivery === "local_batch") return true;
   if (isGoogleBatchMode(opts?.imageFlags)) return true;
   return GENTUBE_HF_ASYNC;
@@ -419,7 +430,93 @@ export async function runRoteiroBlock(project: ProjectRow, blockNumber: number, 
   recomputeStageFromBlocks(projectId, totalBlocos, "script_blocks", "status_roteiro");
 }
 
-export async function runNarracao(project: ProjectRow, voiceId: string): Promise<void> {
+async function synthesizeBlockNarration(input: {
+  projectId: number;
+  projectPath: string;
+  blockNumber: number;
+  totalBlocos: number;
+  voiceId: string;
+  sourceText: string;
+  narracaoDir: string;
+  opts?: NarracaoOptions;
+}): Promise<void> {
+  const { projectId, blockNumber, totalBlocos, voiceId, sourceText, narracaoDir, opts } = input;
+  const force = narracaoForceRegen(opts);
+  const startedAt = new Date().toISOString();
+  const audioPath = path.join(narracaoDir, `block${String(blockNumber).padStart(2, "0")}.mp3`);
+
+  console.log(chalk.cyan(`${blockTag(blockNumber, totalBlocos)} Gerando narracao...`));
+  if (force) {
+    console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} --force-narracao: regenerando MP3 por cena`));
+  }
+
+  upsertNarrationBlock(projectId, blockNumber, { status: "processing", started_at: startedAt, error_message: null });
+  const pad = String(blockNumber).padStart(2, "0");
+  let primaryMp3Path = audioPath;
+
+  const planV2 = await tryLoadBlockScenesPlanV2(input.projectPath, blockNumber);
+  if (planV2) {
+    const blockSubDir = path.join(narracaoDir, `block${pad}`);
+    await fs.mkdir(blockSubDir, { recursive: true });
+    const scenePaths: string[] = [];
+    for (const scene of planV2.scenes) {
+      const p = path.join(blockSubDir, `${scene.id}.mp3`);
+      if (!force && (await narrationSceneMp3Cached(p))) {
+        console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} Reutilizando ${scene.id}.mp3`));
+        scenePaths.push(p);
+        continue;
+      }
+      console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} ElevenLabs ${scene.id}...`));
+      const audioBuffer = await textToSpeechMp3({ text: scene.narration_text, voiceId });
+      await fs.writeFile(p, audioBuffer);
+      scenePaths.push(p);
+    }
+    const concatOk = await tryConcatMp3WithFfmpeg(scenePaths, audioPath);
+    if (!concatOk) {
+      console.log(
+        chalk.yellow(
+          `${blockTag(blockNumber, totalBlocos)} ffmpeg ausente ou concat falhou: block${pad}.mp3 nao criado. Use os MP3 por cena em block${pad}/.`,
+        ),
+      );
+      primaryMp3Path = scenePaths[0]!;
+    }
+  } else {
+    const audioBuffer = await textToSpeechMp3({ text: sourceText, voiceId });
+    await fs.writeFile(audioPath, audioBuffer);
+  }
+
+  upsertNarrationBlock(projectId, blockNumber, {
+    status: "success",
+    file_path_mp3: primaryMp3Path,
+    finished_at: new Date().toISOString(),
+  });
+
+  if (planV2) {
+    let monolithicOk = false;
+    try {
+      const st = await fs.stat(audioPath);
+      monolithicOk = st.isFile();
+    } catch {
+      monolithicOk = false;
+    }
+    if (monolithicOk) {
+      console.log(
+        chalk.green(`${blockTag(blockNumber, totalBlocos)} Por cena → block${pad}/ + block${pad}.mp3 (concat)`),
+      );
+    } else {
+      console.log(
+        chalk.green(
+          `${blockTag(blockNumber, totalBlocos)} Por cena → block${pad}/ (${planV2.scenes.length} MP3); sem block${pad}.mp3 ate ter ffmpeg`,
+        ),
+      );
+    }
+  } else {
+    console.log(chalk.green(`${blockTag(blockNumber, totalBlocos)} Audio salvo → block${pad}.mp3`));
+  }
+  addProjectLog(projectId, "narracao", "info", `Audio do bloco ${blockNumber} gerado com sucesso`);
+}
+
+export async function runNarracao(project: ProjectRow, voiceId: string, opts?: NarracaoOptions): Promise<void> {
   const projectId = Number(project.id);
   const totalBlocos = Number(project.total_blocos);
   const narracaoDir = path.join(String(project.project_path), "02 - Narracao");
@@ -439,80 +536,23 @@ export async function runNarracao(project: ProjectRow, voiceId: string): Promise
     const blockNumber = block.block_number;
 
     const existingNarration = getNarrationBlock(projectId, blockNumber);
-    if (existingNarration?.status === "success") {
+    if (!narracaoForceRegen(opts) && existingNarration?.status === "success") {
       console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} Narracao ja concluida, pulando`));
       continue;
     }
 
-    const startedAt = new Date().toISOString();
     const sourceText = await fs.readFile(block.file_path_md, "utf-8");
-    const audioPath = path.join(narracaoDir, `block${String(blockNumber).padStart(2, "0")}.mp3`);
-
-    console.log(chalk.cyan(`${blockTag(blockNumber, totalBlocos)} Gerando narracao...`));
     try {
-      upsertNarrationBlock(projectId, blockNumber, { status: "processing", started_at: startedAt, error_message: null });
-      const pad = String(blockNumber).padStart(2, "0");
-      let primaryMp3Path = audioPath;
-
-      const planV2 = await tryLoadBlockScenesPlanV2(String(project.project_path), blockNumber);
-      if (planV2) {
-        const blockSubDir = path.join(narracaoDir, `block${pad}`);
-        await fs.mkdir(blockSubDir, { recursive: true });
-        const scenePaths: string[] = [];
-        for (const scene of planV2.scenes) {
-          const p = path.join(blockSubDir, `${scene.id}.mp3`);
-          if (await narrationSceneMp3Cached(p)) {
-            console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} Reutilizando ${scene.id}.mp3`));
-            scenePaths.push(p);
-            continue;
-          }
-          const audioBuffer = await textToSpeechMp3({ text: scene.narration_text, voiceId });
-          await fs.writeFile(p, audioBuffer);
-          scenePaths.push(p);
-        }
-        const concatOk = await tryConcatMp3WithFfmpeg(scenePaths, audioPath);
-        if (!concatOk) {
-          console.log(
-            chalk.yellow(
-              `${blockTag(blockNumber, totalBlocos)} ffmpeg ausente ou concat falhou: block${pad}.mp3 nao criado. Use os MP3 por cena em block${pad}/ (sem novo ElevenLabs).`,
-            ),
-          );
-          primaryMp3Path = scenePaths[0]!;
-        }
-      } else {
-        const audioBuffer = await textToSpeechMp3({ text: sourceText, voiceId });
-        await fs.writeFile(audioPath, audioBuffer);
-      }
-      upsertNarrationBlock(projectId, blockNumber, {
-        status: "success",
-        file_path_mp3: primaryMp3Path,
-        finished_at: new Date().toISOString(),
+      await synthesizeBlockNarration({
+        projectId,
+        projectPath: String(project.project_path),
+        blockNumber,
+        totalBlocos,
+        voiceId,
+        sourceText,
+        narracaoDir,
+        opts,
       });
-      if (planV2) {
-        let monolithicOk = false;
-        try {
-          const st = await fs.stat(audioPath);
-          monolithicOk = st.isFile();
-        } catch {
-          monolithicOk = false;
-        }
-        if (monolithicOk) {
-          console.log(
-            chalk.green(
-              `${blockTag(blockNumber, totalBlocos)} Por cena → block${pad}/ + block${pad}.mp3 (concat)`
-            )
-          );
-        } else {
-          console.log(
-            chalk.green(
-              `${blockTag(blockNumber, totalBlocos)} Por cena → block${pad}/ (${planV2.scenes.length} MP3); sem block${pad}.mp3 ate ter ffmpeg`
-            )
-          );
-        }
-      } else {
-        console.log(chalk.green(`${blockTag(blockNumber, totalBlocos)} Audio salvo → block${pad}.mp3`));
-      }
-      addProjectLog(projectId, "narracao", "info", `Audio do bloco ${blockNumber} gerado com sucesso`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Erro desconhecido";
       console.log(chalk.red(`${blockTag(blockNumber, totalBlocos)} ERRO narracao: ${message}`));
@@ -537,7 +577,12 @@ export async function runNarracao(project: ProjectRow, voiceId: string): Promise
 }
 
 /** Gera apenas o audio de um bloco e recalcula o status da etapa. */
-export async function runNarracaoBlock(project: ProjectRow, voiceId: string, blockNumber: number): Promise<void> {
+export async function runNarracaoBlock(
+  project: ProjectRow,
+  voiceId: string,
+  blockNumber: number,
+  opts?: NarracaoOptions,
+): Promise<void> {
   const projectId = Number(project.id);
   const totalBlocos = Number(project.total_blocos);
   if (blockNumber < 1 || blockNumber > totalBlocos) {
@@ -551,52 +596,21 @@ export async function runNarracaoBlock(project: ProjectRow, voiceId: string, blo
     throw new Error(`Bloco ${blockNumber} do roteiro nao esta pronto para narracao`);
   }
 
-  const startedAt = new Date().toISOString();
   const sourceText = await fs.readFile(scriptRow.file_path_md, "utf-8");
-  const audioPath = path.join(narracaoDir, `block${String(blockNumber).padStart(2, "0")}.mp3`);
 
   addProjectLog(projectId, "narracao", "info", `Reprocessando audio do bloco ${blockNumber}`);
 
   try {
-    upsertNarrationBlock(projectId, blockNumber, { status: "processing", started_at: startedAt, error_message: null });
-    const pad = String(blockNumber).padStart(2, "0");
-    let primaryMp3Path = audioPath;
-
-    const planV2 = await tryLoadBlockScenesPlanV2(String(project.project_path), blockNumber);
-    if (planV2) {
-      const blockSubDir = path.join(narracaoDir, `block${pad}`);
-      await fs.mkdir(blockSubDir, { recursive: true });
-      const scenePaths: string[] = [];
-      for (const scene of planV2.scenes) {
-        const p = path.join(blockSubDir, `${scene.id}.mp3`);
-        if (await narrationSceneMp3Cached(p)) {
-          console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} Reutilizando ${scene.id}.mp3`));
-          scenePaths.push(p);
-          continue;
-        }
-        const audioBuffer = await textToSpeechMp3({ text: scene.narration_text, voiceId });
-        await fs.writeFile(p, audioBuffer);
-        scenePaths.push(p);
-      }
-      const concatOk = await tryConcatMp3WithFfmpeg(scenePaths, audioPath);
-      if (!concatOk) {
-        console.log(
-          chalk.yellow(
-            `${blockTag(blockNumber, totalBlocos)} ffmpeg ausente ou concat falhou: block${pad}.mp3 nao criado. Use os MP3 por cena em block${pad}/ (sem novo ElevenLabs).`,
-          ),
-        );
-        primaryMp3Path = scenePaths[0]!;
-      }
-    } else {
-      const audioBuffer = await textToSpeechMp3({ text: sourceText, voiceId });
-      await fs.writeFile(audioPath, audioBuffer);
-    }
-    upsertNarrationBlock(projectId, blockNumber, {
-      status: "success",
-      file_path_mp3: primaryMp3Path,
-      finished_at: new Date().toISOString(),
+    await synthesizeBlockNarration({
+      projectId,
+      projectPath: String(project.project_path),
+      blockNumber,
+      totalBlocos,
+      voiceId,
+      sourceText,
+      narracaoDir,
+      opts,
     });
-    addProjectLog(projectId, "narracao", "info", `Audio do bloco ${blockNumber} gerado com sucesso`);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Erro desconhecido";
     upsertNarrationBlock(projectId, blockNumber, {
@@ -861,6 +875,7 @@ async function imagensBlockPlanAndRenderV2(input: {
         maxScenes
       );
 
+      const visualModality = resolveVisualModality();
       rawViz = await generateVisualizationPlanJson({
         promptBase: vizPrompt,
         blockNumber: input.blockNumber,
@@ -871,6 +886,7 @@ async function imagensBlockPlanAndRenderV2(input: {
         segmentationJson: JSON.stringify(seg, null, 2),
         maxVideos,
         maxImages,
+        visualModality,
       });
     }
 
@@ -886,6 +902,8 @@ async function imagensBlockPlanAndRenderV2(input: {
     await fs.mkdir(path.dirname(input.jsonPath), { recursive: true });
     await fs.writeFile(input.jsonPath, JSON.stringify(plan, null, 2), "utf-8");
   }
+
+  assertWojakBlockPlan(plan);
 
   const planImages = plan.scenes.filter((s) => s.visual.type === "image").length;
   const planVideos = plan.scenes.filter((s) => s.visual.type === "video").length;
@@ -930,7 +948,7 @@ async function imagensBlockPlanAndRenderV2(input: {
 
   await fs.mkdir(input.rendersDir, { recursive: true });
 
-  const delivery = resolveImageDelivery(input.imageFlags);
+  const delivery = resolveSceneImageDelivery(input.imageFlags);
   const blockBatchId =
     delivery === "google_batch" || delivery === "local_batch" ? crypto.randomUUID() : undefined;
   const batchIds: string[] = blockBatchId ? [blockBatchId] : [];
@@ -941,8 +959,13 @@ async function imagensBlockPlanAndRenderV2(input: {
   let lastImageRefLocal: string | undefined;
   const visualModality = resolveVisualModality();
   if (visualModality === "wojak") {
-    console.log(chalk.cyan(`  ${blockTag(bn, tb)} Modalidade visual: wojak (referencias em src/assets/wojak/)`));
+    console.log(
+      chalk.cyan(
+        `  ${blockTag(bn, tb)} Modalidade visual: wojak (Gemini + Veo; sem stock/HF — ver wojak.md)`
+      )
+    );
   }
+  const useHfVideoQueue = GENTUBE_HF_ASYNC && visualModality !== "wojak";
   const avatarRef =
     input.avatarPath && String(input.avatarPath).trim()
       ? /^https?:\/\//i.test(String(input.avatarPath))
@@ -958,32 +981,43 @@ async function imagensBlockPlanAndRenderV2(input: {
     }
     let effectiveSource = v.source;
 
-    if (effectiveSource === "stock" && v.search_keywords?.trim()) {
-      console.log(chalk.dim(`  ${blockTag(bn, tb)} Stock ${scene.id} (${v.type}): "${v.search_keywords.trim()}"...`));
-      try {
-        const localPath = await searchAndDownload({
-          type: v.type,
-          keywords: v.search_keywords.trim(),
-          destPathNoExt: path.join(input.rendersDir, scene.id),
-        });
-        done += 1;
-        console.log(chalk.green(`  ${blockTag(bn, tb)} Stock baixado: ${scene.id} → ${path.basename(localPath)}`));
-        addProjectLog(input.projectId, "imagens_videos", "info", `Stock baixado bloco ${bn} cena ${scene.id}`, {
-          mediaPath: localPath,
-          keywords: v.search_keywords.trim(),
-        });
-        upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
-      } catch (stockErr) {
-        const msg = stockErr instanceof Error ? stockErr.message : "Erro stock";
-        console.log(chalk.yellow(`  ${blockTag(bn, tb)} Stock falhou ${scene.id}: ${msg} — fallback IA`));
-        addProjectLog(input.projectId, "imagens_videos", "info", `Stock falhou bloco ${bn} cena ${scene.id}, fallback IA`, {
-          error: msg,
-        });
-        effectiveSource = "ai_generated";
+    if (effectiveSource === "stock") {
+      if (visualModality === "wojak") {
+        throw new Error(
+          `Cena ${scene.id}: source stock no plano em modo wojak. Regerar com GENTUBE_FORCE_VIZ_REGEN=1 e --plan-only.`
+        );
       }
+      if (v.search_keywords?.trim()) {
+        console.log(chalk.dim(`  ${blockTag(bn, tb)} Stock ${scene.id} (${v.type}): "${v.search_keywords.trim()}"...`));
+        try {
+          const localPath = await searchAndDownload({
+            type: v.type,
+            keywords: v.search_keywords.trim(),
+            destPathNoExt: path.join(input.rendersDir, scene.id),
+          });
+          done += 1;
+          console.log(chalk.green(`  ${blockTag(bn, tb)} Stock baixado: ${scene.id} → ${path.basename(localPath)}`));
+          addProjectLog(input.projectId, "imagens_videos", "info", `Stock baixado bloco ${bn} cena ${scene.id}`, {
+            mediaPath: localPath,
+            keywords: v.search_keywords.trim(),
+          });
+          upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
+        } catch (stockErr) {
+          const msg = stockErr instanceof Error ? stockErr.message : "Erro stock";
+          console.log(chalk.yellow(`  ${blockTag(bn, tb)} Stock falhou ${scene.id}: ${msg} — fallback IA`));
+          addProjectLog(input.projectId, "imagens_videos", "info", `Stock falhou bloco ${bn} cena ${scene.id}, fallback IA`, {
+            error: msg,
+          });
+          effectiveSource = "ai_generated";
+        }
+      }
+      if (effectiveSource === "stock") continue;
     }
 
     if (effectiveSource === "manual_capture") {
+      if (visualModality === "wojak") {
+        throw new Error(`Cena ${scene.id}: manual_capture proibido em modo wojak`);
+      }
       const dest = path.join(input.rendersDir, `${scene.id}.png`);
       await fs.copyFile(MANUAL_CAPTURE_PLACEHOLDER_PATH, dest);
       done += 1;
@@ -997,7 +1031,12 @@ async function imagensBlockPlanAndRenderV2(input: {
 
     const renderPrep = prepareSceneVisualRender(v, scene.narration_text, visualModality, avatarRef);
     const hfPrompt = renderPrep.hfPrompt;
+    const bootstrapPrompt = renderPrep.bootstrapPrompt ?? hfPrompt;
+    const veoPrompt = renderPrep.veoPrompt ?? hfPrompt;
     let referenceImageUrl = renderPrep.referenceImageUrl;
+    if (renderPrep.wojakReferenceLabel) {
+      console.log(chalk.dim(`  ${blockTag(bn, tb)} Ref Wojak: ${renderPrep.wojakReferenceLabel}`));
+    }
 
     if (v.type === "video" && !referenceImageUrl && !renderPrep.wojakVideoBootstrap) {
       if (GENTUBE_HF_ASYNC) {
@@ -1017,7 +1056,7 @@ async function imagensBlockPlanAndRenderV2(input: {
           projectId: input.projectId,
           blockNumber: bn,
           shotId: `${scene.id}__bootstrap`,
-          prompt: hfPrompt,
+          prompt: bootstrapPrompt,
           outPathNoExt: path.join(input.rendersDir, `${scene.id}__bootstrap`),
           referenceImageUrl: renderPrep.wojakVideoBootstrap ? renderPrep.referenceImageUrl : avatarRef,
           flags: input.imageFlags,
@@ -1053,9 +1092,13 @@ async function imagensBlockPlanAndRenderV2(input: {
       );
       if (imgResult.queued) {
         hfJobTotal += 1;
+        const refNote =
+          visualModality === "wojak" && referenceImageUrl
+            ? `, ref ${path.basename(String(referenceImageUrl))}`
+            : "";
         console.log(
           chalk.dim(
-            `  ${blockTag(bn, tb)} Imagem enfileirada: ${scene.id} (${imgResult.provider})`
+            `  ${blockTag(bn, tb)} Imagem enfileirada (google_batch${refNote}): ${scene.id} (${imgResult.provider})`
           )
         );
         addProjectLog(input.projectId, "imagens_videos", "info", `Job imagem enfileirado bloco ${bn} cena ${scene.id}`, {
@@ -1080,7 +1123,7 @@ async function imagensBlockPlanAndRenderV2(input: {
       continue;
     }
 
-    if (GENTUBE_HF_ASYNC) {
+    if (useHfVideoQueue) {
       try {
         const enq = await enqueueRenderShotTracked(input.projectId, bn, scene.id, {
           type: v.type,
@@ -1124,12 +1167,20 @@ async function imagensBlockPlanAndRenderV2(input: {
         }
       }
     } else {
-      console.log(chalk.dim(`  ${blockTag(bn, tb)} Renderizando ${scene.id} (${v.type}, --wait)...`));
+      const videoRef =
+        visualModality === "wojak" && v.type === "video" ? undefined : referenceImageUrl;
+      if (visualModality === "wojak" && v.type === "video") {
+        console.log(
+          chalk.dim(`  ${blockTag(bn, tb)} Veo ${scene.id}: text-to-video (sem ref PNG; bootstrap em disco se montagem precisar)`)
+        );
+      } else {
+        console.log(chalk.dim(`  ${blockTag(bn, tb)} Renderizando ${scene.id} (${v.type}, --wait)...`));
+      }
       const out = await generateAndRenderShot({
         type: v.type,
-        prompt: hfPrompt,
+        prompt: v.type === "video" && visualModality === "wojak" ? veoPrompt : hfPrompt,
         outPathNoExt: path.join(input.rendersDir, scene.id),
-        referenceImageUrl,
+        referenceImageUrl: videoRef,
         magnificKeywords: v.search_keywords,
       });
       done += 1;
@@ -1229,7 +1280,7 @@ export async function runImagensVideos(project: ProjectRow, avatarPath?: string,
       const scriptText = await fs.readFile(scriptPath, "utf-8");
       upsertMediaBlock(projectId, i, { plan_status: "processing", started_at: startedAt, plan_error: null });
 
-      const stockRatio = i === 1 ? STOCK_RATIO_BLOCK1 : STOCK_RATIO_OTHER;
+      const stockRatio = resolveStockRatioForBlock(i);
 
       if (scenePlanV2Enabled(opts)) {
         if (imagensUsesAsyncQueue(opts) && forceScenePlanVizRegen()) {
@@ -1539,7 +1590,7 @@ export async function runImagensVideosBlock(
     console.log(chalk.cyan(`${blockTag(blockNumber, totalBlocos)} Gerando plano de direcao (Claude)...`));
     const scriptText = await fs.readFile(scriptPath, "utf-8");
     upsertMediaBlock(projectId, blockNumber, { plan_status: "processing", started_at: startedAt, plan_error: null });
-    const stockRatio = blockNumber === 1 ? STOCK_RATIO_BLOCK1 : STOCK_RATIO_OTHER;
+    const stockRatio = resolveStockRatioForBlock(blockNumber);
 
     if (scenePlanV2Enabled(opts)) {
       if (asyncQueue && forceScenePlanVizRegen()) {

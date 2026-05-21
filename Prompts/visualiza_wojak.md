@@ -1,16 +1,23 @@
-## Canal Wojak (addon — apply with base visualiza rules)
+## Canal Wojak v2 (addon — overrides stock/manual rules from base visualiza)
 
-This channel uses a **Wojak** line-art avatar (bold black outlines, white fill, minimal gray shading) when the channel character must appear on screen.
+When this addon is active (`visual_modality: wojak`), the channel is a **comedic Wojak narrative** video: the character **acts out every narration beat**. There is **no stock library** and **no manual_capture**.
 
-### When the avatar is on screen
+### Hard rules (WOJAK MODE)
 
-- Set `"source": "ai_generated"`, `"character_required": true`, `"search_keywords": null`.
-- Set `"character_variant"` to one of: `neutral`, `happy`, `smiling`, `tired`, `doomer`, `frontal`, `impressed`, `pain`.
-- Write `"description"` in **English** as a concrete scene prompt, e.g.  
-  `Wojak character, tired expression, sitting at desk looking at laptop showing red chart, minimalist line art, bold black outlines, white background`
-- Do **not** use stock for avatar shots (stock cannot supply this character).
+1. **Every scene** must use:
+   - `"source": "ai_generated"` only (never `"stock"`, never `"manual_capture"`).
+   - `"search_keywords": null`.
+   - `"character_required": true`.
+   - `"character_variant"` (see table below).
+2. **`stock_ratio` is 0** — ignore any urge to add B-roll; the Wojak **is** the illustration.
+3. **Comedic / engaging tone**: exaggerate expressions, absurd scale (trillion dollars), meme-adjacent gestures, ironic visual jokes — still **minimalist line art**, bold black outlines, white background. Not photorealistic, not colorful cartoon.
+4. **`description` must match `narration_text`**: describe what **this Wojak is doing right now** in that line (verb + props + setting simplified in line art). Never a generic documentary shot without the character (e.g. do NOT describe only "aerial city skyline" while narration says "buy the whole city").
+5. **Prefer `"type": "video"`** for story beats (motion in the description). Use `"type": "image"` only for very short beats (≤ ~4 words) or when you have exhausted the video cap.
+6. **Video scenes**: include **motion cues** in `description` (e.g. "walking into dealership", "throwing cash", "facepalming", "arms spreading wide", "head shaking no").
+7. **`negative_prompt`** on avatar shots:  
+   `photorealistic, 3d render, anime, cartoon color, detailed skin texture, cinematic lighting`
 
-### Variant guide
+### Variant guide (`character_variant`)
 
 | variant | Use when narration suggests |
 |---------|------------------------------|
@@ -19,25 +26,32 @@ This channel uses a **Wojak** line-art avatar (bold black outlines, white fill, 
 | `smiling` | open smile, celebration, joke landing |
 | `tired` | exhaustion, late nights, burnout |
 | `doomer` | cynicism, despair, hoodie/beanie mood |
-| `frontal` | direct address to viewer |
-| `impressed` | surprise, “wow”, discovery |
-| `pain` | loss, mistake, frustration, “oof” |
+| `frontal` | direct address to viewer, hook |
+| `impressed` | surprise, “wow”, discovery, absurd wealth |
+| `pain` | loss, mistake, frustration, “oof”, math reality check |
 
-### When the avatar is NOT on screen
+### Example descriptions (style reference)
 
-- Stock, B-roll, metaphors without the face: `"character_required": false`, no `character_variant`.
-- `manual_capture`: unchanged from base rules.
+- Narration: buying supercars →  
+  `Wojak character, manic smiling expression, standing in exotic car showroom sweeping arm across row of supercars, money bills flying, minimalist line art, bold black outlines, white background, motion: strutting proudly`
+- Narration: 24h to spend everything →  
+  `Wojak character, panicked tired expression, staring at giant ticking clock, sweat drops, minimalist line art, motion: head shaking rapidly`
+- Narration: philanthropy fails →  
+  `Wojak character, pain expression, holding tiny donation box labeled government next to mountain of cash, comedic scale contrast, line art, motion: slumping shoulders`
 
-### negative_prompt (recommended for ai_generated avatar shots)
+### Output schema (required fields per scene)
 
-`photorealistic, 3d render, anime, cartoon color, detailed skin texture, cinematic lighting`
-
-### Output schema addition
-
-Inside each `visual` object with `character_required: true`, include:
+Inside each `visual` object:
 
 ```json
-"character_variant": "neutral"
+"source": "ai_generated",
+"character_required": true,
+"character_variant": "neutral",
+"search_keywords": null
 ```
 
-Plans without `character_variant` are still valid; the pipeline may infer from narration.
+Do not omit `character_variant`.
+
+---
+
+**Pipeline / render / custos / retomada parcial:** ver [wojak.md](../wojak.md) (opção B batch+ref, Veo, `cost-estimate`, `scripts/continue-missing-renders.ts`).

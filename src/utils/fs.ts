@@ -9,6 +9,8 @@ export async function ensureDir(dirPath: string): Promise<void> {
 export const MODELAGEM_DIR_NAME = "05 - Modelagem";
 export const MODELAGEM_TRANSCRIPT_FILE = "transcript.txt";
 
+export const MONTAGEM_DIR_NAME = "06 - Montagem";
+
 export async function ensureTemplateStructure(targetVideoDir: string): Promise<void> {
   const subfolders = [
     "01 - Roteiro",
@@ -16,6 +18,7 @@ export async function ensureTemplateStructure(targetVideoDir: string): Promise<v
     "03 - Imagens e Videos",
     "04 - Thumbnails",
     MODELAGEM_DIR_NAME,
+    MONTAGEM_DIR_NAME,
   ];
 
   for (const subfolder of subfolders) {

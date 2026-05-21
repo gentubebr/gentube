@@ -5,7 +5,12 @@ import {
   GEMINI_IMAGE_SIZE,
 } from "../config.js";
 import type { ImageJobRow } from "../types/image-jobs.js";
-import { extFromMime, extractInlineImageFromResponse, getGeminiClient } from "./gemini-image.js";
+import {
+  buildGeminiMultimodalParts,
+  extFromMime,
+  extractInlineImageFromResponse,
+  getGeminiClient,
+} from "./gemini-image.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { updateImageJob } from "../repository.js";
@@ -40,25 +45,35 @@ export async function submitGoogleImageBatch(
   if (jobs.length === 0) throw new Error("submitGoogleImageBatch: lista vazia");
   const ai = getGeminiClient();
 
-  const inlinedRequests = jobs.map((job) => ({
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: job.prompt_text ?? "" }],
-      },
-    ],
-    config: {
-      responseModalities: ["IMAGE"],
-      imageConfig: {
-        aspectRatio: GEMINI_IMAGE_ASPECT_RATIO,
-        imageSize: GEMINI_IMAGE_SIZE,
-      },
-    },
-    metadata: {
-      image_job_id: String(job.id),
-      shot_id: job.shot_id,
-    },
-  }));
+  const inlinedRequests = await Promise.all(
+    jobs.map(async (job) => {
+      const parts = await buildGeminiMultimodalParts(
+        job.prompt_text ?? "",
+        job.reference_image_path ?? undefined,
+      );
+      const normalizedParts = typeof parts === "string" ? [{ text: parts }] : parts;
+      return {
+        contents: [
+          {
+            role: "user",
+            parts: normalizedParts,
+          },
+        ],
+        config: {
+          responseModalities: ["IMAGE"],
+          imageConfig: {
+            aspectRatio: GEMINI_IMAGE_ASPECT_RATIO,
+            imageSize: GEMINI_IMAGE_SIZE,
+          },
+        },
+        metadata: {
+          image_job_id: String(job.id),
+          shot_id: job.shot_id,
+          has_reference: job.reference_image_path ? "1" : "0",
+        },
+      };
+    }),
+  );
 
   const batchJob = await ai.batches.create({
     model: GEMINI_IMAGE_MODEL,

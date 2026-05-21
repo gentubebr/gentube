@@ -10,7 +10,7 @@ CLI em **Node.js** para organizar projetos de vídeo no estilo YouTube: **roteir
 - Roteiro em blocos (`block01.md`, …) a partir do prompt em `Prompts/matriz.md` ou **`matriz_tutorial.md`** (`GENTUBE_ROTEIRO_MODE=tutorial`, `GENTUBE_PROMPT_MATRIX` ou `--prompt-matrix`). No **bloco 1**, o ficheiro opcional `Prompts/canal_voice.md` fixa voz/persona do canal; nos **blocos seguintes**, o texto dos `.md` anteriores entra como contexto de coesão (configurável; ver tabela de variáveis).
 - Áudio por bloco (`block01.mp3`, …) ou **por cena** (`02 - Narracao/block01/sc01.mp3`, …) quando existe plano v2; concat com `ffmpeg` → `help run-step` (etapa narracao).
 - Status de cada etapa e de cada bloco gravados localmente (sem depender só de arquivos soltos).
-- Modalidade visual **Wojak** (opt-in): avatar line-art com referências PNG e bootstrap de vídeo — ver **[wojak.md](wojak.md)** e secção **18.10** de `ESPECIFICACAO_TECNICA.md`.
+- Modalidade visual **Wojak** (opt-in): avatar line-art, plano só `ai_generated` (sem stock), validação v2, render Gemini+Veo — ver **[wojak.md](wojak.md)** e secção **18.10** de `ESPECIFICACAO_TECNICA.md`.
 
 ## Pré-requisitos: contas, chaves e ferramentas
 
@@ -82,6 +82,7 @@ Detalhes: **secção 22** de `ESPECIFICACAO_TECNICA.md`.
 ### Node.js e este repositório
 
 - [Node.js](https://nodejs.org/) **18+** (recomendado LTS **20** ou **22**), **a mesma major** em todas as máquinas onde correr `npm install`.
+- Corridas longas com **Wojak** + `better-sqlite3`: em alguns ambientes só **Node 23** compila o módulo nativo — use a mesma major no `PATH` que em `npm install` (ver [wojak.md](wojak.md)).
 - Após `git clone` e `cd gentube`:
 
 ```bash
@@ -162,9 +163,13 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS` | Opcional | Máx. vídeos nos **blocos 2..N** (default `10`) |
 | `GENTUBE_MAX_IMAGES_OTHER_BLOCKS` | Opcional | Máx. imagens nos **blocos 2..N** (default `40`) |
 | `GENTUBE_SCENE_PLAN_V2` | Opcional | `1` / `true` / `yes`: step **imagens** em modo plano por cenas (dois passos Claude). A flag `--scene-plan-v2` tem prioridade quando passada |
-| `GENTUBE_VISUAL_MODALITY` | Opcional | `default` (comportamento atual) ou `wojak` — ver [wojak.md](wojak.md) |
-| `GENTUBE_PROMPT_VISUALIZA` | Opcional | Ficheiro em `Prompts/` para visualização (ex.: `visualiza_wojak.md`); em modo `wojak` o default é `visualiza01.md` + addon `visualiza_wojak.md` |
-| `GENTUBE_FORCE_VIZ_REGEN` | Opcional | `1` / `true` / `yes`: força **nova** segmentação/visualização Claude e apaga jobs HF do bloco no retry (ignora `blockNN.assets.json` e `.error` no disco) |
+| `GENTUBE_VISUAL_MODALITY` | Opcional | `default` ou `wojak` — em `wojak`: plano só `ai_generated`, `stock_ratio` efetivo 0, validação `assertWojakBlockPlan`; ver [wojak.md](wojak.md) |
+| `GENTUBE_PROMPT_VISUALIZA` | Opcional | Ficheiro em `Prompts/` para visualização; em `wojak` o default é `visualiza01.md` + `visualiza_wojak.md` |
+| `GENTUBE_WOJAK_STYLE_TOKEN` | Opcional | Override do prefixo de estilo no render (modo wojak) |
+| `GENTUBE_WOJAK_VEO_USE_REF` | Opcional | `0` (default): Veo sem PNG ref; prompt sanitizado. `1`: envia bootstrap ao Veo (pode disparar RAI) |
+| `GENTUBE_VIDEO_BACKEND` | Opcional | `auto`, `veo`, `higgsfield`, `magnific` — em modo **wojak** o render de vídeo usa **Veo** |
+| `GENTUBE_COST_USD_*` | Opcional | Tarifas USD para `cost-estimate` (Claude plano, Gemini sync/batch, Veo/s) — ver `.env.example` |
+| `GENTUBE_FORCE_VIZ_REGEN` | Opcional | `1` / `true` / `yes`: força **nova** segmentação/visualização Claude e apaga jobs HF do bloco no retry (ignora `blockNN.assets.json` e `.error` no disco; com `--plan-only` não reutiliza plano antigo) |
 | `GENTUBE_REMOTE_HOST` | Opcional | Host SSH remoto para `copy-cmd` (ex.: `dev-development`); evita `--remote-host` toda vez |
 | `GENTUBE_HF_ASYNC` | Opcional | `1`, `true` ou `yes`: no step **imagens**, enfileira jobs no Higgsfield sem esperar no mesmo comando; use `image:sync` / `higgsfield:sync` (ou `--watch`) para baixar resultados |
 | `HIGGSFIELD_CLI_PATH`, `HIGGSFIELD_CREDENTIALS_PATH`, `HIGGSFIELD_CLI_WAIT_TIMEOUT`, `HIGGSFIELD_API_URL` | Opcionais | Caminho do binário `hf`, credenciais, timeout de `--wait` (modo síncrono), base da API de agents; ver [`.env.example`](.env.example) |
@@ -192,6 +197,7 @@ npm run gentube -- help run-step       # roteiro, narração, imagens (plan-only
 npm run gentube -- help retry          # reprocessar etapa ou bloco
 npm run gentube -- help video:retry    # HF → Veo → Magnific
 npm run gentube -- help image:sync     # poll image_jobs (HF + Gemini batch)
+npm run gentube -- cost-estimate --project <id>   # custo USD estimado (modo Wojak)
 npm run gentube -- help sync-from-disk # alinhar SQLite com disco
 npm run gentube -- <comando> --help    # equivalente a help <comando>
 ```
@@ -320,11 +326,20 @@ npm run gentube -- sync-from-disk --project 6 --only imagens
 npm run gentube -- sync-from-disk --project 6 --force     # reimportar mesmo com blocos já success
 ```
 
-**Narração:** `run-step --step narracao` **já** ignora blocos com `narration_blocks.status === success` — depois do sync não se volta a gastar ElevenLabs nesses blocos.
+**Narração:** `run-step --step narracao` **já** ignora blocos com `narration_blocks.status === success` — depois do sync não se volta a gastar ElevenLabs nesses blocos. Com plano v2 (`blockNN.assets.json`), cada cena vira `02 - Narracao/blockNN/scXX.mp3` a partir de `narration_text`; MP3 ≥ 1 KiB no disco são **reutilizados** (sem nova chamada ElevenLabs). Para **nova voz** ou texto do plano atualizado, use **`--force-narracao`** (regenera todas as cenas do bloco):
+
+```bash
+npm run gentube -- retry --project <slug> --stage narracao --block 1 \
+  --force-narracao --voice-id PzuBz8h2SxBvQ7lnUC44
+```
+
+Equivalente: `run-step --step narracao --block 1 --force-narracao --voice-id <id>`. Requer `blockNN.assets.json` (schema 2.0) antes da narração por cena — ver [wojak.md](wojak.md).
+
+**Background (vários blocos — narração + renders Wojak):** script `scripts/background-wojak-blocks.sh` + `image:sync --watch` noutro terminal. Detalhes em [wojak.md](wojak.md) (secção *Execução em background*).
 
 **Imagens:** `run-step --step imagens` **salta blocos** em que `media_blocks` já tem plano e renders concluídos (e, em modo assíncrono, sem jobs `image_jobs` / `hf_cli_jobs` pendentes para esse bloco). Para trabalho feito fora do CLI, o `sync-from-disk --only imagens` valida `blockNN.assets.json` + ficheiros em `renders/blockNN/` e grava o estado no SQLite.
 
-**Plano por cenas (schema 2.0):** em `run-step` / `retry` com **`--scene-plan-v2`** (imagens) ou variável **`GENTUBE_SCENE_PLAN_V2=1`**, o Claude corre em dois passos (`Prompts/segmenta01.md`, `Prompts/visualiza01.md`), grava `blockNN.assets.json` com `schema_version: "2.0"` e `scenes[]`; `manual_capture` usa um PNG placeholder em `src/assets/manual_capture/placeholder.png` até substituíres; a narração grava um MP3 por cena em `02 - Narracao/blockNN/scXX.mp3` e **reutiliza** ficheiros já existentes (≥ 1 KiB) sem voltar a chamar o ElevenLabs; opcionalmente junta `blockNN.mp3` com **ffmpeg** — **sem ffmpeg não há segundo gasto de API**: não se gera monólito do bloco inteiro.
+**Plano por cenas (schema 2.0):** em `run-step` / `retry` com **`--scene-plan-v2`** (imagens) ou variável **`GENTUBE_SCENE_PLAN_V2=1`**, o Claude corre em dois passos (`Prompts/segmenta01.md`, `Prompts/visualiza01.md`), grava `blockNN.assets.json` com `schema_version: "2.0"` e `scenes[]`; `manual_capture` usa um PNG placeholder em `src/assets/manual_capture/placeholder.png` até substituíres; a narração grava um MP3 por cena em `02 - Narracao/blockNN/scXX.mp3` e **reutiliza** ficheiros já existentes (≥ 1 KiB) salvo com **`--force-narracao`**; opcionalmente junta `blockNN.mp3` com **ffmpeg** (`GENTUBE_FFMPEG_PATH` ou `experiments/ffmpeg-bin/ffmpeg`) — **sem ffmpeg não há segundo gasto de API**: não se gera monólito do bloco inteiro.
 
 **Retoma sem gastar Claude de novo (imagens v2):**
 
@@ -336,6 +351,8 @@ npm run gentube -- sync-from-disk --project 6 --force     # reimportar mesmo com
 **Lista de capturas manuais:** `npm run gentube -- shot-list-manual --project <id>` gera `shot_list_manual.md` / `.csv` a partir dos planos 2.0.
 
 Detalhes: **secções 18.9, 18.10 e 21** de `ESPECIFICACAO_TECNICA.md`. Modalidade Wojak: **[wojak.md](wojak.md)**.
+
+**Modo Wojak v2 (resumo):** `GENTUBE_VISUAL_MODALITY=wojak` + `--scene-plan-v2`. Imagens estáticas → **Google Batch com PNG Wojak** (opção B, forçado no código); bootstrap de vídeo → sync; Veo → sync (`GENTUBE_WOJAK_VEO_USE_REF=0` por defeito). Estimativa: `npm run gentube -- cost-estimate --project <id>`. Produção: `plan-only` → `narracao` → `retry`/`imagens` → `image:sync --watch`. Se **quota Veo (429)** travar o `retry` no primeiro vídeo: `npx tsx scripts/continue-missing-renders.ts --project <id> --block N` + `image:sync`, depois `retry` quando a cota voltar. **Node 23** recomendado no PATH (`better-sqlite3`). Detalhes: [wojak.md](wojak.md).
 
 ### Build (TypeScript → `dist/`)
 

@@ -1,6 +1,12 @@
 import path from "node:path";
 import fs from "node:fs/promises";
-import { videoBackendFromEnv, type VideoBackend } from "../config.js";
+import {
+  resolveVisualModality,
+  videoBackendFromEnv,
+  wojakVeoUsesReferenceImage,
+  type VideoBackend,
+} from "../config.js";
+import { sanitizeWojakPromptForVeo } from "../utils/wojak-prompt.js";
 import { generateVideoWithDefaultsCli } from "../integrations/higgsfield-cli.js";
 import { generateVeoVideoSync } from "../integrations/gemini-video.js";
 import { searchAndDownload } from "../integrations/magnific.js";
@@ -47,10 +53,13 @@ async function tryHiggsfieldVideo(input: RenderVideoInput): Promise<RenderVideoR
 }
 
 async function tryVeoVideo(input: RenderVideoInput): Promise<RenderVideoResult> {
+  const wojak = resolveVisualModality() === "wojak";
+  const prompt = wojak ? sanitizeWojakPromptForVeo(input.prompt) : input.prompt;
+  const useRef = wojak ? wojakVeoUsesReferenceImage() : Boolean(input.referenceImageUrl);
   const { localPath } = await generateVeoVideoSync({
-    prompt: input.prompt,
+    prompt,
     outPathNoExt: input.outPathNoExt,
-    referenceImagePath: input.referenceImageUrl,
+    referenceImagePath: useRef ? input.referenceImageUrl : undefined,
   });
   return { localPath, provider: "veo" };
 }
@@ -94,6 +103,10 @@ async function tryHiggsfieldWithRetries(input: RenderVideoInput): Promise<Render
  * HF → Veo (sync poll) → Magnific conforme GENTUBE_VIDEO_BACKEND e matriz de erros.
  */
 export async function renderVideoWithFallback(input: RenderVideoInput): Promise<RenderVideoResult> {
+  if (resolveVisualModality() === "wojak") {
+    return tryVeoVideo(input);
+  }
+
   const backend: VideoBackend = videoBackendFromEnv();
   const errors: string[] = [];
 

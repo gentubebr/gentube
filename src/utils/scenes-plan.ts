@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Step3Limits } from "../types/step3-limits.js";
-import { isWojakCharacterVariant } from "./wojak-prompt.js";
+import { assertWojakBlockPlan, isWojakCharacterVariant } from "./wojak-prompt.js";
 import type { BlockScenesPlanV2, ScenePlanV2, SceneVisualPlanV2, SegmentationPlanV2 } from "../types/scenes-plan.js";
 import {
   estimatedSpeechSecondsFromWordCount,
@@ -322,12 +322,14 @@ export function parseVisualizationMerge(
     enforceScenePlanCaps(scenes, segmentation.block_number, limits);
   }
 
-  return {
+  const plan: BlockScenesPlanV2 = {
     schema_version: "2.0",
     block_number: segmentation.block_number,
     total_blocks: segmentation.total_blocks,
     scenes,
   };
+  assertWojakBlockPlan(plan);
+  return plan;
 }
 
 export function isBlockScenesPlanV2(raw: unknown): raw is BlockScenesPlanV2 {

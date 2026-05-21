@@ -56,9 +56,20 @@ export function wojakStyleToken(): string {
   return fromEnv || DEFAULT_WOJAK_STYLE_TOKEN;
 }
 
+/** Veo: por defeito nao envia PNG/bootstrap (evita RAI third-party). `1` para image-to-video com ref. */
+export function wojakVeoUsesReferenceImage(): boolean {
+  return ["1", "true", "yes"].includes(String(process.env.GENTUBE_WOJAK_VEO_USE_REF ?? "0").toLowerCase());
+}
+
 export function resolveVisualModality(): VisualModality {
   const raw = (process.env.GENTUBE_VISUAL_MODALITY ?? "default").trim().toLowerCase();
   return raw === "wojak" ? "wojak" : "default";
+}
+
+/** Em modo Wojak o plano nao usa stock; caso contrario ratios por bloco. */
+export function resolveStockRatioForBlock(blockNumber: number): number {
+  if (resolveVisualModality() === "wojak") return 0;
+  return blockNumber === 1 ? STOCK_RATIO_BLOCK1 : STOCK_RATIO_OTHER;
 }
 
 function resolvePromptFileInPromptsDir(raw: string): string {
@@ -335,6 +346,23 @@ export function resolveImageDelivery(flags?: ImageRunFlags): ImageDeliveryMode {
   if (flags?.batchLocal) return "local_batch";
   if (flags?.googleBatchMode) return "google_batch";
   return imageDeliveryFromEnv();
+}
+
+/**
+ * Entrega de imagem por cena. Modo Wojak (opcao B): google_batch com PNG de referencia no job;
+ * bootstrap de video (forceSync) permanece sync.
+ */
+export function resolveSceneImageDelivery(
+  flags?: ImageRunFlags,
+  opts?: { forceSync?: boolean },
+): ImageDeliveryMode {
+  if (opts?.forceSync) return "sync";
+  if (resolveVisualModality() === "wojak") return "google_batch";
+  return resolveImageDelivery(flags);
+}
+
+export function isWojakGoogleBatchMode(flags?: ImageRunFlags): boolean {
+  return resolveSceneImageDelivery(flags) === "google_batch";
 }
 
 export function resolveImageBackend(flags?: ImageRunFlags, delivery?: ImageDeliveryMode): ImageBackend {

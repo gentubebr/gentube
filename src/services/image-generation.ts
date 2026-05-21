@@ -6,6 +6,8 @@ import {
   type ImageRunFlags,
   resolveImageBackend,
   resolveImageDelivery,
+  resolveSceneImageDelivery,
+  resolveVisualModality,
 } from "../config.js";
 import {
   enqueueImageWithDefaultsCli,
@@ -148,8 +150,9 @@ export async function renderSceneImage(
   const effectiveFlags = input.forceSync
     ? { googleBatchMode: false, batchLocal: false }
     : input.flags;
-  const delivery = input.forceSync ? "sync" : resolveImageDelivery(effectiveFlags);
-  const backend = resolveImageBackend(effectiveFlags, delivery);
+  const delivery = resolveSceneImageDelivery(effectiveFlags, { forceSync: input.forceSync });
+  const backend =
+    resolveVisualModality() === "wojak" ? "gemini" : resolveImageBackend(effectiveFlags, delivery);
 
   // Bootstrap de video (forceSync) deve concluir na hora; HF async nao serve aqui.
   if (input.forceSync) {
@@ -230,7 +233,7 @@ export function shouldUseGeminiForImages(flags?: ImageRunFlags): boolean {
 }
 
 export function isGoogleBatchMode(flags?: ImageRunFlags): boolean {
-  return resolveImageDelivery(flags) === "google_batch";
+  return resolveSceneImageDelivery(flags) === "google_batch";
 }
 
 export { resolveImageBackend, resolveImageDelivery };

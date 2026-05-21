@@ -153,6 +153,7 @@ export function getDb(): Database.Database {
   `);
 
   migrateImageJobsColumns(db);
+  migrateMontagemSchema(db);
 
   return db;
 }
@@ -164,6 +165,35 @@ function migrateImageJobsColumns(database: Database.Database): void {
   if (!names.has("prompt_text")) {
     database.exec("ALTER TABLE image_jobs ADD COLUMN prompt_text TEXT");
   }
+}
+
+function migrateMontagemSchema(database: Database.Database): void {
+  const projectCols = database.prepare("PRAGMA table_info(video_projects)").all() as { name: string }[];
+  if (!new Set(projectCols.map((c) => c.name)).has("status_montagem")) {
+    database.exec(
+      "ALTER TABLE video_projects ADD COLUMN status_montagem TEXT NOT NULL DEFAULT 'pending'",
+    );
+  }
+
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS assembly_blocks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      block_number INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      scenes_total INTEGER NOT NULL DEFAULT 0,
+      scenes_ready INTEGER NOT NULL DEFAULT 0,
+      full_block_path TEXT,
+      err_path TEXT,
+      started_at TEXT,
+      finished_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(project_id, block_number),
+      FOREIGN KEY(project_id) REFERENCES video_projects(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_assembly_blocks_project ON assembly_blocks(project_id);
+  `);
 }
 
 export function nowIso(): string {

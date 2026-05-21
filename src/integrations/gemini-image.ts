@@ -45,10 +45,20 @@ export function extractInlineImageFromResponse(response: {
   return null;
 }
 
-async function buildContents(prompt: string, referenceImagePath?: string): Promise<
-  string | Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>
-> {
+export type GeminiMultimodalPart = {
+  text?: string;
+  inlineData?: { mimeType: string; data: string };
+};
+
+/** Partes user para Gemini (imagem de referencia opcional + prompt). Usado em sync e batch. */
+export async function buildGeminiMultimodalParts(
+  prompt: string,
+  referenceImagePath?: string,
+): Promise<GeminiMultimodalPart[] | string> {
   if (!referenceImagePath?.trim()) return prompt;
+  if (/^https?:\/\//i.test(referenceImagePath.trim())) {
+    throw new Error("Gemini batch/sync: referencia Wojak deve ser caminho local (PNG em src/assets/wojak/)");
+  }
 
   const buf = await fs.readFile(referenceImagePath);
   const ext = path.extname(referenceImagePath).toLowerCase();
@@ -63,6 +73,13 @@ async function buildContents(prompt: string, referenceImagePath?: string): Promi
     { inlineData: { mimeType, data: buf.toString("base64") } },
     { text: prompt },
   ];
+}
+
+async function buildContents(
+  prompt: string,
+  referenceImagePath?: string,
+): Promise<string | GeminiMultimodalPart[]> {
+  return buildGeminiMultimodalParts(prompt, referenceImagePath);
 }
 
 export async function generateGeminiImageSync(input: {

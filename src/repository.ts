@@ -2,6 +2,7 @@ import { getDb, nowIso } from "./db.js";
 import type { ImageJobDeliveryMode, ImageJobOutcome, ImageJobProvider, ImageJobRow } from "./types/image-jobs.js";
 
 export type BlockStatus = "pending" | "processing" | "success" | "error";
+export type MontagemStatus = BlockStatus | "partial";
 
 export function createChannel(nomeCanal: string, slugCanal: string, basePath: string): number {
   const db = getDb();
@@ -49,8 +50,8 @@ export function createProject(input: {
     INSERT INTO video_projects (
       channel_id, titulo, slug, data_projeto, project_path, total_blocos,
       niche, audience, transcript, status_roteiro, status_narracao,
-      status_imagens_videos, status_thumbnails, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 'pending', 'pending', ?, ?)
+      status_imagens_videos, status_thumbnails, status_montagem, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', 'pending', 'pending', 'pending', ?, ?)
   `);
   const result = stmt.run(
     input.channelId,
@@ -91,6 +92,7 @@ export type ProjectSummaryRow = {
   status_narracao: string;
   status_imagens_videos: string;
   status_thumbnails: string;
+  status_montagem: string;
   created_at: string;
   nome_canal: string;
   slug_canal: string;
@@ -114,6 +116,7 @@ export function listProjectsSummary(): ProjectSummaryRow[] {
       p.status_narracao,
       p.status_imagens_videos,
       p.status_thumbnails,
+      p.status_montagem,
       p.created_at,
       c.nome_canal,
       c.slug_canal
@@ -132,8 +135,13 @@ export function updateProjectStageStatus(projectId: number, stage: "status_rotei
 
 export function updateProjectAnyStageStatus(
   projectId: number,
-  stage: "status_roteiro" | "status_narracao" | "status_imagens_videos" | "status_thumbnails",
-  status: BlockStatus
+  stage:
+    | "status_roteiro"
+    | "status_narracao"
+    | "status_imagens_videos"
+    | "status_thumbnails"
+    | "status_montagem",
+  status: BlockStatus | MontagemStatus,
 ): void {
   const db = getDb();
   db.prepare(`UPDATE video_projects SET ${stage} = ?, updated_at = ? WHERE id = ?`).run(status, nowIso(), projectId);
@@ -618,6 +626,7 @@ export function deleteProject(projectId: number): void {
     db.prepare("DELETE FROM hf_cli_jobs WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM project_logs WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM media_blocks WHERE project_id = ?").run(projectId);
+    db.prepare("DELETE FROM assembly_blocks WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM narration_blocks WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM script_blocks WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM video_projects WHERE id = ?").run(projectId);
@@ -662,6 +671,107 @@ export function recomputeStageFromBlocks(
   }
 
   updateProjectStageStatus(projectId, stageColumn, status);
+}
+
+export function getAssemblyBlock(projectId: number, blockNumber: number) {
+  const db = getDb();
+  return db
+    .prepare("SELECT * FROM assembly_blocks WHERE project_id = ? AND block_number = ?")
+    .get(projectId, blockNumber) as Record<string, unknown> | undefined;
+}
+
+export function upsertAssemblyBlock(input: {
+  projectId: number;
+  blockNumber: number;
+  status: MontagemStatus;
+  scenesTotal: number;
+  scenesReady: number;
+  fullBlockPath?: string | null;
+  errPath?: string | null;
+}): void {
+  const db = getDb();
+  const now = nowIso();
+  const existing = db
+    .prepare("SELECT id FROM assembly_blocks WHERE project_id = ? AND block_number = ?")
+    .get(input.projectId, input.blockNumber) as { id: number } | undefined;
+
+  if (existing) {
+    db.prepare(
+      `
+      UPDATE assembly_blocks SET
+        status = ?, scenes_total = ?, scenes_ready = ?,
+        full_block_path = ?, err_path = ?,
+        finished_at = ?, updated_at = ?
+      WHERE project_id = ? AND block_number = ?
+    `,
+    ).run(
+      input.status,
+      input.scenesTotal,
+      input.scenesReady,
+      input.fullBlockPath ?? null,
+      input.errPath ?? null,
+      now,
+      now,
+      input.projectId,
+      input.blockNumber,
+    );
+    return;
+  }
+
+  db.prepare(
+    `
+    INSERT INTO assembly_blocks (
+      project_id, block_number, status, scenes_total, scenes_ready,
+      full_block_path, err_path, started_at, finished_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `,
+  ).run(
+    input.projectId,
+    input.blockNumber,
+    input.status,
+    input.scenesTotal,
+    input.scenesReady,
+    input.fullBlockPath ?? null,
+    input.errPath ?? null,
+    now,
+    now,
+    now,
+    now,
+  );
+}
+
+export function recomputeMontagemStage(projectId: number, totalBlocos: number): void {
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT status FROM assembly_blocks WHERE project_id = ?")
+    .all(projectId) as Array<{ status: string }>;
+
+  if (rows.length === 0) {
+    updateProjectAnyStageStatus(projectId, "status_montagem", "pending");
+    return;
+  }
+
+  let hasError = false;
+  let hasPartial = false;
+  let successCount = 0;
+
+  for (const row of rows) {
+    if (row.status === "error") hasError = true;
+    if (row.status === "partial") hasPartial = true;
+    if (row.status === "success") successCount += 1;
+  }
+
+  if (hasError && successCount === 0 && !hasPartial) {
+    updateProjectAnyStageStatus(projectId, "status_montagem", "error");
+  } else if (successCount >= totalBlocos && !hasPartial && !hasError) {
+    updateProjectAnyStageStatus(projectId, "status_montagem", "success");
+  } else if (successCount > 0 || hasPartial) {
+    updateProjectAnyStageStatus(projectId, "status_montagem", "partial");
+  } else if (hasError) {
+    updateProjectAnyStageStatus(projectId, "status_montagem", "error");
+  } else {
+    updateProjectAnyStageStatus(projectId, "status_montagem", "processing");
+  }
 }
 
 export function recomputeImagensVideosStage(projectId: number, totalBlocos: number): void {

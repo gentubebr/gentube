@@ -7,18 +7,23 @@ import {
   getNarrationBlock,
   getScriptBlock,
   recomputeImagensVideosStage,
+  recomputeMontagemStage,
   recomputeStageFromBlocks,
+  upsertAssemblyBlock,
   upsertMediaBlock,
   upsertNarrationBlock,
   upsertScriptBlock,
 } from "../repository.js";
+import { resolveMontagemConfig } from "../config/montagem.js";
+import { montagemBlocksDir, fullBlockFileName } from "../utils/montagem-paths.js";
+import type { MontagemStatus } from "../repository.js";
 
 type ProjectRow = Record<string, unknown>;
 
 const MIN_SCRIPT_BYTES = 32;
 const MIN_MP3_BYTES = 1024;
 
-export type SyncFromDiskScope = "roteiro" | "narracao" | "imagens" | "all";
+export type SyncFromDiskScope = "roteiro" | "narracao" | "imagens" | "montagem" | "all";
 
 export type SyncFromDiskOptions = {
   dryRun: boolean;
@@ -30,6 +35,7 @@ export type SyncFromDiskReport = {
   roteiro: { imported: number[]; skipped: number[]; missing: number[] };
   narracao: { imported: number[]; skipped: number[]; missing: number[] };
   imagens: { imported: number[]; skipped: number[]; invalid: number[] };
+  montagem: { imported: number[]; skipped: number[]; missing: number[] };
 };
 
 function blockPad(n: number): string {
@@ -184,6 +190,7 @@ export async function syncProjectFromDisk(project: ProjectRow, opts: SyncFromDis
     roteiro: { imported: [], skipped: [], missing: [] },
     narracao: { imported: [], skipped: [], missing: [] },
     imagens: { imported: [], skipped: [], invalid: [] },
+    montagem: { imported: [], skipped: [], missing: [] },
   };
 
   const roteiroDir = path.join(projectPath, "01 - Roteiro");
@@ -315,6 +322,73 @@ export async function syncProjectFromDisk(project: ProjectRow, opts: SyncFromDis
     }
   }
 
+  if (scopeEnabled("montagem", opts.only)) {
+    const cfg = resolveMontagemConfig();
+    const blocksDir = montagemBlocksDir(projectPath, cfg);
+    for (let i = 1; i <= totalBlocos; i += 1) {
+      const fullPath = path.join(blocksDir, fullBlockFileName(i));
+      const assemblyJson = path.join(blocksDir, `block${blockPad(i)}.assembly.json`);
+      let hasOutput = false;
+      try {
+        await fs.access(fullPath);
+        hasOutput = true;
+      } catch {
+        try {
+          const files = await fs.readdir(blocksDir);
+          const prefix = `block${blockPad(i)}_`;
+          hasOutput = files.some((f) => f.startsWith(prefix) && f.endsWith(".mp4"));
+        } catch {
+          report.montagem.missing.push(i);
+          continue;
+        }
+      }
+      if (!hasOutput) {
+        report.montagem.missing.push(i);
+        continue;
+      }
+
+      if (opts.dryRun) {
+        console.log(chalk.cyan(`[dry-run] montagem bloco ${i}: importaria estado do disco`));
+        report.montagem.imported.push(i);
+        continue;
+      }
+
+      let status: MontagemStatus = "partial";
+      let scenesTotal = 0;
+      let scenesReady = 0;
+      try {
+        const raw = await fs.readFile(assemblyJson, "utf-8");
+        const meta = JSON.parse(raw) as {
+          status?: MontagemStatus;
+          scenes_total?: number;
+          scenes_ready?: number;
+        };
+        if (meta.status) status = meta.status;
+        scenesTotal = meta.scenes_total ?? 0;
+        scenesReady = meta.scenes_ready ?? 0;
+      } catch {
+        try {
+          await fs.access(fullPath);
+          status = "success";
+        } catch {
+          status = "partial";
+        }
+      }
+
+      upsertAssemblyBlock({
+        projectId,
+        blockNumber: i,
+        status,
+        scenesTotal,
+        scenesReady,
+        fullBlockPath: (await fs.access(fullPath).then(() => fullPath).catch(() => null)) ?? null,
+        errPath: null,
+      });
+      report.montagem.imported.push(i);
+      console.log(chalk.green(`Montagem bloco ${i}: SQLite atualizado (${status})`));
+    }
+  }
+
   if (opts.dryRun) {
     console.log(chalk.bold.yellow("\nDry-run: nenhuma escrita no SQLite."));
     return report;
@@ -328,6 +402,9 @@ export async function syncProjectFromDisk(project: ProjectRow, opts: SyncFromDis
   }
   if (onlyScope === "all" || onlyScope === "imagens") {
     recomputeImagensVideosStage(projectId, totalBlocos);
+  }
+  if (onlyScope === "all" || onlyScope === "montagem") {
+    recomputeMontagemStage(projectId, totalBlocos);
   }
 
   addProjectLog(projectId, "sync", "info", "sync-from-disk concluido", {

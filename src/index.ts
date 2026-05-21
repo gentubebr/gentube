@@ -61,6 +61,8 @@ import {
   runThumbnails,
 } from "./services/pipeline.js";
 import { syncProjectFromDisk, type SyncFromDiskScope } from "./services/sync-from-disk.js";
+import { mergeMontagemRunOptions, resolveMontagemConfig, type MontagemPhase } from "./config/montagem.js";
+import { runMontagem } from "./services/montagem.js";
 import { writeShotListManualFiles } from "./services/shot-list-manual.js";
 import { ensureDir, ensureTemplateStructure, formatDateYYYYMMDD, toSlug, writeModelagemTranscript } from "./utils/fs.js";
 import { Step3Limits } from "./types/step3-limits.js";
@@ -187,6 +189,7 @@ program
           status_narracao: p.status_narracao,
           status_imagens_videos: p.status_imagens_videos,
           status_thumbnails: p.status_thumbnails,
+          status_montagem: p.status_montagem ?? "pending",
         })),
       }));
       console.log(JSON.stringify(payload, null, 2));
@@ -209,7 +212,7 @@ program
         continue;
       }
       for (const p of list) {
-        const st = `${p.status_roteiro} | ${p.status_narracao} | ${p.status_imagens_videos} | ${p.status_thumbnails}`;
+        const st = `${p.status_roteiro} | ${p.status_narracao} | ${p.status_imagens_videos} | ${p.status_montagem ?? "pending"} | ${p.status_thumbnails}`;
         console.log(
           `  - [${p.id}] ${p.titulo}  ${chalk.dim(`(${p.slug})`)}  ${chalk.dim(`${p.total_blocos} blocos`)}  ${chalk.dim(st)}`
         );
@@ -402,11 +405,11 @@ program
 program
   .command("run-step")
   .description(
-    "Executa uma etapa do pipeline: roteiro | narracao | imagens | thumbnails (ver help run-step)"
+    "Executa uma etapa do pipeline: roteiro | narracao | imagens | montagem | thumbnails (ver help run-step)"
   )
   .addHelpText("after", CLI_HELP.runStep)
   .requiredOption("--project <idOuSlug>", "ID numerico (ex.: 10) ou slug da pasta (ex.: 20260518-meu-titulo)")
-  .requiredOption("--step <etapa>", "Etapa: roteiro | narracao | imagens | thumbnails")
+  .requiredOption("--step <etapa>", "Etapa: roteiro | narracao | imagens | montagem | thumbnails")
   .option("--voice-id <id>", "Narracao: voice ElevenLabs (padrao: ELEVENLABS_VOICE_ID ou prompt)")
   .option("--avatar-file <caminho>", "Opcional: avatar para consistencia visual (imagens e thumbnails)")
   .option("--reference-url <url>", "Step thumbnails: URL do video YouTube cuja thumbnail sera usada como referencia")
@@ -438,9 +441,26 @@ program
     "--enqueue-only",
     "Imagens v2: stock + filas + videos HF; submit N batches Google no fim (exige plano + --scene-plan-v2)"
   )
+  .option(
+    "--force-narracao",
+    "Narracao (plano v2): regenera todos os scXX.mp3 via ElevenLabs (ignora MP3 ja no disco)",
+  )
+  .option("--force", "Montagem: re-encode clipes e blocos mesmo se saidas existirem")
+  .option("--xfade-duration <s>", "Montagem: duracao da transicao entre cenas (segundos)")
+  .option("--xfade-transition <nome>", "Montagem: tipo xfade FFmpeg (default: fade)")
+  .option("--no-partial-segments", "Montagem: nao gera blockNN_scXX-scYY.mp4 quando faltam cenas")
+  .option(
+    "--montagem-scenes-only",
+    "Montagem: apenas clipes scXX.mp4 (todos os blocos ou --block); blocos finais depois com --montagem-assemble-only",
+  )
+  .option(
+    "--montagem-assemble-only",
+    "Montagem: apenas concatena blockNN.mp4 a partir dos clipes ja em scenes/ (sem re-renderizar cenas)",
+  )
+  .option("--block <N>", "Narracao, imagens, montagem, retry: somente o bloco N (base 1)")
   .action(async (options: {
     project: string;
-    step: "roteiro" | "narracao" | "imagens" | "thumbnails";
+    step: "roteiro" | "narracao" | "imagens" | "montagem" | "thumbnails";
     voiceId?: string;
     avatarFile?: string;
     referenceUrl?: string;
@@ -457,9 +477,43 @@ program
     batchLocal?: boolean;
     planOnly?: boolean;
     enqueueOnly?: boolean;
+    force?: boolean;
+    forceNarracao?: boolean;
+    xfadeDuration?: string;
+    xfadeTransition?: string;
+    noPartialSegments?: boolean;
+    montagemScenesOnly?: boolean;
+    montagemAssembleOnly?: boolean;
+    block?: string;
   }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
+
+    let blockNumber: number | undefined;
+    if (options.block !== undefined && options.block !== "") {
+      blockNumber = parseInt(options.block, 10);
+      if (Number.isNaN(blockNumber) || blockNumber < 1) {
+        throw new Error("--block deve ser um inteiro >= 1");
+      }
+    }
+
+    if (options.step === "montagem") {
+      if (options.montagemScenesOnly && options.montagemAssembleOnly) {
+        throw new Error("Use apenas uma: --montagem-scenes-only ou --montagem-assemble-only");
+      }
+      let montagemPhase: MontagemPhase | undefined;
+      if (options.montagemScenesOnly) montagemPhase = "scenes";
+      else if (options.montagemAssembleOnly) montagemPhase = "assemble";
+      await executeMontagem(project, {
+        force: Boolean(options.force),
+        blockNumber,
+        xfadeDuration: options.xfadeDuration ? parseFloat(options.xfadeDuration) : undefined,
+        xfadeTransition: options.xfadeTransition,
+        partialSegments: options.noPartialSegments ? false : undefined,
+        montagemPhase,
+      });
+      return;
+    }
 
     if (options.step === "roteiro") {
       await executeRoteiro(project, options.promptMatrix, options.promptCanalVoice);
@@ -483,8 +537,17 @@ program
       );
       return;
     }
-    const voiceId = await resolveVoiceId(options.voiceId);
-    await executeNarracao(project, voiceId);
+    if (options.step === "narracao") {
+      const voiceId = await resolveVoiceId(options.voiceId);
+      const narracaoOpts = { forceRegenScenes: Boolean(options.forceNarracao) };
+      if (blockNumber !== undefined) {
+        await executeNarracaoBlock(project, voiceId, blockNumber, narracaoOpts);
+      } else {
+        await executeNarracao(project, voiceId, narracaoOpts);
+      }
+      return;
+    }
+    throw new Error(`--step invalido: ${options.step}`);
   });
 
 program
@@ -515,10 +578,10 @@ program
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
   .option("--dry-run", "Lista alteracoes sem escrever no SQLite")
   .option("--force", "Reimportar blocos que ja estao success no DB")
-  .option("--only <escopo>", "roteiro | narracao | imagens | all (default: all)", "all")
+  .option("--only <escopo>", "roteiro | narracao | imagens | montagem | all (default: all)", "all")
   .action(
     async (opts: { project: string; dryRun?: boolean; force?: boolean; only?: string }) => {
-      const allowed: SyncFromDiskScope[] = ["roteiro", "narracao", "imagens", "all"];
+      const allowed: SyncFromDiskScope[] = ["roteiro", "narracao", "imagens", "montagem", "all"];
       const onlyRaw = (opts.only ?? "all").trim().toLowerCase();
       if (!allowed.includes(onlyRaw as SyncFromDiskScope)) {
         throw new Error(`--only deve ser um de: ${allowed.join(", ")}`);
@@ -562,6 +625,7 @@ program
     console.log(`- Narracao: ${project.status_narracao}`);
     console.log(`- Imagens e Videos: ${project.status_imagens_videos}`);
     console.log(`- Thumbnails: ${project.status_thumbnails}`);
+    console.log(`- Montagem: ${project.status_montagem ?? "pending"}`);
     console.log(`- Pasta: ${project.project_path}`);
   });
 
@@ -869,6 +933,21 @@ program
   });
 
 program
+  .command("cost-estimate")
+  .description("Estimativa de custo USD — modalidade Wojak (Claude plano + Gemini batch/sync + Veo)")
+  .addHelpText("after", CLI_HELP.costEstimate)
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .action(async (options: { project: string }) => {
+    const p = getProjectByIdOrSlug(options.project.trim());
+    if (!p) throw new Error("Projeto nao encontrado");
+    const { estimateWojakProjectCosts, formatWojakCostReport } = await import(
+      "./services/wojak-cost-estimate.js"
+    );
+    const est = await estimateWojakProjectCosts(String(p.project_path), Number(p.total_blocos));
+    console.log(formatWojakCostReport(est));
+  });
+
+program
   .command("image:status")
   .description("Fila de image_jobs (HF/Gemini) e hf_cli_jobs de video por projeto")
   .addHelpText("after", CLI_HELP.imageStatus)
@@ -1062,7 +1141,7 @@ program
   .description("Reprocessa roteiro | narracao | imagens | thumbnails (etapa ou --block N)")
   .addHelpText("after", CLI_HELP.retry)
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
-  .requiredOption("--stage <etapa>", "Etapa: roteiro | narracao | imagens | thumbnails")
+  .requiredOption("--stage <etapa>", "Etapa: roteiro | narracao | imagens | montagem | thumbnails")
   .option("--block <N>", "Somente o bloco N (base 1). Sem esta opcao, refaz todos os blocos da etapa")
   .option("--voice-id <id>", "Obrigatorio implicitamente para narracao: .env ou flag")
   .option("--avatar-file <caminho>", "Opcional para stage imagens/thumbnails: avatar de consistencia")
@@ -1086,10 +1165,20 @@ program
   .option("--batch-local", "Stage imagens/thumbnails: batch local Gemini (testes)")
   .option("--plan-only", "Stage imagens v2: so plano Claude (exige --scene-plan-v2)")
   .option("--enqueue-only", "Stage imagens v2: enqueue + submit batch no fim (exige --scene-plan-v2)")
+  .option(
+    "--force-narracao",
+    "Stage narracao (plano v2): regenera todos os scXX.mp3 (ignora MP3 no disco)",
+  )
+  .option("--force", "Stage montagem: re-encode")
+  .option("--xfade-duration <s>", "Stage montagem: duracao xfade")
+  .option("--xfade-transition <nome>", "Stage montagem: tipo xfade")
+  .option("--no-partial-segments", "Stage montagem: sem segmentos parciais")
+  .option("--montagem-scenes-only", "Stage montagem: so clipes por cena (ver run-step)")
+  .option("--montagem-assemble-only", "Stage montagem: so blocos finais a partir dos clipes")
   .action(
     async (options: {
       project: string;
-      stage: "roteiro" | "narracao" | "imagens" | "thumbnails";
+      stage: "roteiro" | "narracao" | "imagens" | "montagem" | "thumbnails";
       block?: string;
       voiceId?: string;
       avatarFile?: string;
@@ -1107,6 +1196,13 @@ program
       batchLocal?: boolean;
       planOnly?: boolean;
       enqueueOnly?: boolean;
+      force?: boolean;
+      forceNarracao?: boolean;
+      xfadeDuration?: string;
+      xfadeTransition?: string;
+      noPartialSegments?: boolean;
+      montagemScenesOnly?: boolean;
+      montagemAssembleOnly?: boolean;
     }) => {
       const project = getProjectByIdOrSlug(options.project);
       if (!project) throw new Error("Projeto nao encontrado");
@@ -1149,12 +1245,30 @@ program
         );
         return;
       }
+      if (options.stage === "montagem") {
+        if (options.montagemScenesOnly && options.montagemAssembleOnly) {
+          throw new Error("Use apenas uma: --montagem-scenes-only ou --montagem-assemble-only");
+        }
+        let montagemPhase: MontagemPhase | undefined;
+        if (options.montagemScenesOnly) montagemPhase = "scenes";
+        else if (options.montagemAssembleOnly) montagemPhase = "assemble";
+        await executeMontagem(project, {
+          force: Boolean(options.force),
+          blockNumber,
+          xfadeDuration: options.xfadeDuration ? parseFloat(options.xfadeDuration) : undefined,
+          xfadeTransition: options.xfadeTransition,
+          partialSegments: options.noPartialSegments ? false : undefined,
+          montagemPhase,
+        });
+        return;
+      }
 
       const voiceId = await resolveVoiceId(options.voiceId);
+      const narracaoOpts = { forceRegenScenes: Boolean(options.forceNarracao) };
       if (blockNumber !== undefined) {
-        await executeNarracaoBlock(project, voiceId, blockNumber);
+        await executeNarracaoBlock(project, voiceId, blockNumber, narracaoOpts);
       } else {
-        await executeNarracao(project, voiceId);
+        await executeNarracao(project, voiceId, narracaoOpts);
       }
     }
   );
@@ -1178,10 +1292,46 @@ async function executeRoteiro(project: ProjectRow, promptMatrix?: string, prompt
   }
 }
 
-async function executeNarracao(project: ProjectRow, voiceId: string): Promise<void> {
+async function executeMontagem(
+  project: ProjectRow,
+  opts?: {
+    force?: boolean;
+    blockNumber?: number;
+    xfadeDuration?: number;
+    xfadeTransition?: string;
+    partialSegments?: boolean;
+    montagemPhase?: MontagemPhase;
+  },
+): Promise<void> {
+  const phase = mergeMontagemRunOptions(resolveMontagemConfig(), opts).montagemPhase;
+  const phaseBit =
+    phase === "scenes"
+      ? "apenas clipes por cena"
+      : phase === "assemble"
+        ? "apenas blocos (xfade)"
+        : "clipes + blocos";
+  const label =
+    opts?.blockNumber !== undefined
+      ? `Montagem FFmpeg (${phaseBit}) — bloco ${opts.blockNumber}...`
+      : `Montagem FFmpeg (${phaseBit}) — todos os blocos...`;
+  const spinner = ora(label).start();
+  try {
+    await runMontagem(project, opts);
+    spinner.succeed("Montagem concluida.");
+  } catch (error) {
+    spinner.fail("Falha na montagem.");
+    throw error;
+  }
+}
+
+async function executeNarracao(
+  project: ProjectRow,
+  voiceId: string,
+  opts?: { forceRegenScenes?: boolean },
+): Promise<void> {
   const spinner = ora("Gerando narracao...").start();
   try {
-    await runNarracao(project, voiceId);
+    await runNarracao(project, voiceId, opts);
     spinner.succeed("Narracao gerada com sucesso.");
   } catch (error) {
     spinner.fail("Falha na geracao da narracao.");
@@ -1240,10 +1390,15 @@ async function executeRoteiroBlock(
   }
 }
 
-async function executeNarracaoBlock(project: ProjectRow, voiceId: string, blockNumber: number): Promise<void> {
+async function executeNarracaoBlock(
+  project: ProjectRow,
+  voiceId: string,
+  blockNumber: number,
+  opts?: { forceRegenScenes?: boolean },
+): Promise<void> {
   const spinner = ora(`Gerando narracao — bloco ${blockNumber}...`).start();
   try {
-    await runNarracaoBlock(project, voiceId, blockNumber);
+    await runNarracaoBlock(project, voiceId, blockNumber, opts);
     spinner.succeed(`Audio do bloco ${blockNumber} gerado.`);
   } catch (error) {
     spinner.fail(`Falha no audio do bloco ${blockNumber}.`);

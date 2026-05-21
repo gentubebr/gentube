@@ -256,12 +256,22 @@ export async function generateVisualizationPlanJson(input: {
   segmentationJson: string;
   maxVideos: number;
   maxImages: number;
+  visualModality?: "default" | "wojak";
 }): Promise<string> {
   const anthropic = getClient();
   const signals =
     input.manualCaptureSignals.length > 0
       ? JSON.stringify(input.manualCaptureSignals)
       : "[]";
+  const wojakMode = input.visualModality === "wojak";
+  const wojakContext = wojakMode
+    ? `
+- visual_modality: wojak (MANDATORY)
+- stock_ratio: 0 — do NOT use source "stock" or "manual_capture" on any scene
+- Every scene: source "ai_generated", character_required true, character_variant set, search_keywords null
+- Wojak must comically act out each narration_text; prefer type "video" with motion cues in description
+`.trim()
+    : "";
   const userPrompt = `
 ${input.promptBase}
 
@@ -269,11 +279,11 @@ Context:
 - block_number: ${input.blockNumber}
 - total_blocks: ${input.totalBlocks}
 - audience: ${input.audience}
-- stock_ratio: ${input.stockRatio}
-- manual_capture_signals: ${signals}
+- stock_ratio: ${input.stockRatio}${wojakMode ? " (wojak mode: must be 0% stock)" : ""}
+- manual_capture_signals: ${signals}${wojakMode ? " (wojak mode: ignore — no manual_capture)" : ""}
 - max_videos_for_this_block: ${input.maxVideos} — HARD CAP: count of scenes with visual.type "video" must be ≤ this number.
 - max_images_for_this_block: ${input.maxImages} — HARD CAP: count of scenes with visual.type "image" must be ≤ this number.
-- scenes (segmentation output — copy narration fields verbatim in output):
+${wojakContext ? `${wojakContext}\n` : ""}- scenes (segmentation output — copy narration fields verbatim in output):
 ${input.segmentationJson}
 
 Return ONLY JSON following visualiza01 schema (schema_version "2.0-visualization").

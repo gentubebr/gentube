@@ -674,17 +674,29 @@ Gravado ao falhar parse/validacao em segmentacao ou visualizacao (`writePlanPars
 
 ### 18.10 Modalidade visual Wojak (opt-in)
 
-**Documento mestre:** [wojak.md](wojak.md) (plano, ficheiros, testes, rollout).
+**Documento mestre:** [wojak.md](wojak.md) (plano, opção B, retomada parcial, custos, piloto).
 
-**Objetivo:** canais com avatar **Wojak** (line art) em cenas `character_required: true`, com referencia PNG canonica (`src/assets/wojak/`), style token no render e bootstrap obrigatorio antes de video (Veo).
+**Objetivo:** canais com avatar **Wojak** (line art): personagem **comico** ilustra cada beat da narracao; plano so `ai_generated`; render **Gemini** (imagem/bootstrap) + **Veo** (video), sem stock Magnific nem Higgsfield.
 
-**Ativacao:** `GENTUBE_VISUAL_MODALITY=wojak` (default `default` — sem impacto em projetos existentes). Opcional: `GENTUBE_PROMPT_VISUALIZA`. `--avatar-file` continua disponivel e faz override da PNG da variant em modo Wojak.
+**Ativacao:** `GENTUBE_VISUAL_MODALITY=wojak` (default `default`). Corrida recomendada: `GENTUBE_IMAGE_BACKEND=gemini`, `GENTUBE_VIDEO_BACKEND=veo`, `GENTUBE_HF_ASYNC=0`, `GENTUBE_SCENE_PLAN_V2=1`. Opcional: `GENTUBE_PROMPT_VISUALIZA`, `GENTUBE_WOJAK_STYLE_TOKEN`, `GENTUBE_WOJAK_VEO_USE_REF` (default `0` — Veo text-to-video com prompt sanitizado, sem PNG ref). `--avatar-file` faz override da PNG da variant.
 
-**Prompts:** `segmenta01.md` inalterado. Visualizacao: `visualiza01.md` + addon `Prompts/visualiza_wojak.md` (schema `2.0-visualization` igual; campo opcional `character_variant`).
+**Plano v2:** `stock_ratio` efetivo **0** (`resolveStockRatioForBlock`). Validacao pos-parse: `assertWojakBlockPlan` / `validateWojakBlockPlan` em `src/utils/wojak-prompt.ts` (proibe `stock`/`manual_capture`; exige `character_required` + `character_variant` em todas as cenas).
 
-**Implementacao:** `src/config.ts` (`resolveVisualModality`, `resolveVisualizaPromptContent`), `src/utils/wojak-prompt.ts`, ramo em `imagensBlockPlanAndRenderV2` (`src/services/pipeline.ts`). Nao altera `image-generation.ts`, `video-generation.ts` nem montagem.
+**Prompts:** `segmenta01.md` inalterado. Visualizacao: `visualiza01.md` + addon `Prompts/visualiza_wojak.md`.
+
+**Opção B (producao imagens):** em modo wojak, `resolveSceneImageDelivery()` forca **`google_batch`** para cenas `type: image`; cada job inclui PNG de referencia (`buildGeminiMultimodalParts` em `gemini-batch.ts`). Bootstrap `scXX__bootstrap` permanece **sync** (`forceSync`). Veo permanece **sync** (sem batch de video).
+
+**Estimativa de custo:** comando `gentube cost-estimate --project <id>` (`src/services/wojak-cost-estimate.ts`); tarifas configuraveis `GENTUBE_COST_USD_*` no `.env`.
+
+**Retomada quando Veo falha (ex. quota 429):** o `retry --stage imagens` interrompe na primeira cena de video sem quota. Script auxiliar `scripts/continue-missing-renders.ts` gera imagens e bootstraps pendentes; depois `image:sync --watch`; quando a cota Veo voltar, `retry` salta ficheiros ja no disco. Ver secao em `wojak.md`.
+
+**Correcoes de pipeline (2026-05-20):** `shouldSkipImagensBlock` nao salta bloco com `renders_status=awaiting_hf` se nao houver `image_jobs`/`hf_cli_jobs` pendentes; `GENTUBE_FORCE_VIZ_REGEN=1` com `--plan-only` nao reutiliza plano antigo por engano.
 
 **Pre-requisito:** plano v2 (`--scene-plan-v2` / `GENTUBE_SCENE_PLAN_V2`).
+
+**CLI:** `run-step` / `retry --stage imagens` com `--scene-plan-v2 --plan-only` (so cenas); `GENTUBE_FORCE_VIZ_REGEN=1` regera plano. Producao: `narracao` → `imagens` (ou `--enqueue-only`) → `image:sync` → `retry` para videos em falta. `cost-estimate` antes de corridas longas.
+
+**Ficheiros (v2 + opcao B):** `Prompts/visualiza_wojak.md`, `src/config.ts`, `src/utils/wojak-prompt.ts`, `src/utils/scenes-plan.ts`, `src/integrations/claude.ts`, `src/integrations/gemini-batch.ts`, `src/services/pipeline.ts`, `src/services/image-generation.ts`, `src/services/video-generation.ts`, `src/services/wojak-cost-estimate.ts`, `scripts/continue-missing-renders.ts`.
 
 ## 19) Politica aprovada — Step 4 (Thumbnails)
 
