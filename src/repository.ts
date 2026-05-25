@@ -622,6 +622,13 @@ export function deleteImageJobsForBlock(projectId: number, blockNumber: number):
 export function deleteProject(projectId: number): void {
   const db = getDb();
   const tx = db.transaction(() => {
+    const runIds = db.prepare("SELECT id FROM pipeline_runs WHERE project_id = ?").all(projectId) as Array<{
+      id: number;
+    }>;
+    for (const { id } of runIds) {
+      db.prepare("DELETE FROM pipeline_run_steps WHERE run_id = ?").run(id);
+    }
+    db.prepare("DELETE FROM pipeline_runs WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM image_jobs WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM hf_cli_jobs WHERE project_id = ?").run(projectId);
     db.prepare("DELETE FROM project_logs WHERE project_id = ?").run(projectId);

@@ -104,8 +104,9 @@ O CLI deve ser amigavel, visual e objetivo:
 
 ### 5.2 Sequencial (pipeline)
 
-- `run-all` hoje executa automaticamente: Etapa 1 -> Etapa 2 (roteiro e narracao).
-- A etapa **imagens** roda com `run-step --step imagens` (ou fluxo equivalente no codigo), nao esta incluida no `run-all` atual.
+- `run-all` (legado) executa: roteiro -> narracao apenas.
+- **`run-pipeline`** (recomendado Wojak v2): roteiro -> imagens (plano v2 + batch) -> `image_sync` -> `imagens_retry` -> narracao -> montagem -> thumbnails, com rastreio em `pipeline_runs` / `pipeline_run_steps` e relatorio JSON em `05 - Modelagem/`.
+- A etapa **imagens** isolada continua disponivel via `run-step --step imagens`.
 - Interrompe em erro, mantendo rastreabilidade
 
 ## 6) Etapa 1 - Roteiro (Claude API)
@@ -698,6 +699,42 @@ Gravado ao falhar parse/validacao em segmentacao ou visualizacao (`writePlanPars
 
 **Ficheiros (v2 + opcao B):** `Prompts/visualiza_wojak.md`, `src/config.ts`, `src/utils/wojak-prompt.ts`, `src/utils/scenes-plan.ts`, `src/integrations/claude.ts`, `src/integrations/gemini-batch.ts`, `src/services/pipeline.ts`, `src/services/image-generation.ts`, `src/services/video-generation.ts`, `src/services/wojak-cost-estimate.ts`, `scripts/continue-missing-renders.ts`.
 
+### 18.11 Comando `run-pipeline` (orquestrador com rastreio)
+
+**Objetivo:** uma corrida encadeia as etapas do video Wojak v2 sem perder rastreabilidade quando `--continue-on-error` (default) segue apos falhas parciais.
+
+**Perfil inicial:** `wojak-images-only` — `max_videos` forcado a 0; imagens via Google Batch; ordem:
+
+1. `roteiro` (por bloco, ate `--max-retries-per-block`)
+2. `imagens` (plano v2 + enqueue batch por bloco)
+3. `image_sync` (poll ate sem `image_jobs` pendentes ou `--image-sync-max-rounds`)
+4. `imagens_retry` (blocos com `image_jobs.outcome=failed`: apaga failed, re-render bloco, sync curto)
+5. `narracao` (ElevenLabs por cena; requer `blockNN.assets.json`)
+6. `montagem` (FFmpeg; requer `scXX.mp3` + PNG)
+7. `thumbnails` (opcional; `--skip-thumbnails`)
+
+**Rastreio (SQLite):**
+
+| Tabela | Uso |
+|--------|-----|
+| `pipeline_runs` | Uma linha por corrida: `profile`, `status` (`running`/`success`/`partial`/`failed`), `summary_json`, `report_path` |
+| `pipeline_run_steps` | Uma linha por passo: `stage`, `block_number` (nullable), `status`, `attempt`, `error_message`, `details_json` |
+| `project_logs` | `stage=pipeline` — eventos agregados |
+
+**Relatorio em disco:** `05 - Modelagem/pipeline-run-<runId>.json` e `pipeline-run-latest.json` (mesmo conteudo que `summary_json` + lista de steps).
+
+**CLI auxiliar:** `gentube pipeline-report --project <id|slug> [--run-id N]`.
+
+**Retomada:** `--from-stage <etapa>` — etapas **anteriores na ordem do pipeline** sao ignoradas (nao reexecutadas). Ex.: `--from-stage narracao` **nao** corre `imagens` nem `image_sync` — use `--from-stage imagens` se o plano ja existe e faltam PNG. Blocos ja `success` em `script_blocks` / `media_blocks` / `narration_blocks` sao marcados `skipped` nos steps.
+
+**Render Wojak imagens-only:** em `runImagensVideosBlock`, quando `maxVideos === 0` (perfil `wojak-images-only`), cenas com `visual.type === video` geram **bootstrap PNG** (`scXX__bootstrap.png`) e **nao** invocam Veo. Montagem resolve bootstrap se `.mp4` ausente (`resolveSceneVisualPath`).
+
+**Flags:** `--no-continue-on-error`, `--voice-id`, `--avatar-file`, `--max-images-block1`, `--max-images-other`, `--image-sync-interval`, `--google-batch-mode`, `--scene-plan-v2`, `--skip-thumbnails`, `--montagem-force`, `--from-stage`, `--through-stage`.
+
+**Implementacao:** `src/services/pipeline-orchestrator.ts`, `src/repository-pipeline.ts`, migracao em `src/db.ts` (`migratePipelineRunsSchema`).
+
+**`create-video --mode pipeline`:** apos criar projeto, invoca `run-pipeline` com o mesmo perfil.
+
 ## 19) Politica aprovada — Step 4 (Thumbnails)
 
 ### 19.1 Objetivo
@@ -1182,8 +1219,130 @@ npm run gentube -- sync-from-disk --project <id> --only montagem
 - Idempotencia: `GENTUBE_MONTAGEM_SKIP_EXISTING=1` — saltar se saida mais recente que entradas (`--force` re-encode).
 - `create-video` / template criam pasta `06 - Montagem/`.
 
+### 23.12 Concatenacao xfade em lotes (blocos longos)
+
+Quando `clipPaths.length > GENTUBE_MONTAGEM_XFADE_MAX_SCENES_SINGLE` (default **40**), `concatClipsWithXfadeChunked` em `src/utils/montagem-render.ts`:
+
+1. Divide as cenas em lotes de ate N clipes.
+2. Cada lote: um `filter_complex` single-pass → ficheiro `.xfade-chunk-{i}-blockNN.mp4`.
+3. Funde os lotes com outro single-pass (ou recursao se ainda > N).
+
+**Motivo:** um unico encode com 80–105 inputs (`block06` do projeto 12) causa OOM / `ffmpeg: exit null`. O modo `pairwise` (104 encodes sequenciais) funciona mas e muito lento.
+
+| Variavel | Default | Uso |
+|----------|---------|-----|
+| `GENTUBE_MONTAGEM_XFADE_MAX_SCENES_SINGLE` | `40` | Tamanho maximo de um lote na concat |
+| `GENTUBE_MONTAGEM_XFADE_CONCAT` | `single` | Dentro de cada lote; evitar `pairwise` em blocos longos |
+
 ### 23.11 Prototipo local
 
 ```bash
 ./experiments/ffmpeg-scene-tests/run-tests.sh
 ```
+
+---
+
+## 24) Claude Message Batches API (roteiro + planos v2)
+
+Documentacao de decisao (2026-05-21): producao usa **obrigatoriamente** a [Message Batches API](https://docs.anthropic.com/en/docs/build-with-claude/message-batches) da Anthropic (~**50%** do preco sync). **Google Batch** (`image:sync`) continua separado — apenas imagens PNG.
+
+### 24.1 Problema diagnostico — bloco 6 (`20260521-The-10-Brutal-Truths-how-AI-Ends`)
+
+| Sintoma | Causa |
+|---------|--------|
+| `Visualizacao: resposta nao e JSON valido` (~pos 44k) | Resposta Claude **truncada** (`CLAUDE_MAX_TOKENS`); JSON cortado em `sc50` |
+| `Segmentacao: sc75 tem N palavras (limite 120)` | Segmentacao com **50 cenas** para ~1950 palavras; modelo **despeja** o resto na ultima cena |
+| Roteiro `block06.md` | Contem **porta 6 + porta 7 + teaser 8–9** no mesmo bloco (matriz 8 blocos / 10 portas) |
+
+**Correcao aplicada:**
+
+1. `max_scenes` **dinamico**: `min(GENTUBE_MAX_SCENES_CAP, ceil(palavras / GENTUBE_MAX_SCENES_WORDS_DIVISOR))` — bloco 6 ~**89–90** cenas.
+2. `Prompts/segmenta01.md`: proibir mega-cena final; distribuir ate o orcamento.
+3. `GENTUBE_MAX_WORDS_PER_SCENE` (default 120): falha barata na segmentacao.
+4. Visualizacao **split** quando cenas > `GENTUBE_VIZ_SPLIT_SCENE_THRESHOLD` (default 70): dois pedidos `viz-a` / `viz-b` no batch, merge local.
+5. Nao reutilizar `blockNN.assets.json.error` com `raw_response` truncado (`GENTUBE_FORCE_VIZ_REGEN=1` ou apagar `.error`).
+
+### 24.2 Arquitetura de fases (por projeto)
+
+| Fase | `custom_id` | Pedidos | Depende de |
+|------|-------------|---------|------------|
+| **R1** roteiro | `p{id}-roteiro-b{n}` | N blocos | transcript + prompts |
+| **S1** segmentacao | `p{id}-segmentation-b{n}` | N blocos | `blockNN.md` + `max_scenes` |
+| **V1** visualizacao | `p{id}-visualization-b{n}` ou `…-viz-a/b` | N (ou 2N se split) | segmentacao valida |
+| **Imagens** | (existente) | Google Batch | `blockNN.assets.json` |
+
+Implementacao: `runClaudeUserPrompt` em `src/integrations/claude.ts` — se `GENTUBE_CLAUDE_DELIVERY=batch`, submete 1 item, **poll inline**, grava em `claude_batch_jobs` + JSONL em `05 - Modelagem/claude-batches/`. Comando auxiliar: `gentube claude:sync` (poll de jobs ainda `pending`).
+
+### 24.3 Variaveis de ambiente
+
+| Variavel | Default | Uso |
+|----------|---------|-----|
+| `GENTUBE_CLAUDE_DELIVERY` | `batch` | `batch` \| `sync` (debug) |
+| `GENTUBE_CLAUDE_BATCH_POLL_INTERVAL` | `60s` | Poll batch / `claude:sync --watch` |
+| `GENTUBE_CLAUDE_MODEL_ROTEIRO` | (fallback `CLAUDE_MODEL`) | Roteiro |
+| `GENTUBE_CLAUDE_MODEL_SEGMENTATION` | (fallback) | Segmentacao |
+| `GENTUBE_CLAUDE_MODEL_VISUALIZATION` | (fallback) | Visualizacao |
+| `GENTUBE_CLAUDE_THINKING_PLAN` | `disabled` | Seg + viz (evita esgotar tokens) |
+| `GENTUBE_MAX_SCENES_DYNAMIC` | `1` | Formula por palavras do bloco |
+| `GENTUBE_MAX_SCENES_WORDS_DIVISOR` | `22` | ~1 cena / 22 palavras |
+| `GENTUBE_MAX_SCENES_CAP` | `100` | Teto Anthropic por bloco |
+| `GENTUBE_MAX_WORDS_PER_SCENE` | `120` | Rejeita “lixo na ultima cena” |
+| `GENTUBE_VIZ_SPLIT_SCENE_THRESHOLD` | `70` | Divide visualizacao em 2 pedidos |
+
+Codigo: `src/utils/max-scenes.ts`, `src/integrations/claude-batch.ts`, `src/services/claude-sync.ts`, tabela `claude_batch_jobs`.
+
+### 24.4 Custos e latencia
+
+- Batch Anthropic: ~**50%** input/output vs Messages API sync (ver pricing Anthropic).
+- Recomendacao: **Sonnet** para seg/viz; **Opus** opcional so roteiro (`GENTUBE_CLAUDE_MODEL_ROTEIRO`).
+- Latencia: maioria < 1 h; ate 24 h — adequado para `run-pipeline` overnight; retry de bloco faz poll inline.
+
+### 24.5 Comandos
+
+```bash
+# Plano bloco 6 (exemplo video 20260521)
+mv "03 - Imagens e Videos/block06.assets.json.error" "03 - Imagens e Videos/block06.assets.json.error.bak"
+export GENTUBE_FORCE_VIZ_REGEN=1
+npm run gentube -- retry --project 20260521-The-10-Brutal-Truths-how-AI-Ends \
+  --stage imagens --block 6 --scene-plan-v2 --google-batch-mode \
+  --max-videos-block1 0 --max-videos-other 0
+
+npm run gentube -- image:sync --project 20260521-The-10-Brutal-Truths-how-AI-Ends --watch --interval 30s
+npm run gentube -- claude:sync --project 20260521-The-10-Brutal-Truths-how-AI-Ends --watch
+npm run gentube -- pipeline-report --project 20260521-The-10-Brutal-Truths-how-AI-Ends
+```
+
+### 24.6 Cobertura de texto na segmentacao
+
+`validateSceneTextsCoverBlock` (`src/utils/text-coverage.ts`) exige que a concatenacao das `narration_text` das cenas seja identica ao `blockNN.md` apos normalizacao.
+
+**Separadores Markdown `---`:** linhas so com `---` no roteiro (quebras de secao) **nao** entram na narracao por cena; sao removidas na normalizacao (`replace(/^\s*---\s*$/gm, " ")`). Sem isto, blocos com `---` (ex. `block07.md`) falham com *Cobertura de texto falhou* mesmo com segmentacao correta.
+
+**Blocos muito longos:** se `sc59` (ou ultima cena) exceder `GENTUBE_MAX_WORDS_PER_SCENE`, aumente cenas via `GENTUBE_MAX_SCENES_WORDS_DIVISOR` (ex. `10` para ~100 cenas em 1000 palavras) e regenere segmentacao.
+
+### 24.7 Roteiro importado (sem step roteiro)
+
+Fluxo para texto ja gerado no Claude (ou outro editor):
+
+1. `create-video --mode iterativo` (ou flags `--channel`, `--title`, `--blocks`).
+2. Copiar `block01.md` … `blockNN.md` para `01 - Roteiro/`.
+3. `sync-from-disk --only roteiro` → `script_blocks.status = success`.
+4. Continuar com `plan-only` / `run-pipeline --from-stage imagens`.
+
+Nao executar `run-step --step roteiro` salvo para regerar texto.
+
+### 24.8 Google Gemini — teto de gastos mensal
+
+Sintoma: `429 RESOURCE_EXHAUSTED` com *Your project has exceeded its monthly spending cap* em `image:sync`, bootstrap sync ou submit batch.
+
+| Acao | Detalhe |
+|------|---------|
+| Gestao | [Google AI Studio — Spend](https://ai.studio/spend) |
+| Pipeline | `image_sync` em loop nao avanca; `imagens` falha em todos os blocos |
+| Retomada | Apos aumentar cap ou novo ciclo: `--from-stage imagens` + `image:sync --watch` |
+
+Distinto de quota **Veo** (`429` rate limit) — ver `wojak.md`.
+
+### 24.9 Roteiro — alinhamento futuro (opcional)
+
+Matriz atual: 8 blocos com **multiplas portas** por bloco (ex. bloco 5 = portas 4+5, bloco 6 = 6+7). Medio prazo: **10 blocos / 1 porta** no `create-video` ou revisao manual de `block06.md` … `block08.md` para evitar >100 cenas/bloco.

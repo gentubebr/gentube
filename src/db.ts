@@ -154,6 +154,8 @@ export function getDb(): Database.Database {
 
   migrateImageJobsColumns(db);
   migrateMontagemSchema(db);
+  migratePipelineRunsSchema(db);
+  migrateClaudeBatchSchema(db);
 
   return db;
 }
@@ -193,6 +195,67 @@ function migrateMontagemSchema(database: Database.Database): void {
       FOREIGN KEY(project_id) REFERENCES video_projects(id)
     );
     CREATE INDEX IF NOT EXISTS idx_assembly_blocks_project ON assembly_blocks(project_id);
+  `);
+}
+
+function migrateClaudeBatchSchema(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS claude_batch_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      stage TEXT NOT NULL CHECK(stage IN ('roteiro', 'segmentation', 'visualization')),
+      block_number INTEGER,
+      custom_id TEXT NOT NULL,
+      batch_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'submitted',
+      outcome TEXT NOT NULL DEFAULT 'pending' CHECK(outcome IN ('pending', 'done', 'failed')),
+      result_path TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(project_id) REFERENCES video_projects(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_claude_batch_project ON claude_batch_jobs(project_id, outcome);
+    CREATE INDEX IF NOT EXISTS idx_claude_batch_batch ON claude_batch_jobs(batch_id);
+  `);
+}
+
+function migratePipelineRunsSchema(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS pipeline_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      profile TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      continue_on_error INTEGER NOT NULL DEFAULT 1,
+      current_stage TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      summary_json TEXT,
+      report_path TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(project_id) REFERENCES video_projects(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pipeline_runs_project ON pipeline_runs(project_id);
+
+    CREATE TABLE IF NOT EXISTS pipeline_run_steps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL,
+      stage TEXT NOT NULL,
+      block_number INTEGER,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempt INTEGER NOT NULL DEFAULT 1,
+      error_message TEXT,
+      details_json TEXT,
+      started_at TEXT,
+      finished_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES pipeline_runs(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pipeline_run_steps_run ON pipeline_run_steps(run_id);
+    CREATE INDEX IF NOT EXISTS idx_pipeline_run_steps_stage ON pipeline_run_steps(run_id, stage);
   `);
 }
 

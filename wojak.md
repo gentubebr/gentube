@@ -116,6 +116,7 @@ export GENTUBE_WOJAK_VEO_USE_REF=0          # Veo sem PNG ref; prompt sanitizado
 | `type: image` | `resolveSceneImageDelivery()` → **`google_batch`** em modo wojak | PNG da variant (`src/assets/wojak/`) ou `--avatar-file`; partes via `buildGeminiMultimodalParts` em `gemini-batch.ts` |
 | Bootstrap `scXX__bootstrap` | **sync** (`forceSync: true`) | `buildWojakReferenceImagePrompt(description, negative)` + PNG canónica |
 | `type: video` (Veo) | **sync** (sem batch Veo) | Por defeito **sem** enviar bootstrap ao Veo (`GENTUBE_WOJAK_VEO_USE_REF=0`); bootstrap fica em disco para montagem |
+| `type: video` + `max_videos=0` (perfil imagens-only) | bootstrap sync apenas | **Sem Veo**; montagem usa `scXX__bootstrap.png` |
 
 Poll das imagens em batch: `npm run gentube -- image:sync --project <id> --watch`.
 
@@ -298,18 +299,29 @@ Referência real: projeto **id 11**, slug `20260520-Can-you-spend-1Tri-Dollar` (
 
 Use **Node 23** no PATH (`better-sqlite3` falha no Node 20 do Cursor).
 
-### Ordem correta (não pular o plan-only)
+### Ordem correta (produção)
 
 | # | Etapa | Notas |
 |---|--------|--------|
-| 0 | `create-video` + transcript | `--blocks 1`, `--transcript-file`, `--prompt-canal-voice canal_voice.md` |
-| 1 | Roteiro | `run-step --step roteiro` |
-| 2 | **Cenas Wojak** | `imagens` + `--scene-plan-v2` + **`--plan-only`** + **`GENTUBE_VISUAL_MODALITY=wojak`** |
-| 3 | Revisar plano | Abrir `03 - Imagens e Videos/block01.assets.json` |
-| 4 | Narração por cena | `run-step --step narracao` (com plano no disco → `02 - Narracao/block01/scXX.mp3`) |
-| 5 | Renders / qualidade | Ver [Próximos passos após o plano](#próximos-passos-após-o-plano) |
+| 0 | `create-video` + transcript | `--mode pipeline` ou iterativo + `run-pipeline` depois |
+| 1 | Roteiro | Dentro de `run-pipeline` ou `run-step --step roteiro` |
+| 2 | **Cenas + renders** | `imagens` v2 (plano + batch); 0 vídeos com perfil `wojak-images-only` |
+| 3 | **image_sync** | Automático em `run-pipeline`; manual: `image:sync --watch` |
+| 4 | Narração | Após plano no disco → `scXX.mp3` (ElevenLabs) |
+| 5 | Montagem + thumbs | `06 - Montagem/blocks/` · `04 - Thumbnails/` |
 
-**Erro comum:** rodar `imagens` sem `--plan-only` (ou `narracao` antes do plano) — gera MP3 monolítico e tenta render antes de existir `scenes[]` com regras Wojak.
+**Comando único (recomendado):**
+
+```bash
+npm run gentube -- run-pipeline --project <slug> --voice-id <ELEVENLABS_VOICE_ID>
+npm run gentube -- pipeline-report --project <slug>   # onde parou / erros por bloco
+```
+
+Rastreio: tabelas `pipeline_runs` / `pipeline_run_steps`, `project_logs` (`stage=pipeline`), JSON em `05 - Modelagem/pipeline-run-latest.json`. Com `--continue-on-error` (default), falhas num bloco não param o projeto inteiro — status final `partial`; corrija com `retry --stage … --block N` ou `--from-stage`.
+
+**Fluxo manual (revisar plano entre passos):** use `--plan-only` antes dos renders; ver comandos abaixo.
+
+**Erro comum (manual):** `narracao` antes de existir `blockNN.assets.json` — falta texto por cena no plano.
 
 ### Comandos copiáveis
 
@@ -488,4 +500,104 @@ Alternativas: `tmux new -s gentube` / `screen`; ou job no Cursor com comando aci
 
 **Bootstrap / imagem:** PNG canónica + `buildWojakReferenceImagePrompt`; emoção na `description` reforça a variant quando não é `neutral`.
 
-*Última atualização: 2026-05-20 — v2, opção B, cost-estimate, retomada parcial (piloto bloco 1).*
+---
+
+## Claude Batch + Google Batch (produção)
+
+Decisão 2026-05-21: **todo** texto/plano via Anthropic **Message Batches API**; **todo** PNG via **Google Batch**. Não misturar os dois “batch” no mesmo comando.
+
+### Ordem recomendada (`run-pipeline` / manual)
+
+| # | Etapa | API | Poll |
+|---|--------|-----|------|
+| 1 | Roteiro `blockNN.md` | Claude batch (`GENTUBE_CLAUDE_DELIVERY=batch`) | inline no CLI |
+| 2 | Plano `blockNN.assets.json` (seg + viz) | Claude batch | inline; split viz se >70 cenas |
+| 3 | Renders `scXX.png` | Google batch | `image:sync --watch` |
+| 4 | Narração `scXX.mp3` | ElevenLabs | — |
+| 5 | Montagem | FFmpeg local | — |
+
+### `.env` Wojak + batch Claude
+
+```bash
+GENTUBE_CLAUDE_DELIVERY=batch
+GENTUBE_CLAUDE_THINKING_PLAN=disabled
+GENTUBE_CLAUDE_MODEL_SEGMENTATION=claude-sonnet-4-6
+GENTUBE_CLAUDE_MODEL_VISUALIZATION=claude-sonnet-4-6
+GENTUBE_MAX_SCENES_DYNAMIC=1
+GENTUBE_MAX_SCENES_WORDS_DIVISOR=22
+GENTUBE_MAX_SCENES_CAP=100
+GENTUBE_MAX_WORDS_PER_SCENE=120
+GENTUBE_VISUAL_MODALITY=wojak
+GENTUBE_SCENE_PLAN_V2=1
+GENTUBE_IMAGE_DELIVERY=google_batch
+```
+
+### Blocos longos (ex. projeto 12, `block06`)
+
+O roteiro de 8 blocos pode incluir **duas “portas”** no mesmo `block06.md` (~1950 palavras). Com `--max-images-other 50` fixo, a segmentação colapsava o excesso em `sc50` e a visualização truncava o JSON.
+
+**Correção:** fórmula dinâmica de cenas + validação 120 palavras/cena + visualização em 2 pedidos se >70 cenas. Ver **ESPECIFICACAO_TECNICA.md §24**.
+
+Para segmentação ainda com mega-cena ou cobertura falhando, use divisor mais agressivo na corrida:
+
+```bash
+GENTUBE_MAX_SCENES_WORDS_DIVISOR=10 npm run gentube -- retry --project <slug> \
+  --stage imagens --block 6 --scene-plan-v2 --plan-only
+```
+
+### Perfil `wojak-images-only` — render sem Veo
+
+`run-pipeline` e `resolveWojakImagesOnlyLimits` forçam `max_videos` a **0** no **plano** Claude. Desde 2026-05-23, o **render** também respeita isso: cenas `type: video` recebem apenas **bootstrap PNG** (`scXX__bootstrap.png`), sem chamada Veo. A montagem usa o bootstrap como imagem (Ken Burns) se não existir `scXX.mp4`.
+
+**Retomada correta após narração pronta:**
+
+```bash
+npm run gentube -- run-pipeline --project <slug> \
+  --from-stage imagens --through-stage montagem \
+  --skip-thumbnails --profile wojak-images-only --voice-id <id>
+```
+
+**Não use** `--from-stage narracao` se ainda faltam PNG — essa etapa **não** executa `imagens`.
+
+### Roteiro externo (sem `step roteiro`)
+
+1. `create-video --mode iterativo` + copiar `blockNN.md` → `01 - Roteiro/`.
+2. `sync-from-disk --only roteiro`.
+3. `run-step --step imagens --scene-plan-v2 --plan-only` (ou `run-pipeline --from-stage imagens`).
+
+Roteiros com linhas `---` entre secções: a normalização de cobertura ignora esses separadores (ver ESPECIFICACAO §24.6).
+
+### Montagem — 80+ cenas por bloco
+
+`GENTUBE_MONTAGEM_XFADE_MAX_SCENES_SINGLE=40` (default): concat em lotes antes de `blockNN.mp4`. Projeto Lottery (~418 cenas, bloco 6 com 80): evitar concat single-pass de 105 clipes.
+
+### Google — monthly spending cap (batch imagens)
+
+Além do 429 de **Veo**, o projeto Google pode devolver *monthly spending cap exceeded* no **batch de imagens** / bootstrap sync. Sintoma: todos os blocos em `imagens` com erro 429; `image:sync` com dezenas de rodadas sem progresso. Resolver no AI Studio Spend antes de retomar `--from-stage imagens`.
+
+```bash
+# Só destravar bloco 6 após falha
+mv "03 - Imagens e Videos/block06.assets.json.error" \
+   "03 - Imagens e Videos/block06.assets.json.error.bak"
+export GENTUBE_FORCE_VIZ_REGEN=1
+npm run gentube -- retry --project 20260521-The-10-Brutal-Truths-how-AI-Ends \
+  --stage imagens --block 6 --scene-plan-v2 --google-batch-mode \
+  --max-videos-block1 0 --max-videos-other 0
+npm run gentube -- image:sync --project 20260521-The-10-Brutal-Truths-how-AI-Ends --watch --interval 30s
+```
+
+### Artefactos de rastreio Claude
+
+| Caminho | Conteúdo |
+|---------|----------|
+| `data/gentube.db` → `claude_batch_jobs` | `custom_id`, `batch_id`, `stage`, `outcome` |
+| `05 - Modelagem/claude-batches/*.jsonl` | Resultados brutos por batch Anthropic |
+| `05 - Modelagem/pipeline-run-*.json` | Corrida `run-pipeline` |
+
+### Custo estimado
+
+`cost-estimate` assume ~2 chamadas Claude/bloco; com batch Anthropic aplique **~50%** em `GENTUBE_COST_USD_CLAUDE_PLAN_BLOCK` mentalmente ou ajuste a variável no `.env`.
+
+---
+
+*Última atualização: 2026-05-21 — Claude Message Batches, max_scenes dinâmico, bloco 6 (projeto 12).*

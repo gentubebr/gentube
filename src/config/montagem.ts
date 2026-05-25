@@ -72,6 +72,8 @@ export type MontagemConfig = {
   audioCrossfade: boolean;
   /** single = um ffmpeg com cadeia xfade (rapido); pairwise = um encode por par (lento, legado) */
   xfadeConcatMode: "single" | "pairwise";
+  /** Acima deste N de clipes, divide em lotes single-pass e funde os lotes (evita OOM no bloco inteiro). */
+  xfadeMaxScenesSinglePass: number;
   partialSegments: boolean;
   minScenesPerSegment: number;
   stopOnBlockError: boolean;
@@ -121,6 +123,7 @@ export function resolveMontagemConfig(overrides?: Partial<MontagemConfig>): Mont
       (process.env.GENTUBE_MONTAGEM_XFADE_CONCAT ?? "single").trim().toLowerCase() === "pairwise"
         ? "pairwise"
         : "single",
+    xfadeMaxScenesSinglePass: envInt("GENTUBE_MONTAGEM_XFADE_MAX_SCENES_SINGLE", 40),
     partialSegments: envBool("GENTUBE_MONTAGEM_PARTIAL_SEGMENTS", true),
     minScenesPerSegment: envInt("GENTUBE_MONTAGEM_MIN_SCENES_PER_SEGMENT", 1),
     stopOnBlockError: envBool("GENTUBE_MONTAGEM_STOP_ON_BLOCK_ERROR", false),

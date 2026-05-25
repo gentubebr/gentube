@@ -72,12 +72,19 @@ import { tryConcatMp3WithFfmpeg } from "../utils/mp3-concat.js";
 import {
   clearPlanParseError,
   loadVisualizationErrorResume,
+  mergeVisualizationRawHalves,
   parseSegmentationJson,
   parseVisualizationMerge,
   isBlockScenesPlanV2,
   unwrapJsonFromModel,
   writePlanParseError,
 } from "../utils/scenes-plan.js";
+import {
+  resolveSceneCapsForBlock,
+  splitScenesForVisualization,
+  step3LimitsFromSceneCaps,
+  visualizationShouldSplit,
+} from "../utils/max-scenes.js";
 import { searchAndDownload } from "../integrations/magnific.js";
 import { sceneRenderOutputExists } from "../utils/media-output.js";
 import { Step3Limits } from "../types/step3-limits.js";
@@ -347,6 +354,7 @@ export async function runRoteiro(project: ProjectRow, opts?: RoteiroPromptOption
         previousBlocksText: previousBlocksText || undefined,
         blockNumber: i,
         totalBlocks: totalBlocos,
+        projectId,
       });
 
       await fs.writeFile(blockPath, content, "utf-8");
@@ -409,6 +417,7 @@ export async function runRoteiroBlock(project: ProjectRow, blockNumber: number, 
       previousBlocksText: previousBlocksText || undefined,
       blockNumber,
       totalBlocks: totalBlocos,
+      projectId,
     });
 
     await fs.writeFile(blockPath, content, "utf-8");
@@ -789,21 +798,17 @@ async function imagensBlockPlanAndRenderV2(input: {
 
   const bn = input.blockNumber;
   const tb = input.totalBlocos;
-  const maxVideos = input.limits
-    ? bn === 1
-      ? input.limits.maxVideosBlock1
-      : input.limits.maxVideosOtherBlocks
-    : bn === 1
-      ? DEFAULT_MAX_VIDEOS_BLOCK1
-      : DEFAULT_MAX_VIDEOS_OTHER_BLOCKS;
-  const maxImages = input.limits
-    ? bn === 1
-      ? input.limits.maxImagesBlock1
-      : input.limits.maxImagesOtherBlocks
-    : bn === 1
-      ? DEFAULT_MAX_IMAGES_BLOCK1
-      : DEFAULT_MAX_IMAGES_OTHER_BLOCKS;
-  const maxScenes = maxVideos + maxImages;
+  const caps = resolveSceneCapsForBlock(input.scriptText, bn, input.limits);
+  const maxScenes = caps.maxScenes;
+  const maxImages = caps.maxImages;
+  const maxVideos = caps.maxVideos;
+  if (caps.dynamic) {
+    console.log(
+      chalk.dim(
+        `${blockTag(bn, tb)} max_scenes=${maxScenes} (${caps.wordCount} palavras, formula dinamica)`,
+      ),
+    );
+  }
 
   const forceVizRegen = forceScenePlanVizRegen();
   const existingPlan = forceVizRegen ? null : await tryLoadPlanFromAssetsJson(input.jsonPath);
@@ -865,6 +870,7 @@ async function imagensBlockPlanAndRenderV2(input: {
         totalBlocks: input.totalBlocos,
         blockText: input.scriptText,
         maxScenes,
+        projectId: input.projectId,
       });
       seg = await parseSegmentationWithErrorFile(
         input.jsonPath,
@@ -876,18 +882,60 @@ async function imagensBlockPlanAndRenderV2(input: {
       );
 
       const visualModality = resolveVisualModality();
-      rawViz = await generateVisualizationPlanJson({
-        promptBase: vizPrompt,
-        blockNumber: input.blockNumber,
-        totalBlocks: input.totalBlocos,
-        audience: String(input.project.audience),
-        stockRatio: input.stockRatio,
-        manualCaptureSignals: input.manualCaptureSignals,
-        segmentationJson: JSON.stringify(seg, null, 2),
-        maxVideos,
-        maxImages,
-        visualModality,
-      });
+      const segJsonFull = JSON.stringify(seg, null, 2);
+      if (visualizationShouldSplit(seg.scenes.length)) {
+        const [partA, partB] = splitScenesForVisualization(seg.scenes);
+        const segA: SegmentationPlanV2 = { ...seg, scenes: partA };
+        const segB: SegmentationPlanV2 = { ...seg, scenes: partB };
+        console.log(
+          chalk.dim(
+            `${blockTag(bn, tb)} Visualizacao em 2 pedidos (${partA.length}+${partB.length} cenas)`,
+          ),
+        );
+        const rawVizA = await generateVisualizationPlanJson({
+          promptBase: vizPrompt,
+          blockNumber: input.blockNumber,
+          totalBlocks: input.totalBlocos,
+          audience: String(input.project.audience),
+          stockRatio: input.stockRatio,
+          manualCaptureSignals: input.manualCaptureSignals,
+          segmentationJson: JSON.stringify(segA, null, 2),
+          maxVideos,
+          maxImages,
+          visualModality,
+          projectId: input.projectId,
+          customIdSuffix: "viz-a",
+        });
+        const rawVizB = await generateVisualizationPlanJson({
+          promptBase: vizPrompt,
+          blockNumber: input.blockNumber,
+          totalBlocks: input.totalBlocos,
+          audience: String(input.project.audience),
+          stockRatio: input.stockRatio,
+          manualCaptureSignals: input.manualCaptureSignals,
+          segmentationJson: JSON.stringify(segB, null, 2),
+          maxVideos,
+          maxImages,
+          visualModality,
+          projectId: input.projectId,
+          customIdSuffix: "viz-b",
+        });
+        rawViz = mergeVisualizationRawHalves(rawVizA, rawVizB);
+      } else {
+        rawViz = await generateVisualizationPlanJson({
+          promptBase: vizPrompt,
+          blockNumber: input.blockNumber,
+          totalBlocks: input.totalBlocos,
+          audience: String(input.project.audience),
+          stockRatio: input.stockRatio,
+          manualCaptureSignals: input.manualCaptureSignals,
+          segmentationJson: segJsonFull,
+          maxVideos,
+          maxImages,
+          visualModality,
+          projectId: input.projectId,
+        });
+      }
     }
 
     plan = await parseVisualizationWithErrorFile(
@@ -895,7 +943,7 @@ async function imagensBlockPlanAndRenderV2(input: {
       rawViz,
       seg,
       input.scriptText,
-      input.limits
+      step3LimitsFromSceneCaps(bn, caps, input.limits),
     );
 
     await clearPlanParseError(input.jsonPath);
@@ -1075,6 +1123,17 @@ async function imagensBlockPlanAndRenderV2(input: {
         mediaPath: bootstrap.localPath,
         provider: bootstrap.provider,
       });
+    }
+
+    if (v.type === "video" && maxVideos === 0) {
+      done += 1;
+      console.log(
+        chalk.green(
+          `  ${blockTag(bn, tb)} ${scene.id} imagens-only (bootstrap PNG, sem Veo) (${done}/${plan.scenes.length})`,
+        ),
+      );
+      upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
+      continue;
     }
 
     if (v.type === "image") {

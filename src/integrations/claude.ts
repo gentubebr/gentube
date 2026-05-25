@@ -2,11 +2,24 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { MessageCreateParamsNonStreaming } from "@anthropic-ai/sdk/resources/messages.js";
 import {
   CLAUDE_API_KEY,
-  CLAUDE_MODEL,
   CLAUDE_MAX_TOKENS,
+  CLAUDE_MODEL,
   CLAUDE_THINKING,
+  claudeDeliveryFromEnv,
+  claudeModelForStage,
+  claudeThinkingForStage,
+  type ClaudeBatchStage,
 } from "../config.js";
 import { sanitizeScriptBlockContent } from "../utils/sanitize-script-block.js";
+import {
+  buildBatchCustomId,
+  createClaudeMessageBatch,
+  extractTextFromBatchMessage,
+  isClaudeBatchSuccess,
+  pollClaudeBatchUntilEnded,
+  streamClaudeBatchResults,
+} from "./claude-batch.js";
+import { insertClaudeBatchJob, updateClaudeBatchJob } from "../repository-claude-batch.js";
 
 let client: Anthropic | null = null;
 
@@ -26,14 +39,124 @@ function applyStructuredJsonCallParams(
     thinking?: { type: "adaptive" };
     output_config?: { effort: "low" };
     temperature?: number;
-  }
+  },
+  thinkingMode?: string,
 ): void {
-  if (CLAUDE_THINKING === "adaptive") {
+  const mode = (thinkingMode ?? CLAUDE_THINKING).trim().toLowerCase();
+  if (mode === "adaptive") {
     createParams.thinking = { type: "adaptive" };
     createParams.output_config = { effort: "low" };
-  } else {
+  } else if (mode && mode !== "disabled") {
     createParams.temperature = 0.35;
   }
+}
+
+export function buildMessageCreateParams(
+  stage: ClaudeBatchStage,
+  userPrompt: string,
+): MessageCreateParamsNonStreaming & {
+  thinking?: { type: "adaptive" };
+  output_config?: { effort: "low" };
+  temperature?: number;
+} {
+  const createParams: MessageCreateParamsNonStreaming & {
+    thinking?: { type: "adaptive" };
+    output_config?: { effort: "low" };
+    temperature?: number;
+  } = {
+    model: claudeModelForStage(stage),
+    max_tokens: CLAUDE_MAX_TOKENS,
+    messages: [{ role: "user" as const, content: userPrompt }],
+  };
+  const thinking = claudeThinkingForStage(stage);
+  if (stage === "roteiro") {
+    if (thinking === "adaptive") {
+      (createParams as MessageCreateParamsNonStreaming & { thinking: unknown }).thinking = {
+        type: "adaptive",
+      };
+    } else if (thinking && thinking !== "disabled") {
+      createParams.temperature = 0.7;
+    }
+  } else {
+    applyStructuredJsonCallParams(createParams, thinking);
+  }
+  return createParams;
+}
+
+export async function runClaudeUserPrompt(input: {
+  stage: ClaudeBatchStage;
+  userPrompt: string;
+  projectId?: number;
+  blockNumber?: number;
+  customIdSuffix?: string;
+  emptyError: string;
+}): Promise<string> {
+  const params = buildMessageCreateParams(input.stage, input.userPrompt);
+
+  if (claudeDeliveryFromEnv() === "sync") {
+    const response = await getClient().messages.create(params);
+    const textOut = response.content
+      .filter((part: { type: string }) => part.type === "text")
+      .map((part) => ("text" in part ? part.text : ""))
+      .join("\n")
+      .trim();
+    if (!textOut) {
+      const reason = "stop_reason" in response ? String(response.stop_reason) : "unknown";
+      throw new Error(`${input.emptyError} (stop_reason=${reason})`);
+    }
+    return textOut;
+  }
+
+  const customId =
+    input.projectId !== undefined && input.blockNumber !== undefined
+      ? buildBatchCustomId(input.projectId, input.stage, input.blockNumber, input.customIdSuffix)
+      : `adhoc-${input.stage}-${Date.now()}`;
+
+  const { id: batchId } = await createClaudeMessageBatch([{ custom_id: customId, params }]);
+  let jobRowId: number | undefined;
+  if (input.projectId !== undefined) {
+    jobRowId = insertClaudeBatchJob({
+      projectId: input.projectId,
+      stage: input.stage,
+      blockNumber: input.blockNumber ?? null,
+      customId,
+      batchId,
+    });
+  }
+  const ended = await pollClaudeBatchUntilEnded(batchId);
+  const { processing_status, request_counts } = ended;
+  if (
+    !isClaudeBatchSuccess(
+      processing_status,
+      request_counts.errored,
+      request_counts.expired,
+    )
+  ) {
+    throw new Error(
+      `${input.emptyError} — Claude batch ${batchId} terminou com errored=${request_counts.errored} expired=${request_counts.expired}`,
+    );
+  }
+
+  const results = await streamClaudeBatchResults(batchId);
+  const line = results.find((r) => r.custom_id === customId);
+  if (!line?.result || line.result.type !== "succeeded") {
+    const err = line?.result?.error;
+    throw new Error(
+      `${input.emptyError} — batch item ${customId} falhou: ${err?.type ?? "unknown"} ${err?.message ?? ""}`,
+    );
+  }
+  const textOut = extractTextFromBatchMessage(line.result.message);
+  if (!textOut) {
+    throw new Error(`${input.emptyError} — resposta vazia no batch ${customId}`);
+  }
+  if (jobRowId !== undefined) {
+    updateClaudeBatchJob(jobRowId, {
+      status: "ended",
+      outcome: "done",
+      error_message: null,
+    });
+  }
+  return textOut;
 }
 
 export async function generateScriptBlock(input: {
@@ -48,9 +171,8 @@ export async function generateScriptBlock(input: {
   previousBlocksText?: string;
   blockNumber: number;
   totalBlocks: number;
+  projectId?: number;
 }): Promise<string> {
-  const anthropic = getClient();
-
   const formattedPrompt = input.promptBase
     .replaceAll("[NOME DO NICHO]", input.niche)
     .replaceAll("[PUBLICO]", input.audience)
@@ -103,29 +225,13 @@ ${formatRules}
 ${previousBlocksSection ? `${previousBlocksSection}\n\n` : ""}${referenceBlock ? `${referenceBlock}` : ""}
 `.trim();
 
-  const createParams: MessageCreateParamsNonStreaming = {
-    model: CLAUDE_MODEL,
-    max_tokens: CLAUDE_MAX_TOKENS,
-    messages: [{ role: "user" as const, content: userPrompt }],
-  };
-
-  if (CLAUDE_THINKING === "adaptive") {
-    (createParams as MessageCreateParamsNonStreaming & { thinking: unknown }).thinking = { type: "adaptive" };
-  } else {
-    createParams.temperature = 0.7;
-  }
-
-  const response = await anthropic.messages.create(createParams);
-
-  const textChunks = response.content
-    .filter((part: { type: string }) => part.type === "text")
-    .map((part) => ("text" in part ? part.text : ""))
-    .join("\n")
-    .trim();
-
-  if (!textChunks) {
-    throw new Error(`Claude retornou conteudo vazio para bloco ${input.blockNumber}`);
-  }
+  const textChunks = await runClaudeUserPrompt({
+    stage: "roteiro",
+    userPrompt,
+    projectId: input.projectId,
+    blockNumber: input.blockNumber,
+    emptyError: `Claude retornou roteiro vazio para bloco ${input.blockNumber}`,
+  });
 
   const cleaned = sanitizeScriptBlockContent(textChunks);
   if (!cleaned) {
@@ -178,7 +284,7 @@ Respect the stock_ratio for source distribution.
 
   if (CLAUDE_THINKING === "adaptive") {
     (createParams as MessageCreateParamsNonStreaming & { thinking: unknown }).thinking = { type: "adaptive" };
-  } else {
+  } else if (CLAUDE_THINKING && CLAUDE_THINKING !== "disabled") {
     createParams.temperature = 0.4;
   }
 
@@ -202,8 +308,8 @@ export async function generateSegmentationPlanJson(input: {
   totalBlocks: number;
   blockText: string;
   maxScenes: number;
+  projectId?: number;
 }): Promise<string> {
-  const anthropic = getClient();
   const userPrompt = `
 ${input.promptBase}
 
@@ -219,31 +325,13 @@ ${input.blockText}
 Return ONLY JSON following segmenta01 schema (schema_version "2.0-segmentation", stage "segmentation").
 `.trim();
 
-  const createParams: MessageCreateParamsNonStreaming & {
-    thinking?: { type: "adaptive" };
-    output_config?: { effort: "low" };
-    temperature?: number;
-  } = {
-    model: CLAUDE_MODEL,
-    max_tokens: CLAUDE_MAX_TOKENS,
-    messages: [{ role: "user" as const, content: userPrompt }],
-  };
-  applyStructuredJsonCallParams(createParams);
-
-  const response = await anthropic.messages.create(createParams);
-  const textOut = response.content
-    .filter((part: { type: string }) => part.type === "text")
-    .map((part) => ("text" in part ? part.text : ""))
-    .join("\n")
-    .trim();
-
-  if (!textOut) {
-    const reason = "stop_reason" in response ? String(response.stop_reason) : "unknown";
-    throw new Error(
-      `Claude retornou segmentacao vazia para bloco ${input.blockNumber} (stop_reason=${reason})`
-    );
-  }
-  return textOut;
+  return runClaudeUserPrompt({
+    stage: "segmentation",
+    userPrompt,
+    projectId: input.projectId,
+    blockNumber: input.blockNumber,
+    emptyError: `Claude retornou segmentacao vazia para bloco ${input.blockNumber}`,
+  });
 }
 
 export async function generateVisualizationPlanJson(input: {
@@ -257,8 +345,9 @@ export async function generateVisualizationPlanJson(input: {
   maxVideos: number;
   maxImages: number;
   visualModality?: "default" | "wojak";
+  projectId?: number;
+  customIdSuffix?: string;
 }): Promise<string> {
-  const anthropic = getClient();
   const signals =
     input.manualCaptureSignals.length > 0
       ? JSON.stringify(input.manualCaptureSignals)
@@ -289,30 +378,13 @@ ${input.segmentationJson}
 Return ONLY JSON following visualiza01 schema (schema_version "2.0-visualization").
 `.trim();
 
-  const createParams: MessageCreateParamsNonStreaming & {
-    thinking?: { type: "adaptive" };
-    output_config?: { effort: "low" };
-    temperature?: number;
-  } = {
-    model: CLAUDE_MODEL,
-    max_tokens: CLAUDE_MAX_TOKENS,
-    messages: [{ role: "user" as const, content: userPrompt }],
-  };
-  applyStructuredJsonCallParams(createParams);
-
-  const response = await anthropic.messages.create(createParams);
-  const textOut = response.content
-    .filter((part: { type: string }) => part.type === "text")
-    .map((part) => ("text" in part ? part.text : ""))
-    .join("\n")
-    .trim();
-
-  if (!textOut) {
-    const reason = "stop_reason" in response ? String(response.stop_reason) : "unknown";
-    throw new Error(
-      `Claude retornou visualizacao vazia para bloco ${input.blockNumber} (stop_reason=${reason})`
-    );
-  }
-  return textOut;
+  return runClaudeUserPrompt({
+    stage: "visualization",
+    userPrompt,
+    projectId: input.projectId,
+    blockNumber: input.blockNumber,
+    customIdSuffix: input.customIdSuffix,
+    emptyError: `Claude retornou visualizacao vazia para bloco ${input.blockNumber}`,
+  });
 }
 

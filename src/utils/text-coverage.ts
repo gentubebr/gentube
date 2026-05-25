@@ -8,6 +8,8 @@ export function normalizeForCoverage(raw: string): string {
   return raw
     .replace(/\uFEFF/g, "")
     .replace(ZERO_WIDTH, "")
+    // Separadores Markdown no roteiro (---) nao entram na narracao por cena
+    .replace(/^\s*---\s*$/gm, " ")
     .normalize("NFC")
     // Aspas/apóstrofos tipográficos → ASCII (evita falha de cobertura quando o modelo copia ' mas o bloco tem ')
     .replace(/[\u2018\u2019\u201A\u201B]/g, "'")

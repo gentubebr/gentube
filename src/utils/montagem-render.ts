@@ -161,12 +161,62 @@ export async function concatClipsWithXfade(input: {
 
   await fs.mkdir(path.dirname(outPath), { recursive: true });
 
+  const maxSingle = cfg.xfadeMaxScenesSinglePass;
+  if (clipPaths.length > maxSingle) {
+    await concatClipsWithXfadeChunked(cfg, clipPaths, outPath, maxSingle);
+    return;
+  }
+
   if (cfg.xfadeConcatMode === "pairwise") {
     await concatClipsWithXfadePairwise(cfg, clipPaths, outPath);
     return;
   }
 
   await concatClipsWithXfadeSinglePass(cfg, clipPaths, outPath);
+}
+
+/** Lotes single-pass + merge final (blocos com 80+ cenas). */
+async function concatClipsWithXfadeChunked(
+  cfg: MontagemConfig,
+  clipPaths: string[],
+  outPath: string,
+  chunkSize: number,
+): Promise<void> {
+  const chunks: string[][] = [];
+  for (let i = 0; i < clipPaths.length; i += chunkSize) {
+    chunks.push(clipPaths.slice(i, i + chunkSize));
+  }
+
+  const chunkOuts: string[] = [];
+  const base = path.basename(outPath);
+  for (let i = 0; i < chunks.length; i += 1) {
+    const part = chunks[i]!;
+    const chunkPath =
+      chunks.length === 1
+        ? outPath
+        : path.join(path.dirname(outPath), `.xfade-chunk-${i}-${base}`);
+    if (part.length === 1) {
+      await fs.copyFile(part[0]!, chunkPath);
+    } else if (cfg.xfadeConcatMode === "pairwise") {
+      await concatClipsWithXfadePairwise(cfg, part, chunkPath);
+    } else {
+      await concatClipsWithXfadeSinglePass(cfg, part, chunkPath);
+    }
+    chunkOuts.push(chunkPath);
+  }
+
+  if (chunkOuts.length === 1) {
+    if (chunkOuts[0] !== outPath) await fs.copyFile(chunkOuts[0]!, outPath);
+    return;
+  }
+
+  try {
+    await concatClipsWithXfade({ cfg, clipPaths: chunkOuts, outPath });
+  } finally {
+    for (const p of chunkOuts) {
+      if (p !== outPath) await fs.unlink(p).catch(() => {});
+    }
+  }
 }
 
 /** Um encode para N cenas (em vez de N-1 encodes sobre video cada vez maior). */

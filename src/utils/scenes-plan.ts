@@ -148,6 +148,18 @@ export function parseSegmentationJson(
     });
   }
   validateSceneTextsCoverBlock(blockText, scenes.map((x) => x.narration_text));
+  const maxWordsPerScene = Math.max(
+    40,
+    parseInt(process.env.GENTUBE_MAX_WORDS_PER_SCENE ?? "120", 10) || 120,
+  );
+  for (const s of scenes) {
+    if (s.narration_word_count > maxWordsPerScene) {
+      throw new Error(
+        `Segmentacao: ${s.id} tem ${s.narration_word_count} palavras (limite ${maxWordsPerScene}). ` +
+          `Aumente max_images/max_videos (max_scenes) ou regenere a segmentacao.`,
+      );
+    }
+  }
   if (opts?.maxScenes !== undefined && scenes.length > opts.maxScenes) {
     throw new Error(
       `Segmentacao: ${scenes.length} cenas excede o limite ${opts.maxScenes} para este bloco (ajuste max_images/max_videos ou regenere)`,
@@ -330,6 +342,25 @@ export function parseVisualizationMerge(
   };
   assertWojakBlockPlan(plan);
   return plan;
+}
+
+/** Une duas metades de visualizacao (split por limite de tokens) num unico JSON bruto. */
+export function mergeVisualizationRawHalves(rawA: string, rawB: string): string {
+  const unwrap = (raw: string) => {
+    const u = unwrapJsonFromModel(raw);
+    return JSON.parse(u) as Record<string, unknown>;
+  };
+  const a = unwrap(rawA);
+  const b = unwrap(rawB);
+  const scenesA = Array.isArray(a.scenes) ? a.scenes : [];
+  const scenesB = Array.isArray(b.scenes) ? b.scenes : [];
+  const merged = {
+    schema_version: a.schema_version ?? b.schema_version ?? "2.0-visualization",
+    block_number: a.block_number ?? b.block_number,
+    total_blocks: a.total_blocks ?? b.total_blocks,
+    scenes: [...scenesA, ...scenesB],
+  };
+  return JSON.stringify(merged);
 }
 
 export function isBlockScenesPlanV2(raw: unknown): raw is BlockScenesPlanV2 {

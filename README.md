@@ -170,6 +170,12 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `GENTUBE_VIDEO_BACKEND` | Opcional | `auto`, `veo`, `higgsfield`, `magnific` — em modo **wojak** o render de vídeo usa **Veo** |
 | `GENTUBE_COST_USD_*` | Opcional | Tarifas USD para `cost-estimate` (Claude plano, Gemini sync/batch, Veo/s) — ver `.env.example` |
 | `GENTUBE_FORCE_VIZ_REGEN` | Opcional | `1` / `true` / `yes`: força **nova** segmentação/visualização Claude e apaga jobs HF do bloco no retry (ignora `blockNN.assets.json` e `.error` no disco; com `--plan-only` não reutiliza plano antigo) |
+| `GENTUBE_CLAUDE_DELIVERY` | Opcional | `batch` (default, −50% custo) ou `sync` (debug) |
+| `GENTUBE_MAX_SCENES_DYNAMIC` | Opcional | `1`: calcula `max_scenes` por palavras do bloco (sec. 24 ESPECIFICACAO) |
+| `GENTUBE_MAX_SCENES_WORDS_DIVISOR` | Opcional | Divisor da fórmula (default `22`) |
+| `GENTUBE_MAX_SCENES_CAP` | Opcional | Teto de cenas por bloco (default `100`) |
+| `GENTUBE_MAX_WORDS_PER_SCENE` | Opcional | Rejeita cenas > N palavras na segmentação (default `120`) |
+| `GENTUBE_CLAUDE_BATCH_POLL_INTERVAL` | Opcional | Poll `claude:sync --watch` (default `60s`) |
 | `GENTUBE_REMOTE_HOST` | Opcional | Host SSH remoto para `copy-cmd` (ex.: `dev-development`); evita `--remote-host` toda vez |
 | `GENTUBE_HF_ASYNC` | Opcional | `1`, `true` ou `yes`: no step **imagens**, enfileira jobs no Higgsfield sem esperar no mesmo comando; use `image:sync` / `higgsfield:sync` (ou `--watch`) para baixar resultados |
 | `HIGGSFIELD_CLI_PATH`, `HIGGSFIELD_CREDENTIALS_PATH`, `HIGGSFIELD_CLI_WAIT_TIMEOUT`, `HIGGSFIELD_API_URL` | Opcionais | Caminho do binário `hf`, credenciais, timeout de `--wait` (modo síncrono), base da API de agents; ver [`.env.example`](.env.example) |
@@ -242,7 +248,16 @@ npm run gentube -- run-step --project 1 --step narracao
 # 4b) Step imagens — limites vêm do .env (GENTUBE_MAX_*); sobrescreva por corrida, ex.:
 # npm run gentube -- run-step --project 1 --step imagens --max-videos-block1 12 --max-images-other 30
 
-# 5) Roteiro + narração em sequência
+# 5) Pipeline completo Wojak (modo cenas, 100% imagens batch, com rastreio SQLite + JSON)
+# Ordem: roteiro → imagens → image_sync → narracao → montagem → thumbnails
+npm run gentube -- run-pipeline --project 1 --voice-id <ELEVENLABS_VOICE_ID>
+# Retomar após falha — use a etapa correta (ordem: roteiro → imagens → image_sync → narracao → montagem):
+npm run gentube -- run-pipeline --project 1 --from-stage imagens --voice-id <id>
+# ATENÇÃO: --from-stage narracao NÃO executa imagens (etapa anterior na ordem do pipeline)
+# Ver onde parou / erros por bloco:
+npm run gentube -- pipeline-report --project 1
+
+# 5b) Legado: só roteiro + narração (sem imagens/montagem)
 npm run gentube -- run-all --project 1
 
 # 6) Consultar status
@@ -335,6 +350,22 @@ npm run gentube -- retry --project <slug> --stage narracao --block 1 \
 
 Equivalente: `run-step --step narracao --block 1 --force-narracao --voice-id <id>`. Requer `blockNN.assets.json` (schema 2.0) antes da narração por cena — ver [wojak.md](wojak.md).
 
+### `run-pipeline` (corrida completa com rastreio)
+
+Comando único para o fluxo Wojak **modo cenas**, **100% imagens** (vídeos forçados a 0), batch Google, narração, montagem e thumbnails opcionais.
+
+| Onde ver o que aconteceu | Conteúdo |
+|------------------------|----------|
+| `pipeline_runs` / `pipeline_run_steps` (SQLite) | Cada etapa e bloco: `success`, `error`, `skipped`, `attempt`, `error_message` |
+| `project_logs` (`stage=pipeline`) | Eventos de início/fim e resumo |
+| `05 - Modelagem/pipeline-run-<id>.json` | Relatório completo da corrida |
+| `05 - Modelagem/pipeline-run-latest.json` | Cópia da última corrida |
+| `npm run gentube -- pipeline-report --project <slug>` | Resumo legível no terminal |
+
+Por defeito **`--continue-on-error`**: um bloco com erro não aborta os restantes; o status final fica `partial`. Use `--no-continue-on-error` para parar cedo. Retome com `--from-stage` na **ordem do pipeline** (`roteiro` → `imagens` → `image_sync` → `narracao` → `montagem` → `thumbnails`). Etapas **anteriores** à `--from-stage` são ignoradas — ex.: `--from-stage narracao` **não** gera imagens.
+
+`.env` recomendado: `GENTUBE_VISUAL_MODALITY=wojak`, `GENTUBE_SCENE_PLAN_V2=1`, `GENTUBE_IMAGE_BACKEND=gemini`, `GENTUBE_HF_ASYNC=0`.
+
 **Background (vários blocos — narração + renders Wojak):** script `scripts/background-wojak-blocks.sh` + `image:sync --watch` noutro terminal. Detalhes em [wojak.md](wojak.md) (secção *Execução em background*).
 
 **Imagens:** `run-step --step imagens` **salta blocos** em que `media_blocks` já tem plano e renders concluídos (e, em modo assíncrono, sem jobs `image_jobs` / `hf_cli_jobs` pendentes para esse bloco). Para trabalho feito fora do CLI, o `sync-from-disk --only imagens` valida `blockNN.assets.json` + ficheiros em `renders/blockNN/` e grava o estado no SQLite.
@@ -350,7 +381,42 @@ Equivalente: `run-step --step narracao --block 1 --force-narracao --voice-id <id
 
 **Lista de capturas manuais:** `npm run gentube -- shot-list-manual --project <id>` gera `shot_list_manual.md` / `.csv` a partir dos planos 2.0.
 
-Detalhes: **secções 18.9, 18.10 e 21** de `ESPECIFICACAO_TECNICA.md`. Modalidade Wojak: **[wojak.md](wojak.md)**.
+Detalhes: **secções 18.9, 18.10, 21 e 24** de `ESPECIFICACAO_TECNICA.md`. Modalidade Wojak: **[wojak.md](wojak.md)**.
+
+### Claude Message Batches (roteiro + planos) — obrigatório em produção
+
+O GenTube usa a **Message Batches API** da Anthropic para roteiro, segmentação e visualização (`GENTUBE_CLAUDE_DELIVERY=batch`, default). Custo ~**50%** do modo síncrono. **Imagens** continuam no **Google Batch** (`image:sync`) — são APIs diferentes.
+
+| Variável | Default | Função |
+|----------|---------|--------|
+| `GENTUBE_CLAUDE_DELIVERY` | `batch` | `batch` ou `sync` (só debug local) |
+| `GENTUBE_MAX_SCENES_DYNAMIC` | `1` | `max_scenes = min(100, ceil(palavras/22))` por bloco |
+| `GENTUBE_MAX_WORDS_PER_SCENE` | `120` | Rejeita segmentação com “última cena gigante” |
+| `GENTUBE_CLAUDE_MODEL_SEGMENTATION` | (opcional) | Ex.: `claude-sonnet-4-6` para planos |
+| `GENTUBE_CLAUDE_THINKING_PLAN` | `disabled` | Seg/viz JSON — evita truncar saída |
+
+**Fluxo por projeto:** roteiro (batch) → imagens plano seg+viz (batch, poll inline) → `image:sync` (Google) → narração → montagem.
+
+**Roteiro já escrito (fora do Claude):** copie `block01.md` … `blockNN.md` para `01 - Roteiro/` e alinhe o SQLite sem gastar API:
+
+```bash
+npm run gentube -- sync-from-disk --project <slug> --only roteiro
+npm run gentube -- run-step --project <slug> --step imagens --scene-plan-v2 --plan-only
+```
+
+`create-video --mode iterativo` cria só a pasta; não chame `--step roteiro` se os `.md` já existem.
+
+**Montagem — blocos com 80+ cenas:** concatenação em lotes (`GENTUBE_MONTAGEM_XFADE_MAX_SCENES_SINGLE`, default 40). Evita `ffmpeg: exit null` ao fundir 100+ clipes num único `filter_complex`.
+
+**Wojak só PNG (perfil `wojak-images-only`):** com `max_videos=0`, cenas `type: video` no plano recebem **bootstrap PNG** e **não** chamam Veo no render (`src/services/pipeline.ts`). A montagem usa `scXX__bootstrap.png` se não houver `.mp4`.
+
+**Google Gemini — teto de gastos:** `429 RESOURCE_EXHAUSTED` com mensagem *monthly spending cap* bloqueia batch/sync e bootstrap sync. Aumente o cap em [AI Studio Spend](https://ai.studio/spend) ou aguarde o reset; `image:sync` em loop não resolve até a cota voltar.
+
+```bash
+npm run gentube -- claude:sync --project <slug> --watch   # batches Claude ainda pending (auxiliar)
+```
+
+**Erro típico bloco longo (ex. bloco 6):** JSON de visualização inválido = resposta truncada porque `max_scenes` fixo (50) forçou uma única cena com centenas de palavras. Com `GENTUBE_MAX_SCENES_DYNAMIC=1` e split de visualização (>70 cenas), o pipeline evita isso. Ver **secção 24** da especificação técnica.
 
 **Modo Wojak v2 (resumo):** `GENTUBE_VISUAL_MODALITY=wojak` + `--scene-plan-v2`. Imagens estáticas → **Google Batch com PNG Wojak** (opção B, forçado no código); bootstrap de vídeo → sync; Veo → sync (`GENTUBE_WOJAK_VEO_USE_REF=0` por defeito). Estimativa: `npm run gentube -- cost-estimate --project <id>`. Produção: `plan-only` → `narracao` → `retry`/`imagens` → `image:sync --watch`. Se **quota Veo (429)** travar o `retry` no primeiro vídeo: `npx tsx scripts/continue-missing-renders.ts --project <id> --block N` + `image:sync`, depois `retry` quando a cota voltar. **Node 23** recomendado no PATH (`better-sqlite3`). Detalhes: [wojak.md](wojak.md).
 
@@ -427,9 +493,8 @@ Regras de negócio, modelo de dados, contratos de comandos e decisões de implem
 
 ## Roadmap
 
-- Implementar `image_jobs`, `gemini:image`, `image:sync` e flags `--google-batch-mode` / `--batch-local` (spec sec. 22).
-- Migrar imagens de `hf_cli_jobs` → `image_jobs`.
-- Incluir steps no `run-all` ou comando `run-all --with-imagens`.
+- **Claude Message Batches** — implementado (`GENTUBE_CLAUDE_DELIVERY`, `claude:sync`, `max_scenes` dinâmico). Ver **sec. 24** da especificação.
+- Roteiro 10 blocos / 1 porta (opcional) para alinhar matriz “10 portas” sem >100 cenas/bloco.
 - Step **montagem** implementado: `run-step --step montagem` (ver **sec. 23** e `.env.example`).
 
 ## Licença

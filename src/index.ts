@@ -45,6 +45,8 @@ import {
   submitPendingGoogleBatches,
   syncImageJobsOnce,
 } from "./services/image-sync.js";
+import { CLAUDE_BATCH_POLL_INTERVAL_MS } from "./config.js";
+import { syncClaudeBatchesOnce } from "./services/claude-sync.js";
 import type { ImagensVideosOptions } from "./services/pipeline.js";
 import { processLocalImageBatch } from "./services/image-local-batch.js";
 import { syncHiggsfieldCliJobsOnce } from "./services/hf-cli-sync.js";
@@ -73,6 +75,13 @@ import {
 } from "./integrations/higgsfield-agents.js";
 import { getSubscriptionInfo } from "./integrations/elevenlabs.js";
 import { CLI_HELP } from "./cli-help.js";
+import {
+  printPipelineReport,
+  runFullPipeline,
+  type PipelineProfile,
+  type PipelineStage,
+} from "./services/pipeline-orchestrator.js";
+import { parseIntervalMs } from "./utils/parse-interval.js";
 
 type ProjectRow = Record<string, unknown>;
 
@@ -374,20 +383,24 @@ program
 
     console.log(chalk.green(`Projeto criado com sucesso (id: ${projectId}) em ${projectPath}`));
 
-    let mode: "iterativo" | "sequencial";
+    let mode: "iterativo" | "sequencial" | "pipeline";
     const modeFlag = opts.mode?.trim().toLowerCase();
     if (modeFlag) {
-      if (modeFlag === "iterativo" || modeFlag === "sequencial") {
+      if (modeFlag === "iterativo" || modeFlag === "sequencial" || modeFlag === "pipeline") {
         mode = modeFlag;
       } else {
-        throw new Error('--mode deve ser "iterativo" ou "sequencial"');
+        throw new Error('--mode deve ser "iterativo", "sequencial" ou "pipeline"');
       }
     } else {
-      mode = await select<"iterativo" | "sequencial">({
+      mode = await select<"iterativo" | "sequencial" | "pipeline">({
         message: "Modo de execucao:",
         choices: [
           { value: "iterativo", name: "Iterativo (executar etapa por etapa)" },
-          { value: "sequencial", name: "Sequencial (roteiro + narracao de uma vez)" },
+          { value: "sequencial", name: "Sequencial legado (roteiro + narracao apenas)" },
+          {
+            value: "pipeline",
+            name: "Pipeline completo Wojak (roteiro → imagens → sync → narracao → montagem → thumbs)",
+          },
         ],
       });
     }
@@ -397,8 +410,12 @@ program
 
     if (mode === "sequencial") {
       await executeAll(project, undefined, opts.promptMatrix, opts.promptCanalVoice);
+    } else if (mode === "pipeline") {
+      const voiceId = await resolveVoiceId(undefined);
+      const summary = await invokeRunPipeline(project, { voiceId, promptMatrix: opts.promptMatrix, promptCanalVoice: opts.promptCanalVoice });
+      if (summary.status !== "success") process.exitCode = 1;
     } else {
-      console.log(chalk.cyan("Projeto criado. Use run-step para executar as etapas."));
+      console.log(chalk.cyan("Projeto criado. Use run-step ou run-pipeline para executar as etapas."));
     }
   });
 
@@ -552,7 +569,7 @@ program
 
 program
   .command("run-all")
-  .description("Roteiro (todos os blocos) e narracao em sequencia — nao inclui imagens/thumbnails")
+  .description("Legado: roteiro + narracao apenas (preferir run-pipeline para Wojak completo)")
   .addHelpText("after", CLI_HELP.runAll)
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto em video_projects")
   .option("--voice-id <id>", "Voice ElevenLabs (ou .env ELEVENLABS_VOICE_ID)")
@@ -569,6 +586,65 @@ program
     if (!project) throw new Error("Projeto nao encontrado");
     const voiceId = await resolveVoiceId(options.voiceId);
     await executeAll(project, voiceId, options.promptMatrix, options.promptCanalVoice);
+  });
+
+program
+  .command("run-pipeline")
+  .description(
+    "Pipeline completo com rastreio (SQLite pipeline_runs): roteiro → imagens v2 → image_sync → narracao → montagem → thumbnails",
+  )
+  .addHelpText("after", CLI_HELP.runPipeline)
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .option("--profile <nome>", "Perfil de corrida (default: wojak-images-only)", "wojak-images-only")
+  .option("--voice-id <id>", "ElevenLabs (ou .env ELEVENLABS_VOICE_ID)")
+  .option("--avatar-file <caminho>", "Avatar Wojak opcional")
+  .option(
+    "--prompt-matrix <ficheiro>",
+    "Roteiro: Prompts/ (ex. matriz_tutorial.md)",
+  )
+  .option("--prompt-canal-voice <ficheiro>", "Roteiro bloco 1: voz do canal")
+  .option("--from-stage <etapa>", "Retomar a partir de: roteiro | imagens | image_sync | narracao | montagem | thumbnails")
+  .option(
+    "--through-stage <etapa>",
+    "Parar apos esta etapa (ex. imagens_retry = so roteiro + imagens batch, sem narracao/montagem)",
+  )
+  .option("--only-imagens", "Atalho: --through-stage imagens_retry (0 videos, perfil wojak-images-only)")
+  .option("--no-continue-on-error", "Para no primeiro erro fatal (default: continua e registra)")
+  .option("--max-retries-per-block <n>", "Tentativas por bloco em roteiro/imagens/narracao", "2")
+  .option("--max-videos-block1 <n>", "Forcado a 0 no perfil wojak-images-only")
+  .option("--max-images-block1 <n>", `Max imagens bloco 1 (default ${DEFAULT_MAX_IMAGES_BLOCK1})`)
+  .option("--max-images-other <n>", `Max imagens blocos 2..N (default ${DEFAULT_MAX_IMAGES_OTHER_BLOCKS})`)
+  .option("--scene-plan-v2", "Plano por cenas (default se GENTUBE_SCENE_PLAN_V2=1)")
+  .option("--google-batch-mode", "Batch API Google para imagens")
+  .option("--image-sync-interval <dur>", "Pausa entre rodadas image_sync", "30s")
+  .option("--image-sync-max-rounds <n>", "Max rodadas de poll batch", "500")
+  .option("--skip-thumbnails", "Nao gerar thumbnails")
+  .option("--reference-url <url>", "Thumbnails: referencia YouTube")
+  .option("--count <n>", "Thumbnails: quantidade", "2")
+  .option("--prompt <texto>", "Thumbnails: prompt")
+  .option("--montagem-force", "Re-encode montagem")
+  .option("--montagem-scenes-only", "Montagem: so clipes scXX.mp4")
+  .option("--montagem-assemble-only", "Montagem: so blockNN.mp4")
+  .action(async (options: RunPipelineCliOptions & { project: string }) => {
+    const project = getProjectByIdOrSlug(options.project);
+    if (!project) throw new Error("Projeto nao encontrado");
+    const voiceId = await resolveVoiceId(options.voiceId);
+    const summary = await invokeRunPipeline(project, { ...options, voiceId });
+    if (summary.status !== "success") process.exitCode = 1;
+  });
+
+program
+  .command("pipeline-report")
+  .description("Relatorio da ultima (ou especifica) execucao run-pipeline")
+  .addHelpText("after", CLI_HELP.pipelineReport)
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .option("--run-id <n>", "ID em pipeline_runs (default: ultima corrida)")
+  .action(async (options: { project: string; runId?: string }) => {
+    const project = getProjectByIdOrSlug(options.project);
+    if (!project) throw new Error("Projeto nao encontrado");
+    const runId = options.runId?.trim() ? parseInt(options.runId, 10) : undefined;
+    if (runId !== undefined && Number.isNaN(runId)) throw new Error("--run-id invalido");
+    printPipelineReport(Number(project.id), runId);
   });
 
 program
@@ -843,6 +919,48 @@ program
         await new Promise((r) => setTimeout(r, GEMINI_BATCH_POLL_INTERVAL_MS));
       }
     }
+  );
+
+program
+  .command("claude:sync")
+  .description("Poll de Message Batches Anthropic pendentes (claude_batch_jobs)")
+  .addHelpText("after", CLI_HELP.claudeSync)
+  .option("--project <idOuSlug>", "Somente batches deste projeto")
+  .option("--watch", "Repete ate nao restar job Claude pendente")
+  .option("--interval <dur>", "Pausa entre rodadas no --watch", "60s")
+  .action(
+    async (options: { project?: string; watch?: boolean; interval?: string }) => {
+      let projectId: number | undefined;
+      let projectPath = "";
+      if (options.project?.trim()) {
+        const p = getProjectByIdOrSlug(options.project.trim());
+        if (!p) throw new Error("Projeto nao encontrado");
+        projectId = Number(p.id);
+        projectPath = String(p.project_path);
+      }
+      const { parseIntervalMs } = await import("./utils/parse-interval.js");
+      const intervalMs = parseIntervalMs(options.interval, CLAUDE_BATCH_POLL_INTERVAL_MS);
+      const runOnce = async () => {
+        const { polled, done, failed } = await syncClaudeBatchesOnce({ projectId, projectPath });
+        console.log(chalk.cyan(`claude:sync: batches=${polled} itens_ok=${done} falhas=${failed}`));
+        return { polled, failed };
+      };
+      if (!options.watch) {
+        await runOnce();
+        return;
+      }
+      let round = 0;
+      while (true) {
+        const { polled, failed } = await runOnce();
+        if (polled === 0 && failed === 0) {
+          console.log(chalk.green("claude:sync --watch: nenhum claude_batch_job pendente."));
+          break;
+        }
+        round += 1;
+        await new Promise((r) => setTimeout(r, intervalMs));
+        if (round > 500) break;
+      }
+    },
   );
 
 program
@@ -1467,6 +1585,123 @@ function parseStep3Limits(options: {
     throw new Error("Politica invalida: --max-images-other deve ser maior que --max-videos-other");
   }
   return parsed;
+}
+
+type RunPipelineCliOptions = {
+  project?: string;
+  profile?: string;
+  voiceId?: string;
+  avatarFile?: string;
+  promptMatrix?: string;
+  promptCanalVoice?: string;
+  fromStage?: string;
+  throughStage?: string;
+  onlyImagens?: boolean;
+  noContinueOnError?: boolean;
+  maxRetriesPerBlock?: string;
+  maxVideosBlock1?: string;
+  maxImagesBlock1?: string;
+  maxImagesOther?: string;
+  scenePlanV2?: boolean;
+  googleBatchMode?: boolean;
+  imageSyncInterval?: string;
+  imageSyncMaxRounds?: string;
+  skipThumbnails?: boolean;
+  referenceUrl?: string;
+  count?: string;
+  prompt?: string;
+  montagemForce?: boolean;
+  montagemScenesOnly?: boolean;
+  montagemAssembleOnly?: boolean;
+};
+
+const PIPELINE_STAGES: PipelineStage[] = [
+  "roteiro",
+  "imagens",
+  "image_sync",
+  "imagens_retry",
+  "narracao",
+  "montagem",
+  "thumbnails",
+];
+
+async function invokeRunPipeline(
+  project: ProjectRow,
+  options: RunPipelineCliOptions & { voiceId: string },
+) {
+  const profileRaw = (options.profile ?? "wojak-images-only").trim();
+  if (profileRaw !== "wojak-images-only") {
+    throw new Error(`Perfil desconhecido: ${profileRaw}. Disponivel: wojak-images-only`);
+  }
+  const profile = profileRaw as PipelineProfile;
+
+  let fromStage: PipelineStage | undefined;
+  let throughStage: PipelineStage | undefined;
+  if (options.onlyImagens) {
+    throughStage = "imagens_retry";
+  }
+  if (options.throughStage?.trim()) {
+    const s = options.throughStage.trim() as PipelineStage;
+    if (!PIPELINE_STAGES.includes(s)) {
+      throw new Error(`--through-stage invalido. Use: ${PIPELINE_STAGES.join(" | ")}`);
+    }
+    throughStage = s;
+  }
+  if (options.fromStage?.trim()) {
+    const s = options.fromStage.trim() as PipelineStage;
+    if (!PIPELINE_STAGES.includes(s)) {
+      throw new Error(`--from-stage invalido. Use: ${PIPELINE_STAGES.join(" | ")}`);
+    }
+    fromStage = s;
+  }
+  if (
+    fromStage &&
+    throughStage &&
+    PIPELINE_STAGES.indexOf(fromStage) > PIPELINE_STAGES.indexOf(throughStage)
+  ) {
+    throw new Error("--from-stage nao pode ser posterior a --through-stage");
+  }
+
+  let montagemPhase: MontagemPhase | undefined;
+  if (options.montagemScenesOnly) montagemPhase = "scenes";
+  else if (options.montagemAssembleOnly) montagemPhase = "assemble";
+
+  const limits = parseStep3Limits({
+    maxVideosBlock1: "0",
+    maxVideosOther: "0",
+    maxImagesBlock1: options.maxImagesBlock1,
+    maxImagesOther: options.maxImagesOther,
+  });
+
+  const imagensOpts = buildImagensVideosOpts({
+    scenePlanV2: options.scenePlanV2 ?? true,
+    googleBatchMode: options.googleBatchMode ?? true,
+  });
+
+  const maxRetries = Math.max(1, parseInt(options.maxRetriesPerBlock ?? "2", 10) || 2);
+  const avatarAbs = options.avatarFile ? path.resolve(process.cwd(), options.avatarFile) : undefined;
+
+  return runFullPipeline(project, {
+    profile,
+    voiceId: options.voiceId,
+    continueOnError: !options.noContinueOnError,
+    maxRetriesPerBlock: maxRetries,
+    avatarPath: avatarAbs,
+    promptMatrix: options.promptMatrix,
+    promptCanalVoice: options.promptCanalVoice,
+    skipThumbnails: Boolean(options.skipThumbnails) || Boolean(throughStage && throughStage !== "thumbnails"),
+    fromStage,
+    throughStage,
+    imageSyncIntervalMs: parseIntervalMs(options.imageSyncInterval, 30_000),
+    imageSyncMaxRounds: Math.max(1, parseInt(options.imageSyncMaxRounds ?? "500", 10) || 500),
+    limits,
+    imagensOpts,
+    montagemPhase,
+    montagemForce: Boolean(options.montagemForce),
+    thumbnailReferenceUrl: options.referenceUrl,
+    thumbnailCount: Math.max(1, parseInt(options.count ?? "2", 10) || 2),
+    thumbnailPrompt: options.prompt,
+  });
 }
 
 async function executeAll(

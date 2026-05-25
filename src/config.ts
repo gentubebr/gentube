@@ -176,6 +176,59 @@ export const CLAUDE_MAX_TOKENS = Math.max(
 /** Modo thinking: "adaptive" | "disabled" | "" (default: "") */
 export const CLAUDE_THINKING = (process.env.CLAUDE_THINKING ?? "").trim().toLowerCase();
 
+export type ClaudeDeliveryMode = "sync" | "batch";
+
+/** Entrega Claude: batch (50% custo, assincrono) ou sync (debug). Default: batch. */
+export function claudeDeliveryFromEnv(): ClaudeDeliveryMode {
+  const v = (process.env.GENTUBE_CLAUDE_DELIVERY ?? "batch").trim().toLowerCase();
+  if (v === "sync") return "sync";
+  return "batch";
+}
+
+export type ClaudeBatchStage = "roteiro" | "segmentation" | "visualization";
+
+/** Modelo por etapa; fallback CLAUDE_MODEL. */
+export function claudeModelForStage(stage: ClaudeBatchStage): string {
+  const key =
+    stage === "roteiro"
+      ? "GENTUBE_CLAUDE_MODEL_ROTEIRO"
+      : stage === "segmentation"
+        ? "GENTUBE_CLAUDE_MODEL_SEGMENTATION"
+        : "GENTUBE_CLAUDE_MODEL_VISUALIZATION";
+  const specific = (process.env[key] ?? "").trim();
+  return specific || CLAUDE_MODEL;
+}
+
+/** Thinking em pedidos JSON estruturados (seg/viz): default disabled em batch. */
+export function claudeThinkingForStage(stage: ClaudeBatchStage): string {
+  const key =
+    stage === "roteiro"
+      ? "GENTUBE_CLAUDE_THINKING_ROTEIRO"
+      : "GENTUBE_CLAUDE_THINKING_PLAN";
+  const v = (process.env[key] ?? "").trim().toLowerCase();
+  if (v) return v;
+  if (stage === "roteiro") return CLAUDE_THINKING;
+  return process.env.GENTUBE_CLAUDE_THINKING_PLAN?.trim().toLowerCase() || "disabled";
+}
+
+export const CLAUDE_BATCH_POLL_INTERVAL_MS = parseDurationMs(
+  process.env.GENTUBE_CLAUDE_BATCH_POLL_INTERVAL,
+  60_000,
+);
+
+/** max_scenes = min(cap, ceil(palavras/divisor)) quando dinamico ativo. */
+export const MAX_SCENES_DYNAMIC_ENABLED = !["0", "false", "no", "off"].includes(
+  String(process.env.GENTUBE_MAX_SCENES_DYNAMIC ?? "1").toLowerCase(),
+);
+export const MAX_SCENES_WORDS_DIVISOR = Math.max(
+  8,
+  parseInt(process.env.GENTUBE_MAX_SCENES_WORDS_DIVISOR ?? "18", 10) || 18,
+);
+export const MAX_SCENES_CAP = Math.max(
+  20,
+  parseInt(process.env.GENTUBE_MAX_SCENES_CAP ?? "120", 10) || 120,
+);
+
 /**
  * Injeta o texto dos blocos 1..N-1 no prompt do roteiro (coesao entre blocos).
  * Desative com GENTUBE_ROTEIRO_PREV_CONTEXT=0 | false | off.

@@ -14,11 +14,11 @@ ${chalk.bold("Fluxo tipico (projeto por pasta em Videos/<canal>/<data>-<titulo>/
   2. run-step --step roteiro
   3. run-step --step narracao          (ElevenLabs; ver narracao abaixo)
   4. run-step --step imagens           (--scene-plan-v2 recomendado)
-  4b. cost-estimate (modo Wojak) · image:sync --watch
+  4b. cost-estimate (modo Wojak) · image:sync --watch · claude:sync (se batch fire-and-forget)
   5. video:status · video:retry (HF/Veo) · retry imagens (Wojak)
   6. run-step --step montagem          (FFmpeg: clipes + blocos em 06 - Montagem/)
   7. run-step --step thumbnails
-  Ou: run-all (so roteiro + narracao) · retry --stage <etapa> · sync-from-disk
+  Ou: run-pipeline (Wojak completo, com rastreio) · run-all (legado) · retry --stage <etapa>
 
 ${chalk.bold("Etapas do projeto (--project id ou slug da pasta)")}
   roteiro     Claude → 01 - Roteiro/blockNN.md
@@ -31,6 +31,8 @@ ${chalk.bold("Exemplos")}
 ${ex([
   "npm run gentube -- init",
   "npm run gentube -- projects:list",
+  "npm run gentube -- run-pipeline --project 10 --voice-id <id>",
+  "npm run gentube -- pipeline-report --project 10",
   "npm run gentube -- status --project 10",
   "npm run gentube -- run-step --project 10 --step narracao",
   "npm run gentube -- run-step --project 10 --step imagens --scene-plan-v2 --google-batch-mode",
@@ -162,10 +164,49 @@ ${ex([
 `),
 
   runAll: cliHelpAfter(`
-Executa em sequencia: roteiro (todos os blocos) → narracao (todos os blocos).
-Nao inclui imagens nem thumbnails (use run-step ou create-video modo iterativo).
+Legado: roteiro → narracao apenas (ordem antiga, sem plano v2 completo).
+Para Wojak + modo cenas use run-pipeline.
 
 ${chalk.bold("Exemplo")}  npm run gentube -- run-all --project 10 --voice-id <id>
+`),
+
+  runPipeline: cliHelpAfter(`
+Pipeline completo com rastreio em SQLite (pipeline_runs, pipeline_run_steps) e relatorio JSON.
+
+${chalk.bold("Ordem (perfil wojak-images-only)")}
+  roteiro → imagens (plano v2 + Google batch, 0 videos) → image_sync → imagens_retry
+  → narracao (ElevenLabs por cena) → montagem → thumbnails
+
+${chalk.bold("Rastreio")}
+  - Cada passo/bloco: pipeline_run_steps (status, tentativa, error_message)
+  - Logs: project_logs WHERE stage='pipeline'
+  - Relatorio: 05 - Modelagem/pipeline-run-<id>.json e pipeline-run-latest.json
+  - Resumo CLI: pipeline-report --project <slug>
+
+${chalk.bold("Erros")}
+  Por defeito --continue-on-error: regista erro, segue proximo bloco/etapa.
+  Corrija depois com retry --stage <etapa> --block N ou --from-stage <etapa>.
+
+${chalk.bold("Flags principais")}
+  --profile wojak-images-only (default)
+  --voice-id · --avatar-file · --from-stage imagens (retomar)
+  --max-retries-per-block 2 · --no-continue-on-error (parar cedo)
+  --max-images-block1 / --max-images-other (videos forcados a 0)
+  --scene-plan-v2 --google-batch-mode · --image-sync-interval 30s
+
+${chalk.bold("Exemplos")}
+${ex([
+  "npm run gentube -- run-pipeline --project 20260520-meu-video --voice-id <id>",
+  "npm run gentube -- run-pipeline --project 10 --from-stage narracao",
+  "npm run gentube -- pipeline-report --project 10",
+  "npm run gentube -- create-video --mode pipeline --transcript-file Transcripts/ref.txt ...",
+])}
+`),
+
+  pipelineReport: cliHelpAfter(`
+Mostra a ultima execucao run-pipeline (ou --run-id N): passos, erros, dicas e caminho do JSON.
+
+${chalk.bold("Exemplo")}  npm run gentube -- pipeline-report --project 10 --run-id 3
 `),
 
   syncFromDisk: cliHelpAfter(`
@@ -187,6 +228,18 @@ Mostra status_roteiro, status_narracao, status_imagens_videos, status_montagem, 
 e o caminho da pasta do projeto.
 
 Para filas e videos: image:status · video:status
+`),
+
+  claudeSync: cliHelpAfter(`
+Poll de Message Batches API (Anthropic) registados em claude_batch_jobs.
+Producao: GENTUBE_CLAUDE_DELIVERY=batch (50% custo vs sync).
+
+O retry/run-step em modo batch faz poll inline por pedido; use claude:sync
+apenas para batches submetidos em fire-and-forget (futuro) ou retomada manual.
+
+Resultados JSONL: 05 - Modelagem/claude-batches/<batch_id>.jsonl
+
+${chalk.bold("Exemplo")}  npm run gentube -- claude:sync --project <slug> --watch --interval 60s
 `),
 
   imageSync: cliHelpAfter(`
