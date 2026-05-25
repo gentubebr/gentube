@@ -153,11 +153,27 @@ export function getDb(): Database.Database {
   `);
 
   migrateImageJobsColumns(db);
+  migrateImageHashSchema(db);
+  migrateTtsCacheSchema(db);
+  migrateJobQueueSchema(db);
   migrateMontagemSchema(db);
   migratePipelineRunsSchema(db);
   migrateClaudeBatchSchema(db);
+  migrateQualityGateSchema(db);
 
   return db;
+}
+
+/** Colunas do QualityGateAgent em script_blocks — idempotente. */
+function migrateQualityGateSchema(database: Database.Database): void {
+  const cols = database.prepare("PRAGMA table_info(script_blocks)").all() as { name: string }[];
+  const names = new Set(cols.map((c) => c.name));
+  if (!names.has("quality_gate_score")) {
+    database.exec("ALTER TABLE script_blocks ADD COLUMN quality_gate_score INTEGER");
+  }
+  if (!names.has("quality_gate_attempts")) {
+    database.exec("ALTER TABLE script_blocks ADD COLUMN quality_gate_attempts INTEGER NOT NULL DEFAULT 0");
+  }
 }
 
 /** Colunas adicionadas apos deploy inicial — idempotente. */
@@ -166,6 +182,58 @@ function migrateImageJobsColumns(database: Database.Database): void {
   const names = new Set(cols.map((c) => c.name));
   if (!names.has("prompt_text")) {
     database.exec("ALTER TABLE image_jobs ADD COLUMN prompt_text TEXT");
+  }
+}
+
+/** Fila de jobs para o daemon (P8 otimizacao 2026-05-25). */
+function migrateJobQueueSchema(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS job_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      profile TEXT NOT NULL DEFAULT 'wojak-images-only',
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','running','done','failed','cancelled')),
+      priority INTEGER NOT NULL DEFAULT 0,
+      options_json TEXT NOT NULL,
+      run_id INTEGER,
+      worker_pid INTEGER,
+      error_message TEXT,
+      queued_at TEXT NOT NULL,
+      started_at TEXT,
+      finished_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(project_id) REFERENCES video_projects(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_job_queue_status
+      ON job_queue(status, priority DESC, id ASC);
+  `);
+}
+
+/** Cache TTS por hash de texto+voz (P7 otimizacao 2026-05-25). */
+function migrateTtsCacheSchema(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS tts_cache (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      text_hash TEXT NOT NULL UNIQUE,
+      voice_id TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      text_length INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_tts_cache_hash ON tts_cache(text_hash);
+  `);
+}
+
+/** Deduplicacao de imagens por hash de prompt (P6 otimizacao 2026-05-25) — idempotente. */
+function migrateImageHashSchema(database: Database.Database): void {
+  const cols = database.prepare("PRAGMA table_info(image_jobs)").all() as { name: string }[];
+  if (!new Set(cols.map((c) => c.name)).has("prompt_hash")) {
+    database.exec("ALTER TABLE image_jobs ADD COLUMN prompt_hash TEXT");
+    database.exec(
+      "CREATE INDEX IF NOT EXISTS idx_image_jobs_prompt_hash ON image_jobs(prompt_hash, outcome)",
+    );
   }
 }
 

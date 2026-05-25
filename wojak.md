@@ -116,7 +116,6 @@ export GENTUBE_WOJAK_VEO_USE_REF=0          # Veo sem PNG ref; prompt sanitizado
 | `type: image` | `resolveSceneImageDelivery()` → **`google_batch`** em modo wojak | PNG da variant (`src/assets/wojak/`) ou `--avatar-file`; partes via `buildGeminiMultimodalParts` em `gemini-batch.ts` |
 | Bootstrap `scXX__bootstrap` | **sync** (`forceSync: true`) | `buildWojakReferenceImagePrompt(description, negative)` + PNG canónica |
 | `type: video` (Veo) | **sync** (sem batch Veo) | Por defeito **sem** enviar bootstrap ao Veo (`GENTUBE_WOJAK_VEO_USE_REF=0`); bootstrap fica em disco para montagem |
-| `type: video` + `max_videos=0` (perfil imagens-only) | bootstrap sync apenas | **Sem Veo**; montagem usa `scXX__bootstrap.png` |
 
 Poll das imagens em batch: `npm run gentube -- image:sync --project <id> --watch`.
 
@@ -511,10 +510,13 @@ Decisão 2026-05-21: **todo** texto/plano via Anthropic **Message Batches API**;
 | # | Etapa | API | Poll |
 |---|--------|-----|------|
 | 1 | Roteiro `blockNN.md` | Claude batch (`GENTUBE_CLAUDE_DELIVERY=batch`) | inline no CLI |
-| 2 | Plano `blockNN.assets.json` (seg + viz) | Claude batch | inline; split viz se >70 cenas |
-| 3 | Renders `scXX.png` | Google batch | `image:sync --watch` |
-| 4 | Narração `scXX.mp3` | ElevenLabs | — |
-| 5 | Montagem | FFmpeg local | — |
+| 2 | **Quality gate** (score + regen opcional) | Claude Sonnet sync | inline; `GENTUBE_QUALITY_GATE_ENABLED=0` desativa |
+| 3 | Plano `blockNN.assets.json` (seg + viz) | Claude batch | inline; split viz se >70 cenas |
+| 4 | Renders `scXX.png` | Google batch | `image:sync --watch` |
+| 5 | Narração `scXX.mp3` | ElevenLabs (+ cache `tts_cache`) | — |
+| 6 | Montagem | FFmpeg local | — |
+
+**Background:** `job:add --project <slug> --voice-id <id>` + `daemon:start` (fila `job_queue`, sec. **26.10** da especificação). Retomada: `--from-stage imagens` (não `narracao` se faltam PNGs).
 
 ### `.env` Wojak + batch Claude
 
@@ -537,43 +539,6 @@ GENTUBE_IMAGE_DELIVERY=google_batch
 O roteiro de 8 blocos pode incluir **duas “portas”** no mesmo `block06.md` (~1950 palavras). Com `--max-images-other 50` fixo, a segmentação colapsava o excesso em `sc50` e a visualização truncava o JSON.
 
 **Correção:** fórmula dinâmica de cenas + validação 120 palavras/cena + visualização em 2 pedidos se >70 cenas. Ver **ESPECIFICACAO_TECNICA.md §24**.
-
-Para segmentação ainda com mega-cena ou cobertura falhando, use divisor mais agressivo na corrida:
-
-```bash
-GENTUBE_MAX_SCENES_WORDS_DIVISOR=10 npm run gentube -- retry --project <slug> \
-  --stage imagens --block 6 --scene-plan-v2 --plan-only
-```
-
-### Perfil `wojak-images-only` — render sem Veo
-
-`run-pipeline` e `resolveWojakImagesOnlyLimits` forçam `max_videos` a **0** no **plano** Claude. Desde 2026-05-23, o **render** também respeita isso: cenas `type: video` recebem apenas **bootstrap PNG** (`scXX__bootstrap.png`), sem chamada Veo. A montagem usa o bootstrap como imagem (Ken Burns) se não existir `scXX.mp4`.
-
-**Retomada correta após narração pronta:**
-
-```bash
-npm run gentube -- run-pipeline --project <slug> \
-  --from-stage imagens --through-stage montagem \
-  --skip-thumbnails --profile wojak-images-only --voice-id <id>
-```
-
-**Não use** `--from-stage narracao` se ainda faltam PNG — essa etapa **não** executa `imagens`.
-
-### Roteiro externo (sem `step roteiro`)
-
-1. `create-video --mode iterativo` + copiar `blockNN.md` → `01 - Roteiro/`.
-2. `sync-from-disk --only roteiro`.
-3. `run-step --step imagens --scene-plan-v2 --plan-only` (ou `run-pipeline --from-stage imagens`).
-
-Roteiros com linhas `---` entre secções: a normalização de cobertura ignora esses separadores (ver ESPECIFICACAO §24.6).
-
-### Montagem — 80+ cenas por bloco
-
-`GENTUBE_MONTAGEM_XFADE_MAX_SCENES_SINGLE=40` (default): concat em lotes antes de `blockNN.mp4`. Projeto Lottery (~418 cenas, bloco 6 com 80): evitar concat single-pass de 105 clipes.
-
-### Google — monthly spending cap (batch imagens)
-
-Além do 429 de **Veo**, o projeto Google pode devolver *monthly spending cap exceeded* no **batch de imagens** / bootstrap sync. Sintoma: todos os blocos em `imagens` com erro 429; `image:sync` com dezenas de rodadas sem progresso. Resolver no AI Studio Spend antes de retomar `--from-stage imagens`.
 
 ```bash
 # Só destravar bloco 6 após falha
@@ -600,4 +565,4 @@ npm run gentube -- image:sync --project 20260521-The-10-Brutal-Truths-how-AI-End
 
 ---
 
-*Última atualização: 2026-05-21 — Claude Message Batches, max_scenes dinâmico, bloco 6 (projeto 12).*
+*Última atualização: 2026-05-25 — branch `multiagent`: QualityGate, daemon/job_queue, cache TTS, dedup imagens, `GENTUBE_ROTEIRO_STAGE_BATCH`.*

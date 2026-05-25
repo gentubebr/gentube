@@ -1,6 +1,7 @@
 import path from "node:path";
 import chalk from "chalk";
-import { resolveVisualModality } from "../config.js";
+import { resolveVisualModality, roteiroStageBatchEnabled } from "../config.js";
+import { classifyClaudeError, QUOTA_RETRY_DELAY_MS } from "../utils/provider-errors.js";
 import { addProjectLog, getMediaBlock, getNarrationBlock, listScriptBlocks } from "../repository.js";
 import {
   countImageJobsFailed,
@@ -23,6 +24,8 @@ import {
   runImagensVideosBlock,
   runNarracaoBlock,
   runRoteiroBlock,
+  runRoteiroBatchStage,
+  runQualityGateBlock,
   runThumbnails,
 } from "./pipeline.js";
 import { syncImageJobsOnce, countAllImageJobsPending } from "./image-sync.js";
@@ -35,6 +38,7 @@ export type PipelineProfile = "wojak-images-only";
 
 export type PipelineStage =
   | "roteiro"
+  | "quality_gate"
   | "imagens"
   | "image_sync"
   | "imagens_retry"
@@ -44,6 +48,7 @@ export type PipelineStage =
 
 const STAGE_ORDER: PipelineStage[] = [
   "roteiro",
+  "quality_gate",
   "imagens",
   "image_sync",
   "imagens_retry",
@@ -132,13 +137,15 @@ export function assertPipelineProfileEnv(profile: PipelineProfile): string[] {
   return warnings;
 }
 
+type RecordStepResult = { status: PipelineStepStatus; caughtError?: unknown };
+
 async function recordStep(
   runId: number,
   stage: string,
   blockNumber: number | undefined,
   fn: () => Promise<void>,
   opts: { continueOnError: boolean; attempt?: number },
-): Promise<PipelineStepStatus> {
+): Promise<RecordStepResult> {
   const stepId = insertPipelineRunStep({
     runId,
     stage,
@@ -150,12 +157,12 @@ async function recordStep(
   try {
     await fn();
     finishPipelineRunStep(stepId, "success");
-    return "success";
+    return { status: "success" };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     finishPipelineRunStep(stepId, "error", msg);
     if (!opts.continueOnError) throw e;
-    return "error";
+    return { status: "error", caughtError: e };
   }
 }
 
@@ -220,35 +227,94 @@ export async function runFullPipeline(
   if (shouldRunStage(options.fromStage, "roteiro", options.throughStage)) {
     updatePipelineRun(runId, { currentStage: "roteiro" });
     console.log(chalk.bold("\n--- Etapa: roteiro ---\n"));
-    for (let bn = 1; bn <= totalBlocos; bn += 1) {
-      const scriptRow = listScriptBlocks(projectId).find((b) => b.block_number === bn);
-      if (scriptRow?.status === "success" && options.fromStage !== "roteiro") {
-        const stepId = insertPipelineRunStep({ runId, stage: "roteiro", blockNumber: bn, status: "skipped" });
-        finishPipelineRunStep(stepId, "skipped", undefined, { reason: "script_blocks ja success" });
-        bumpStage("roteiro", "skipped");
-        console.log(chalk.dim(`${blockTag(bn, totalBlocos)} Roteiro ja OK, pulando`));
-        continue;
+
+    if (roteiroStageBatchEnabled()) {
+      // Modo batch por etapa: submete todos os blocos pendentes em 1 unico Message Batch.
+      // Tradeoff: sem contexto cruzado entre blocos; economiza latencia de API.
+      const stepId = insertPipelineRunStep({ runId, stage: "roteiro", blockNumber: undefined, status: "pending" });
+      startPipelineRunStep(stepId);
+      try {
+        await runRoteiroBatchStage(project, roteiroOpts);
+        finishPipelineRunStep(stepId, "success");
+        bumpStage("roteiro", "success");
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        finishPipelineRunStep(stepId, "error", msg);
+        bumpStage("roteiro", "error");
+        blockErrors.push({ stage: "roteiro", blockNumber: 0, error: msg, attempts: 1 });
+        if (!options.continueOnError) throw e;
       }
-      let lastErr: string | undefined;
-      let finalStatus: PipelineStepStatus = "error";
-      for (let attempt = 1; attempt <= options.maxRetriesPerBlock; attempt += 1) {
-        finalStatus = await recordStep(
-          runId,
-          "roteiro",
-          bn,
-          () => runRoteiroBlock(project, bn, roteiroOpts),
-          { continueOnError: true, attempt },
-        );
-        if (finalStatus === "success") break;
-        lastErr = `tentativa ${attempt}/${options.maxRetriesPerBlock} falhou`;
-        if (attempt < options.maxRetriesPerBlock) {
-          console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Retry roteiro (${attempt + 1})...`));
+    } else {
+      // Modo sequencial por bloco (default): 1 batch por bloco, contexto cruzado disponivel.
+      for (let bn = 1; bn <= totalBlocos; bn += 1) {
+        const scriptRow = listScriptBlocks(projectId).find((b) => b.block_number === bn);
+        if (scriptRow?.status === "success" && options.fromStage !== "roteiro") {
+          const stepId = insertPipelineRunStep({ runId, stage: "roteiro", blockNumber: bn, status: "skipped" });
+          finishPipelineRunStep(stepId, "skipped", undefined, { reason: "script_blocks ja success" });
+          bumpStage("roteiro", "skipped");
+          console.log(chalk.dim(`${blockTag(bn, totalBlocos)} Roteiro ja OK, pulando`));
+          continue;
+        }
+        let lastErr: string | undefined;
+        let finalStatus: PipelineStepStatus = "error";
+        let attemptsUsed = 0;
+        for (let attempt = 1; attempt <= options.maxRetriesPerBlock; attempt += 1) {
+          attemptsUsed = attempt;
+          const { status, caughtError } = await recordStep(
+            runId,
+            "roteiro",
+            bn,
+            () => runRoteiroBlock(project, bn, roteiroOpts),
+            { continueOnError: true, attempt },
+          );
+          finalStatus = status;
+          if (finalStatus === "success") break;
+          const kind = classifyClaudeError(caughtError);
+          if (kind === "permanent") {
+            lastErr = `erro permanente (sem retry): ${caughtError instanceof Error ? caughtError.message : String(caughtError)}`;
+            console.log(chalk.red(`${blockTag(bn, totalBlocos)} Roteiro — erro permanente, sem retry`));
+            break;
+          }
+          lastErr = `tentativa ${attempt}/${options.maxRetriesPerBlock} falhou`;
+          if (attempt < options.maxRetriesPerBlock) {
+            if (kind === "quota") {
+              console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Roteiro — rate limit, aguardando ${QUOTA_RETRY_DELAY_MS / 1000}s...`));
+              await new Promise((r) => setTimeout(r, QUOTA_RETRY_DELAY_MS));
+            } else {
+              console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Retry roteiro (${attempt + 1})...`));
+            }
+          }
+        }
+        bumpStage("roteiro", finalStatus);
+        if (finalStatus === "error") {
+          blockErrors.push({ stage: "roteiro", blockNumber: bn, error: lastErr ?? "erro", attempts: attemptsUsed });
+          if (!options.continueOnError) break;
         }
       }
-      bumpStage("roteiro", finalStatus);
-      if (finalStatus === "error") {
-        blockErrors.push({ stage: "roteiro", blockNumber: bn, error: lastErr ?? "erro", attempts: options.maxRetriesPerBlock });
-        if (!options.continueOnError) break;
+    }
+  }
+
+  // --- QualityGate (avaliacao + regeneracao dirigida por bloco) ---
+  if (shouldRunStage(options.fromStage, "quality_gate", options.throughStage)) {
+    updatePipelineRun(runId, { currentStage: "quality_gate" });
+    console.log(chalk.bold("\n--- Etapa: quality_gate (avaliacao de qualidade do roteiro) ---\n"));
+    for (let bn = 1; bn <= totalBlocos; bn += 1) {
+      const stepId = insertPipelineRunStep({ runId, stage: "quality_gate", blockNumber: bn, status: "pending" });
+      startPipelineRunStep(stepId);
+      try {
+        const result = await runQualityGateBlock(project, bn, roteiroOpts);
+        const details = { score: result.score, attempts: result.attempts, skipped: result.skipped };
+        finishPipelineRunStep(stepId, "success", undefined, details);
+        bumpStage("quality_gate", "success");
+        if (!result.skipped) {
+          console.log(chalk.dim(`${blockTag(bn, totalBlocos)} QualityGate score=${result.score} (${result.attempts} iteracao(oes))`));
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        finishPipelineRunStep(stepId, "error", msg);
+        bumpStage("quality_gate", "error");
+        blockErrors.push({ stage: "quality_gate", blockNumber: bn, error: msg, attempts: 1 });
+        if (!options.continueOnError) throw e;
       }
     }
   }
@@ -267,8 +333,10 @@ export async function runFullPipeline(
         continue;
       }
       let finalStatus: PipelineStepStatus = "error";
+      let attemptsUsed = 0;
       for (let attempt = 1; attempt <= options.maxRetriesPerBlock; attempt += 1) {
-        finalStatus = await recordStep(
+        attemptsUsed = attempt;
+        const { status, caughtError } = await recordStep(
           runId,
           "imagens",
           bn,
@@ -277,9 +345,20 @@ export async function runFullPipeline(
           },
           { continueOnError: true, attempt },
         );
+        finalStatus = status;
         if (finalStatus === "success") break;
+        const kind = classifyClaudeError(caughtError);
+        if (kind === "permanent") {
+          console.log(chalk.red(`${blockTag(bn, totalBlocos)} Imagens — erro permanente, sem retry`));
+          break;
+        }
         if (attempt < options.maxRetriesPerBlock) {
-          console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Retry imagens (${attempt + 1})...`));
+          if (kind === "quota") {
+            console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Imagens — rate limit, aguardando ${QUOTA_RETRY_DELAY_MS / 1000}s...`));
+            await new Promise((r) => setTimeout(r, QUOTA_RETRY_DELAY_MS));
+          } else {
+            console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Retry imagens (${attempt + 1})...`));
+          }
         }
       }
       bumpStage("imagens", finalStatus);
@@ -288,7 +367,7 @@ export async function runFullPipeline(
           stage: "imagens",
           blockNumber: bn,
           error: "falha plano/render",
-          attempts: options.maxRetriesPerBlock,
+          attempts: attemptsUsed,
         });
       }
     }
@@ -347,7 +426,7 @@ export async function runFullPipeline(
       for (const bn of failedBlocks) {
         const deleted = deleteFailedImageJobsForBlock(projectId, bn);
         console.log(chalk.dim(`${blockTag(bn, totalBlocos)} Removidos ${deleted} image_jobs failed; re-render...`));
-        const st = await recordStep(
+        const { status: st } = await recordStep(
           runId,
           "imagens_retry",
           bn,
@@ -385,22 +464,35 @@ export async function runFullPipeline(
         continue;
       }
       let finalStatus: PipelineStepStatus = "error";
+      let attemptsUsed = 0;
       for (let attempt = 1; attempt <= options.maxRetriesPerBlock; attempt += 1) {
-        finalStatus = await recordStep(
+        attemptsUsed = attempt;
+        const { status, caughtError } = await recordStep(
           runId,
           "narracao",
           bn,
           () => runNarracaoBlock(project, options.voiceId, bn),
           { continueOnError: true, attempt },
         );
+        finalStatus = status;
         if (finalStatus === "success") break;
+        const kind = classifyClaudeError(caughtError);
+        if (kind === "permanent") {
+          console.log(chalk.red(`${blockTag(bn, totalBlocos)} Narracao — erro permanente, sem retry`));
+          break;
+        }
         if (attempt < options.maxRetriesPerBlock) {
-          console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Retry narracao (${attempt + 1})...`));
+          if (kind === "quota") {
+            console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Narracao — rate limit, aguardando ${QUOTA_RETRY_DELAY_MS / 1000}s...`));
+            await new Promise((r) => setTimeout(r, QUOTA_RETRY_DELAY_MS));
+          } else {
+            console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Retry narracao (${attempt + 1})...`));
+          }
         }
       }
       bumpStage("narracao", finalStatus);
       if (finalStatus === "error") {
-        blockErrors.push({ stage: "narracao", blockNumber: bn, error: "ElevenLabs/ffmpeg", attempts: options.maxRetriesPerBlock });
+        blockErrors.push({ stage: "narracao", blockNumber: bn, error: "ElevenLabs/ffmpeg", attempts: attemptsUsed });
       }
     }
   }

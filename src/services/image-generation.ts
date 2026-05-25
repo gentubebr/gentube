@@ -15,7 +15,7 @@ import {
 } from "../integrations/higgsfield-cli.js";
 import { submitGoogleImageBatch } from "../integrations/gemini-batch.js";
 import { generateGeminiImageSync } from "../integrations/gemini-image.js";
-import { insertImageJob, listImageJobsByBatchId, updateImageJob } from "../repository.js";
+import { findDoneImageJobByHash, insertImageJob, listImageJobsByBatchId, updateImageJob } from "../repository.js";
 import type { ImageJobProvider } from "../types/image-jobs.js";
 import { processLocalImageBatch } from "./image-local-batch.js";
 
@@ -59,7 +59,7 @@ async function downloadHfToDisk(
   return localPath;
 }
 
-async function tryHiggsfieldImage(input: RenderImageInput): Promise<{ localPath?: string; hfJobId?: string }> {
+async function tryHiggsfieldImage(input: RenderImageInput, promptHash?: string): Promise<{ localPath?: string; hfJobId?: string }> {
   if (GENTUBE_HF_ASYNC) {
     const hfJobId = await enqueueImageWithDefaultsCli({
       prompt: input.prompt,
@@ -74,6 +74,7 @@ async function tryHiggsfieldImage(input: RenderImageInput): Promise<{ localPath?
       outPathNoExt: input.outPathNoExt,
       externalId: hfJobId,
       promptText: input.prompt,
+      promptHash: promptHash ?? null,
       referenceImagePath: input.referenceImageUrl,
       status: "submitted",
     });
@@ -88,7 +89,7 @@ async function tryHiggsfieldImage(input: RenderImageInput): Promise<{ localPath?
   return { localPath };
 }
 
-async function renderGeminiSync(input: RenderImageInput, referencePath?: string): Promise<string> {
+async function renderGeminiSync(input: RenderImageInput, referencePath?: string, promptHash?: string): Promise<string> {
   const out = await generateGeminiImageSync({
     prompt: input.prompt,
     outPathNoExt: input.outPathNoExt,
@@ -102,6 +103,7 @@ async function renderGeminiSync(input: RenderImageInput, referencePath?: string)
     deliveryMode: "sync",
     outPathNoExt: input.outPathNoExt,
     promptText: input.prompt,
+    promptHash: promptHash ?? null,
     referenceImagePath: referencePath ?? null,
     status: "completed",
     outcome: "done",
@@ -113,7 +115,7 @@ async function renderGeminiSync(input: RenderImageInput, referencePath?: string)
   return out.localPath;
 }
 
-function queueGeminiBatchJob(input: RenderImageInput, batchId: string): RenderImageResult {
+function queueGeminiBatchJob(input: RenderImageInput & { promptHash?: string }, batchId: string): RenderImageResult {
   insertImageJob({
     projectId: input.projectId,
     blockNumber: input.blockNumber,
@@ -123,12 +125,13 @@ function queueGeminiBatchJob(input: RenderImageInput, batchId: string): RenderIm
     outPathNoExt: input.outPathNoExt,
     batchId,
     promptText: input.prompt,
+    promptHash: input.promptHash ?? null,
     referenceImagePath: input.referenceImageUrl ?? null,
   });
   return { provider: "gemini", doneSync: false, queued: true, batchId };
 }
 
-function queueGeminiLocalJob(input: RenderImageInput, batchId: string): RenderImageResult {
+function queueGeminiLocalJob(input: RenderImageInput & { promptHash?: string }, batchId: string): RenderImageResult {
   insertImageJob({
     projectId: input.projectId,
     blockNumber: input.blockNumber,
@@ -138,9 +141,38 @@ function queueGeminiLocalJob(input: RenderImageInput, batchId: string): RenderIm
     outPathNoExt: input.outPathNoExt,
     batchId,
     promptText: input.prompt,
+    promptHash: input.promptHash ?? null,
     referenceImagePath: input.referenceImageUrl ?? null,
   });
   return { provider: "gemini", doneSync: false, queued: true, batchId };
+}
+
+/** sha256(prompt + "|" + referenceImagePath) — identificador de unicidade da imagem. */
+export function computeImagePromptHash(prompt: string, referenceImagePath?: string | null): string {
+  return crypto
+    .createHash("sha256")
+    .update(`${prompt}|${referenceImagePath ?? ""}`)
+    .digest("hex");
+}
+
+const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"] as const;
+
+/**
+ * Tenta encontrar o arquivo de imagem gerado para um job done.
+ * Varre extensoes comuns — retorna o primeiro path existente, ou null.
+ */
+async function resolveImageFilePath(outPathNoExt: string): Promise<string | null> {
+  const { access } = await import("node:fs/promises");
+  for (const ext of IMAGE_EXTENSIONS) {
+    const p = `${outPathNoExt}${ext}`;
+    try {
+      await access(p);
+      return p;
+    } catch {
+      // proximo
+    }
+  }
+  return null;
 }
 
 export async function renderSceneImage(
@@ -154,6 +186,37 @@ export async function renderSceneImage(
   const backend =
     resolveVisualModality() === "wojak" ? "gemini" : resolveImageBackend(effectiveFlags, delivery);
 
+  // P6 — Deduplicacao por hash de prompt: evita re-gerar imagens identicas.
+  // Nao aplica em forceSync (bootstrap de video) nem em modos assincronos (batch ainda nao tem arquivo).
+  const promptHash = computeImagePromptHash(input.prompt, input.referenceImageUrl);
+  if (!input.forceSync && delivery !== "google_batch" && delivery !== "local_batch") {
+    const existingJob = findDoneImageJobByHash(promptHash);
+    if (existingJob) {
+      const srcPath = await resolveImageFilePath(existingJob.out_path_no_ext);
+      if (srcPath) {
+        const { copyFile, mkdir } = await import("node:fs/promises");
+        const ext = srcPath.slice(srcPath.lastIndexOf("."));
+        const destPath = `${input.outPathNoExt}${ext}`;
+        await mkdir(path.dirname(destPath), { recursive: true });
+        await copyFile(srcPath, destPath);
+        insertImageJob({
+          projectId: input.projectId,
+          blockNumber: input.blockNumber,
+          shotId: input.shotId,
+          provider: existingJob.provider,
+          deliveryMode: "sync",
+          outPathNoExt: input.outPathNoExt,
+          promptText: input.prompt,
+          promptHash,
+          referenceImagePath: input.referenceImageUrl ?? null,
+          status: "dedup",
+          outcome: "done",
+        });
+        return { provider: existingJob.provider, doneSync: true, queued: false, localPath: destPath };
+      }
+    }
+  }
+
   // Bootstrap de video (forceSync) deve concluir na hora; HF async nao serve aqui.
   if (input.forceSync) {
     const localPath = await renderGeminiSync(input, input.referenceImageUrl);
@@ -162,21 +225,21 @@ export async function renderSceneImage(
 
   if (delivery === "google_batch") {
     const bid = batchId ?? crypto.randomUUID();
-    return queueGeminiBatchJob({ ...input, flags: effectiveFlags }, bid);
+    return queueGeminiBatchJob({ ...input, flags: effectiveFlags, promptHash }, bid);
   }
 
   if (delivery === "local_batch") {
     const bid = batchId ?? crypto.randomUUID();
-    return queueGeminiLocalJob({ ...input, flags: effectiveFlags }, bid);
+    return queueGeminiLocalJob({ ...input, flags: effectiveFlags, promptHash }, bid);
   }
 
   if (backend === "gemini") {
-    const localPath = await renderGeminiSync(input, input.referenceImageUrl);
+    const localPath = await renderGeminiSync(input, input.referenceImageUrl, promptHash);
     return { provider: "gemini", doneSync: true, queued: false, localPath };
   }
 
   if (backend === "higgsfield") {
-    const hf = await tryHiggsfieldImage(input);
+    const hf = await tryHiggsfieldImage(input, promptHash);
     if (hf.hfJobId) {
       return { provider: "higgsfield", doneSync: false, queued: true };
     }
@@ -185,7 +248,7 @@ export async function renderSceneImage(
 
   // auto: HF then Gemini sync on any failure
   try {
-    const hf = await tryHiggsfieldImage(input);
+    const hf = await tryHiggsfieldImage(input, promptHash);
     if (hf.hfJobId) {
       return { provider: "higgsfield", doneSync: false, queued: true };
     }
@@ -193,7 +256,7 @@ export async function renderSceneImage(
   } catch (hfErr) {
     const hfMsg = hfErr instanceof Error ? hfErr.message : String(hfErr);
     try {
-      const localPath = await renderGeminiSync(input, input.referenceImageUrl);
+      const localPath = await renderGeminiSync(input, input.referenceImageUrl, promptHash);
       return { provider: "gemini", doneSync: true, queued: false, localPath };
     } catch (gemErr) {
       const gMsg = gemErr instanceof Error ? gemErr.message : String(gemErr);

@@ -82,6 +82,23 @@ import {
   type PipelineStage,
 } from "./services/pipeline-orchestrator.js";
 import { parseIntervalMs } from "./utils/parse-interval.js";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import {
+  enqueueJob,
+  cancelJob,
+  listJobs,
+  getJob,
+  type JobQueueOptions,
+  type JobQueueStatus,
+} from "./repository-jobs.js";
+import {
+  isDaemonRunning,
+  readDaemonPid,
+  runDaemonLoop,
+  DAEMON_PID_FILE,
+  DAEMON_LOG_FILE,
+} from "./services/daemon.js";
 
 type ProjectRow = Record<string, unknown>;
 
@@ -815,6 +832,7 @@ function cliImageJobRow(id: number, prompt: string, outPathNoExt: string, batchI
     error_message: null,
     reference_image_path: null,
     prompt_text: prompt,
+    prompt_hash: null,
     downloaded_at: null,
     created_at: now,
     updated_at: now,
@@ -1724,6 +1742,197 @@ async function resolveVoiceId(cliVoiceId?: string): Promise<string> {
   if (ELEVENLABS_VOICE_ID) return ELEVENLABS_VOICE_ID;
   return password({ message: "Informe voice_id da ElevenLabs:", mask: "*" });
 }
+
+// ---------------------------------------------------------------------------
+// Daemon + job queue commands (P8)
+// ---------------------------------------------------------------------------
+
+program
+  .command("daemon:start")
+  .description("Inicia o daemon GenTube em background (processa job_queue)")
+  .option("--foreground", "Roda em foreground (logs no stdout, util para debug)")
+  .action(async (opts: { foreground?: boolean }) => {
+    if (isDaemonRunning()) {
+      const pid = readDaemonPid();
+      console.log(chalk.yellow(`Daemon ja esta rodando (PID ${pid})`));
+      return;
+    }
+    if (opts.foreground) {
+      console.log(chalk.cyan("Iniciando daemon em foreground (Ctrl+C para parar)..."));
+      await runDaemonLoop();
+      return;
+    }
+    const selfPath = fileURLToPath(import.meta.url);
+    const child = spawn(process.execPath, [selfPath, "daemon:run"], {
+      detached: true,
+      stdio: ["ignore", "ignore", "ignore"],
+      env: { ...process.env },
+    });
+    child.unref();
+    // Aguarda ate 3s para o PID aparecer
+    for (let i = 0; i < 15; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      if (isDaemonRunning()) break;
+    }
+    if (isDaemonRunning()) {
+      console.log(chalk.green(`Daemon iniciado (PID ${readDaemonPid()}). Logs: ${DAEMON_LOG_FILE}`));
+    } else {
+      console.log(chalk.red("Daemon nao respondeu em 3s. Verifique: " + DAEMON_LOG_FILE));
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("daemon:run")
+  .description("Loop interno do daemon (nao usar diretamente — use daemon:start)")
+  .action(async () => {
+    await runDaemonLoop();
+  });
+
+program
+  .command("daemon:stop")
+  .description("Para o daemon GenTube")
+  .action(() => {
+    const pid = readDaemonPid();
+    if (!pid || !isDaemonRunning()) {
+      console.log(chalk.yellow("Daemon nao esta rodando"));
+      return;
+    }
+    process.kill(pid, "SIGTERM");
+    console.log(chalk.green(`SIGTERM enviado ao daemon (PID ${pid})`));
+  });
+
+program
+  .command("daemon:status")
+  .description("Mostra status do daemon e fila de jobs")
+  .action(() => {
+    const running = isDaemonRunning();
+    const pid = readDaemonPid();
+    console.log(running
+      ? chalk.green(`Daemon rodando — PID ${pid}`)
+      : chalk.yellow("Daemon parado"));
+    console.log(chalk.dim(`PID file: ${DAEMON_PID_FILE}`));
+    console.log(chalk.dim(`Log file: ${DAEMON_LOG_FILE}`));
+    const jobs = listJobs({ limit: 10 });
+    if (jobs.length === 0) {
+      console.log(chalk.dim("Nenhum job na fila"));
+      return;
+    }
+    console.log(chalk.bold("\nUltimos 10 jobs:"));
+    for (const j of jobs) {
+      const statusColor =
+        j.status === "done" ? chalk.green :
+        j.status === "failed" ? chalk.red :
+        j.status === "running" ? chalk.cyan :
+        j.status === "cancelled" ? chalk.gray :
+        chalk.yellow;
+      console.log(
+        `  #${j.id} projeto=${j.project_id} ${statusColor(j.status)} ` +
+        (j.started_at ? `iniciado=${j.started_at.slice(0, 19)} ` : "") +
+        (j.finished_at ? `finalizado=${j.finished_at.slice(0, 19)}` : "") +
+        (j.error_message ? chalk.red(` erro: ${j.error_message.slice(0, 80)}`) : ""),
+      );
+    }
+  });
+
+program
+  .command("job:add")
+  .description("Adiciona um projeto ao job_queue para processamento pelo daemon")
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .option("--voice-id <id>", "ElevenLabs voice ID (ou .env ELEVENLABS_VOICE_ID)")
+  .option("--priority <n>", "Prioridade (maior = primeiro, default 0)", "0")
+  .option("--profile <nome>", "Perfil (default: wojak-images-only)")
+  .option("--from-stage <etapa>", "Retomar a partir de etapa")
+  .option("--through-stage <etapa>", "Parar apos etapa")
+  .option("--prompt-matrix <ficheiro>", "Prompt de roteiro")
+  .option("--prompt-canal-voice <ficheiro>", "Voz do canal bloco 1")
+  .option("--max-images-block1 <n>", "Max imagens bloco 1")
+  .option("--max-images-other <n>", "Max imagens outros blocos")
+  .option("--skip-thumbnails", "Nao gerar thumbnails")
+  .option("--no-continue-on-error", "Para no primeiro erro")
+  .action(async (opts: {
+    project: string; voiceId?: string; priority?: string; profile?: string;
+    fromStage?: string; throughStage?: string; promptMatrix?: string; promptCanalVoice?: string;
+    maxImagesBlock1?: string; maxImagesOther?: string; skipThumbnails?: boolean;
+    noContinueOnError?: boolean;
+  }) => {
+    const project = getProjectByIdOrSlug(opts.project);
+    if (!project) throw new Error("Projeto nao encontrado");
+    const voiceId = await resolveVoiceId(opts.voiceId);
+    const options: JobQueueOptions = {
+      voiceId,
+      profile: opts.profile ?? "wojak-images-only",
+      fromStage: opts.fromStage,
+      throughStage: opts.throughStage,
+      promptMatrix: opts.promptMatrix,
+      promptCanalVoice: opts.promptCanalVoice,
+      maxImagesBlock1: opts.maxImagesBlock1,
+      maxImagesOther: opts.maxImagesOther,
+      skipThumbnails: Boolean(opts.skipThumbnails),
+      continueOnError: !opts.noContinueOnError,
+      scenePlanV2: true,
+      googleBatchMode: true,
+    };
+    const jobId = enqueueJob({
+      projectId: Number(project.id),
+      profile: options.profile,
+      priority: parseInt(opts.priority ?? "0", 10) || 0,
+      options,
+    });
+    console.log(chalk.green(`Job #${jobId} adicionado para projeto "${project.titulo}"`));
+    if (!isDaemonRunning()) {
+      console.log(chalk.yellow("Daemon nao esta rodando. Inicie com: gentube daemon:start"));
+    }
+  });
+
+program
+  .command("job:list")
+  .description("Lista jobs do job_queue")
+  .option("--status <s>", "Filtrar por status: pending | running | done | failed | cancelled")
+  .option("--limit <n>", "Maximo de jobs a exibir", "20")
+  .action((opts: { status?: string; limit?: string }) => {
+    const jobs = listJobs({
+      status: opts.status as JobQueueStatus | undefined,
+      limit: parseInt(opts.limit ?? "20", 10) || 20,
+    });
+    if (jobs.length === 0) {
+      console.log(chalk.dim("Nenhum job encontrado"));
+      return;
+    }
+    for (const j of jobs) {
+      const statusColor =
+        j.status === "done" ? chalk.green :
+        j.status === "failed" ? chalk.red :
+        j.status === "running" ? chalk.cyan :
+        j.status === "cancelled" ? chalk.gray :
+        chalk.yellow;
+      console.log(
+        `#${j.id} | projeto=${j.project_id} | ${statusColor(j.status)} | pri=${j.priority}` +
+        (j.queued_at ? ` | queued=${j.queued_at.slice(0, 19)}` : "") +
+        (j.error_message ? chalk.red(` | ${j.error_message.slice(0, 100)}`) : ""),
+      );
+    }
+  });
+
+program
+  .command("job:cancel")
+  .description("Cancela um job pendente no job_queue")
+  .requiredOption("--id <n>", "ID do job a cancelar")
+  .action((opts: { id: string }) => {
+    const id = parseInt(opts.id, 10);
+    if (isNaN(id)) throw new Error("--id deve ser um inteiro");
+    const job = getJob(id);
+    if (!job) throw new Error(`Job #${id} nao encontrado`);
+    if (job.status !== "pending") {
+      console.log(chalk.yellow(`Job #${id} tem status '${job.status}' — so pending pode ser cancelado`));
+      process.exitCode = 1;
+      return;
+    }
+    const ok = cancelJob(id);
+    console.log(ok ? chalk.green(`Job #${id} cancelado`) : chalk.red(`Falha ao cancelar job #${id}`));
+  });
+
+// ---------------------------------------------------------------------------
 
 const argv = process.argv.slice(2);
 if (argv.length === 0) {

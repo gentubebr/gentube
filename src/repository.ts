@@ -69,6 +69,11 @@ export function createProject(input: {
   return Number(result.lastInsertRowid);
 }
 
+export function getProjectById(id: number): Record<string, unknown> | null {
+  const row = getDb().prepare("SELECT * FROM video_projects WHERE id = ?").get(id);
+  return (row as Record<string, unknown>) ?? null;
+}
+
 export function getProjectByIdOrSlug(idOrSlug: string) {
   const db = getDb();
   const numericId = Number(idOrSlug);
@@ -185,6 +190,19 @@ export function getScriptBlock(projectId: number, blockNumber: number): { block_
     .prepare("SELECT block_number, status, file_path_md FROM script_blocks WHERE project_id = ? AND block_number = ?")
     .get(projectId, blockNumber);
   return (row as { block_number: number; status: string; file_path_md: string | null }) ?? null;
+}
+
+/** Persiste resultado do QualityGateAgent no bloco de roteiro. */
+export function updateScriptBlockQualityGate(
+  projectId: number,
+  blockNumber: number,
+  score: number,
+  attempts: number,
+): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE script_blocks SET quality_gate_score = ?, quality_gate_attempts = ?, updated_at = ? WHERE project_id = ? AND block_number = ?",
+  ).run(score, attempts, nowIso(), projectId, blockNumber);
 }
 
 export function getNarrationBlock(projectId: number, blockNumber: number): { block_number: number; status: string; file_path_mp3: string | null } | null {
@@ -451,6 +469,7 @@ export function insertImageJob(input: {
   batchId?: string | null;
   referenceImagePath?: string | null;
   promptText?: string | null;
+  promptHash?: string | null;
   status?: string;
   outcome?: ImageJobOutcome;
 }): number {
@@ -461,8 +480,8 @@ export function insertImageJob(input: {
       `INSERT INTO image_jobs (
         project_id, block_number, shot_id, asset_type, provider, delivery_mode,
         external_id, batch_id, out_path_no_ext, status, outcome,
-        reference_image_path, prompt_text, created_at, updated_at
-      ) VALUES (?, ?, ?, 'image', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        reference_image_path, prompt_text, prompt_hash, created_at, updated_at
+      ) VALUES (?, ?, ?, 'image', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       input.projectId,
@@ -477,10 +496,24 @@ export function insertImageJob(input: {
       input.outcome ?? "pending",
       input.referenceImagePath ?? null,
       input.promptText ?? null,
+      input.promptHash ?? null,
       now,
       now
     );
   return Number(r.lastInsertRowid);
+}
+
+/**
+ * Retorna um job concluido com o mesmo prompt_hash, ou null se nao encontrado.
+ * Usado pela deduplicacao P6: evita re-gerar imagens identicas.
+ */
+export function findDoneImageJobByHash(promptHash: string): ImageJobRow | null {
+  const row = getDb()
+    .prepare(
+      `SELECT * FROM image_jobs WHERE prompt_hash = ? AND outcome = 'done' ORDER BY id DESC LIMIT 1`,
+    )
+    .get(promptHash) as ImageJobRow | undefined;
+  return row ?? null;
 }
 
 export function updateImageJob(

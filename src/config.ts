@@ -185,6 +185,18 @@ export function claudeDeliveryFromEnv(): ClaudeDeliveryMode {
   return "batch";
 }
 
+/**
+ * Batch de roteiro por etapa: submete todos os blocos pendentes em 1 unico Message Batch
+ * (vs 1 batch por bloco). Economiza latencia de API e simplifica rastreio.
+ * Tradeoff: blocos submetidos em paralelo — sem contexto cruzado entre blocos em execucao inicial.
+ * Ativar com GENTUBE_ROTEIRO_STAGE_BATCH=1.
+ */
+export function roteiroStageBatchEnabled(): boolean {
+  return ["1", "true", "yes"].includes(
+    (process.env.GENTUBE_ROTEIRO_STAGE_BATCH ?? "").trim().toLowerCase(),
+  );
+}
+
 export type ClaudeBatchStage = "roteiro" | "segmentation" | "visualization";
 
 /** Modelo por etapa; fallback CLAUDE_MODEL. */
@@ -256,6 +268,32 @@ export const ROTEIRO_PREV_CONTEXT_MAX_CHARS = (() => {
   const n = parseInt(raw, 10);
   return Number.isFinite(n) && n >= 0 ? n : 100_000;
 })();
+// --- QualityGateAgent ---
+
+/** Ativa/desativa o agente de avaliacao de qualidade do roteiro (default: ativo). */
+export function qualityGateEnabled(): boolean {
+  return !["0", "false", "no", "off"].includes(
+    String(process.env.GENTUBE_QUALITY_GATE_ENABLED ?? "1").toLowerCase(),
+  );
+}
+
+/** Score minimo (0-100) para aprovacao direta; abaixo disso regenera (max QUALITY_GATE_MAX_REGEN vezes). */
+export const QUALITY_GATE_THRESHOLD = Math.min(
+  100,
+  Math.max(0, parseInt(process.env.GENTUBE_QUALITY_GATE_THRESHOLD ?? "65", 10) || 65),
+);
+
+/** Maximo de regeneracoes por bloco quando score abaixo do threshold (default 1). */
+export const QUALITY_GATE_MAX_REGEN = Math.max(
+  0,
+  parseInt(process.env.GENTUBE_QUALITY_GATE_MAX_REGEN ?? "1", 10) || 1,
+);
+
+/** Modelo usado pelo QualityGateAgent (default Sonnet — avaliacao estruturada JSON). */
+export const QUALITY_GATE_MODEL = (
+  process.env.GENTUBE_CLAUDE_MODEL_QUALITY_GATE ?? "claude-sonnet-4-6"
+).trim();
+
 export const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY ?? "";
 /** Voice ID padrao quando --voice-id nao e passado no CLI */
 export const ELEVENLABS_VOICE_ID = (process.env.ELEVENLABS_VOICE_ID ?? "").trim();

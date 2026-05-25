@@ -19,6 +19,7 @@ export type ImageJobRow = {
   error_message: string | null;
   reference_image_path: string | null;
   prompt_text: string | null;
+  prompt_hash: string | null;
   downloaded_at: string | null;
   created_at: string;
   updated_at: string;

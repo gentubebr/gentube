@@ -20,6 +20,9 @@ import {
   ROOT_DIR,
   ROTEIRO_PREV_CONTEXT_MAX_CHARS,
   roteiroPrevContextEnabled,
+  qualityGateEnabled,
+  QUALITY_GATE_THRESHOLD,
+  QUALITY_GATE_MAX_REGEN,
   type ImageRunFlags,
 } from "../config.js";
 import {
@@ -27,9 +30,12 @@ import {
   generateScriptBlock,
   generateSegmentationPlanJson,
   generateVisualizationPlanJson,
+  evaluateScriptQuality,
+  type QualityGateResult,
 } from "../integrations/claude.js";
+import { runRoteiroBatchAll } from "../integrations/claude-stage-batch.js";
 import { extractVideoId, downloadYoutubeThumbnail } from "../utils/youtube.js";
-import { textToSpeechMp3 } from "../integrations/elevenlabs.js";
+import { cachedTextToSpeech } from "./tts-cache.js";
 import {
   enqueueImageWithDefaultsCli,
   enqueueThumbnailCli,
@@ -53,6 +59,7 @@ import {
   recomputeImagensVideosStage,
   recomputeStageFromBlocks,
   updateProjectAnyStageStatus,
+  updateScriptBlockQualityGate,
   upsertNarrationBlock,
   upsertMediaBlock,
   upsertScriptBlock,
@@ -236,7 +243,12 @@ function scenePlanV2Enabled(opts?: ImagensVideosOptions): boolean {
   return ["1", "true", "yes"].includes(String(process.env.GENTUBE_SCENE_PLAN_V2 ?? "").toLowerCase());
 }
 
-export type RoteiroPromptOptions = { promptMatrix?: string; promptCanalVoice?: string };
+export type RoteiroPromptOptions = {
+  promptMatrix?: string;
+  promptCanalVoice?: string;
+  /** Feedback do QualityGateAgent da iteracao anterior; injetado no prompt para regeneracao dirigida. */
+  qualityFeedback?: string;
+};
 
 function truncateRoteiroPrevContext(text: string, maxChars: number): { text: string; truncated: boolean } {
   if (maxChars === 0 || text.length <= maxChars) return { text, truncated: false };
@@ -418,6 +430,7 @@ export async function runRoteiroBlock(project: ProjectRow, blockNumber: number, 
       blockNumber,
       totalBlocks: totalBlocos,
       projectId,
+      qualityFeedback: opts?.qualityFeedback,
     });
 
     await fs.writeFile(blockPath, content, "utf-8");
@@ -437,6 +450,205 @@ export async function runRoteiroBlock(project: ProjectRow, blockNumber: number, 
   }
 
   recomputeStageFromBlocks(projectId, totalBlocos, "script_blocks", "status_roteiro");
+}
+
+/**
+ * Gera todos os blocos de roteiro pendentes em um unico Message Batch da Anthropic.
+ * Tradeoff: blocos sao submetidos em paralelo, entao nao ha contexto cruzado entre blocos
+ * (previousBlocksText carregado do disco — vazio em execucao inicial). Economiza ~50% do custo.
+ * Usar apenas quando GENTUBE_HF_ASYNC=1 ou configuracao explicita de batch.
+ */
+export async function runRoteiroBatchStage(project: ProjectRow, opts?: RoteiroPromptOptions): Promise<void> {
+  const projectId = Number(project.id);
+  const totalBlocos = Number(project.total_blocos);
+  const promptPath = resolvePromptMatrixPath(opts?.promptMatrix);
+  const promptBase = await fs.readFile(promptPath, "utf-8");
+  addProjectLog(projectId, "roteiro", "info", `Prompt de roteiro (batch): ${path.relative(ROOT_DIR, promptPath) || promptPath}`);
+  const roteiroDir = path.join(String(project.project_path), "01 - Roteiro");
+
+  updateProjectAnyStageStatus(projectId, "status_roteiro", "processing");
+
+  // Coletar blocos pendentes
+  const pendingBlocks: number[] = [];
+  for (let i = 1; i <= totalBlocos; i += 1) {
+    const existing = getScriptBlock(projectId, i);
+    if (existing?.status !== "success") {
+      pendingBlocks.push(i);
+    } else {
+      console.log(chalk.dim(`${blockTag(i, totalBlocos)} Roteiro ja concluido, pulando`));
+    }
+  }
+
+  if (pendingBlocks.length === 0) {
+    addProjectLog(projectId, "roteiro", "info", "Todos os blocos ja concluidos, nada a fazer");
+    recomputeStageFromBlocks(projectId, totalBlocos, "script_blocks", "status_roteiro");
+    return;
+  }
+
+  // Preparar items do batch — previousBlocksText vem do disco (vazio em execucao inicial)
+  const items = await Promise.all(
+    pendingBlocks.map(async (blockNumber) => {
+      const { text: previousBlocksText } = await previousRoteiroContextForBlock(roteiroDir, blockNumber, projectId);
+      const channelVoiceContext = await loadCanalVoiceForBlock1(blockNumber, projectId, opts?.promptCanalVoice);
+      upsertScriptBlock(projectId, blockNumber, {
+        status: "processing",
+        started_at: new Date().toISOString(),
+        error_message: null,
+      });
+      return {
+        projectId,
+        promptBase,
+        title: String(project.titulo),
+        niche: String(project.niche),
+        audience: String(project.audience),
+        transcript: (project.transcript as string | null) ?? undefined,
+        channelVoiceContext,
+        previousBlocksText: previousBlocksText || undefined,
+        blockNumber,
+        totalBlocks: totalBlocos,
+        qualityFeedback: opts?.qualityFeedback,
+      };
+    }),
+  );
+
+  addProjectLog(projectId, "roteiro", "info", `Submetendo batch com ${items.length} bloco(s)`);
+  console.log(chalk.cyan(`Submetendo batch de roteiro: ${items.length} bloco(s)...`));
+
+  let results: Map<number, string>;
+  try {
+    results = await runRoteiroBatchAll(items, {
+      onStatus: (status, batchId) => {
+        console.log(chalk.dim(`Batch roteiro [${batchId}] status: ${status}`));
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Erro desconhecido";
+    for (const blockNumber of pendingBlocks) {
+      upsertScriptBlock(projectId, blockNumber, {
+        status: "error",
+        error_message: message,
+        finished_at: new Date().toISOString(),
+      });
+    }
+    addProjectLog(projectId, "roteiro", "error", `Batch de roteiro falhou: ${message}`);
+    updateProjectAnyStageStatus(projectId, "status_roteiro", "error");
+    throw error;
+  }
+
+  // Persistir resultados
+  for (const [blockNumber, content] of results) {
+    const blockFileName = `block${String(blockNumber).padStart(2, "0")}.md`;
+    const blockPath = path.join(roteiroDir, blockFileName);
+    await fs.writeFile(blockPath, content, "utf-8");
+    upsertScriptBlock(projectId, blockNumber, {
+      status: "success",
+      file_path_md: blockPath,
+      content_md: content,
+      finished_at: new Date().toISOString(),
+    });
+    console.log(chalk.green(`${blockTag(blockNumber, totalBlocos)} Roteiro (batch) salvo → ${blockFileName}`));
+    addProjectLog(projectId, "roteiro", "info", `Bloco ${blockNumber} gerado via batch`);
+  }
+
+  const totalSuccess = countBlocksByStatus("script_blocks", projectId, "success");
+  if (totalSuccess === totalBlocos) {
+    recomputeStageFromBlocks(projectId, totalBlocos, "script_blocks", "status_roteiro");
+  } else {
+    updateProjectAnyStageStatus(projectId, "status_roteiro", "error");
+    throw new Error("Nem todos os blocos de roteiro batch foram gerados com sucesso");
+  }
+}
+
+export type QualityGateBlockResult = {
+  score: number;
+  attempts: number;
+  passed: boolean;
+  suggestions: string[];
+  skipped: boolean;
+};
+
+/**
+ * Avalia a qualidade do roteiro de um bloco e, se necessario, solicita regeneracao dirigida.
+ * Sempre passa apos maxRegen iteracoes (nao bloqueia o pipeline).
+ */
+export async function runQualityGateBlock(
+  project: ProjectRow,
+  blockNumber: number,
+  opts?: RoteiroPromptOptions & { threshold?: number; maxRegen?: number },
+): Promise<QualityGateBlockResult> {
+  const projectId = Number(project.id);
+  const totalBlocos = Number(project.total_blocos);
+  const threshold = opts?.threshold ?? QUALITY_GATE_THRESHOLD;
+  const maxRegen = opts?.maxRegen ?? QUALITY_GATE_MAX_REGEN;
+
+  if (!qualityGateEnabled()) {
+    addProjectLog(projectId, "quality_gate", "info", `QualityGate desativado (bloco ${blockNumber})`);
+    return { score: -1, attempts: 0, passed: true, suggestions: [], skipped: true };
+  }
+
+  const roteiroDir = path.join(String(project.project_path), "01 - Roteiro");
+  const blockFileName = `block${String(blockNumber).padStart(2, "0")}.md`;
+  const blockPath = path.join(roteiroDir, blockFileName);
+
+  let blockText: string;
+  try {
+    blockText = await fs.readFile(blockPath, "utf-8");
+  } catch {
+    addProjectLog(projectId, "quality_gate", "error", `Bloco ${blockNumber} nao encontrado em disco; pulando QualityGate`);
+    return { score: -1, attempts: 0, passed: true, suggestions: [], skipped: true };
+  }
+
+  let lastResult: QualityGateResult | null = null;
+  let attempts = 0;
+
+  for (let iter = 0; iter <= maxRegen; iter += 1) {
+    addProjectLog(projectId, "quality_gate", "info", `Avaliando bloco ${blockNumber} (iteracao ${iter + 1}/${maxRegen + 1})`);
+
+    lastResult = await evaluateScriptQuality({ blockText, blockNumber, totalBlocks: totalBlocos });
+    attempts = iter + 1;
+
+    const scoreLabel = lastResult.score_total >= threshold ? chalk.green(`${lastResult.score_total}`) : chalk.yellow(`${lastResult.score_total}`);
+    console.log(chalk.cyan(`[quality_gate] bloco ${blockNumber}/${totalBlocos} score=${scoreLabel}/${threshold} (iter ${iter + 1})`));
+
+    addProjectLog(projectId, "quality_gate", "info", `Score bloco ${blockNumber}: ${lastResult.score_total}`, {
+      criteria: lastResult.criteria,
+      blockers: lastResult.blockers,
+      suggestions: lastResult.suggestions,
+      threshold,
+      iter,
+    });
+
+    if (lastResult.score_total >= threshold || iter >= maxRegen) break;
+
+    // Score insuficiente e ainda ha regeneracoes disponíveis — regenera com feedback
+    const feedbackLines = [
+      ...lastResult.blockers.map((b) => `PROBLEMA: ${b}`),
+      ...lastResult.suggestions.map((s) => `MELHORIA: ${s}`),
+    ].join("\n");
+
+    console.log(chalk.yellow(`[quality_gate] bloco ${blockNumber} score abaixo de ${threshold} — regenerando com feedback`));
+    addProjectLog(projectId, "quality_gate", "info", `Regenerando bloco ${blockNumber} com feedback de qualidade`, { feedback: feedbackLines });
+
+    await runRoteiroBlock(project, blockNumber, { ...opts, qualityFeedback: feedbackLines });
+
+    blockText = await fs.readFile(blockPath, "utf-8");
+  }
+
+  const finalScore = lastResult?.score_total ?? 0;
+  const passed = finalScore >= threshold || maxRegen === 0;
+
+  updateScriptBlockQualityGate(projectId, blockNumber, finalScore, attempts);
+
+  const resultLabel = passed ? chalk.green("APROVADO") : chalk.yellow("PASSOU (max regen atingido)");
+  console.log(chalk.cyan(`[quality_gate] bloco ${blockNumber}/${totalBlocos} ${resultLabel} — score final ${finalScore}`));
+
+  return {
+    score: finalScore,
+    attempts,
+    passed: true, // nunca bloqueia o pipeline
+    suggestions: lastResult?.suggestions ?? [],
+    skipped: false,
+  };
 }
 
 async function synthesizeBlockNarration(input: {
@@ -476,8 +688,10 @@ async function synthesizeBlockNarration(input: {
         continue;
       }
       console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} ElevenLabs ${scene.id}...`));
-      const audioBuffer = await textToSpeechMp3({ text: scene.narration_text, voiceId });
-      await fs.writeFile(p, audioBuffer);
+      const { cacheHit } = await cachedTextToSpeech({ text: scene.narration_text, voiceId }, p);
+      if (cacheHit) {
+        console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} ${scene.id} — TTS cache hit`));
+      }
       scenePaths.push(p);
     }
     const concatOk = await tryConcatMp3WithFfmpeg(scenePaths, audioPath);
@@ -490,8 +704,7 @@ async function synthesizeBlockNarration(input: {
       primaryMp3Path = scenePaths[0]!;
     }
   } else {
-    const audioBuffer = await textToSpeechMp3({ text: sourceText, voiceId });
-    await fs.writeFile(audioPath, audioBuffer);
+    await cachedTextToSpeech({ text: sourceText, voiceId }, audioPath);
   }
 
   upsertNarrationBlock(projectId, blockNumber, {

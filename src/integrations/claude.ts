@@ -8,6 +8,7 @@ import {
   claudeDeliveryFromEnv,
   claudeModelForStage,
   claudeThinkingForStage,
+  QUALITY_GATE_MODEL,
   type ClaudeBatchStage,
 } from "../config.js";
 import { sanitizeScriptBlockContent } from "../utils/sanitize-script-block.js";
@@ -20,6 +21,14 @@ import {
   streamClaudeBatchResults,
 } from "./claude-batch.js";
 import { insertClaudeBatchJob, updateClaudeBatchJob } from "../repository-claude-batch.js";
+
+/**
+ * Prompt com cache: `cacheable` e a parte estatica (arquivo de prompt — mesma para todos os
+ * blocos/projetos), marcada com cache_control ephemeral da Anthropic (~70% economia em input
+ * tokens a partir da 2a chamada). `dynamic` e o contexto especifico do bloco, sem cache.
+ * Passar string simples desativa o cache (backward compat).
+ */
+export type CacheablePrompt = string | { cacheable: string; dynamic: string };
 
 let client: Anthropic | null = null;
 
@@ -53,12 +62,24 @@ function applyStructuredJsonCallParams(
 
 export function buildMessageCreateParams(
   stage: ClaudeBatchStage,
-  userPrompt: string,
+  userPrompt: CacheablePrompt,
 ): MessageCreateParamsNonStreaming & {
   thinking?: { type: "adaptive" };
   output_config?: { effort: "low" };
   temperature?: number;
 } {
+  const content =
+    typeof userPrompt === "string"
+      ? userPrompt
+      : [
+          {
+            type: "text" as const,
+            text: userPrompt.cacheable,
+            cache_control: { type: "ephemeral" as const },
+          },
+          { type: "text" as const, text: userPrompt.dynamic },
+        ];
+
   const createParams: MessageCreateParamsNonStreaming & {
     thinking?: { type: "adaptive" };
     output_config?: { effort: "low" };
@@ -66,7 +87,7 @@ export function buildMessageCreateParams(
   } = {
     model: claudeModelForStage(stage),
     max_tokens: CLAUDE_MAX_TOKENS,
-    messages: [{ role: "user" as const, content: userPrompt }],
+    messages: [{ role: "user" as const, content }],
   };
   const thinking = claudeThinkingForStage(stage);
   if (stage === "roteiro") {
@@ -85,7 +106,7 @@ export function buildMessageCreateParams(
 
 export async function runClaudeUserPrompt(input: {
   stage: ClaudeBatchStage;
-  userPrompt: string;
+  userPrompt: CacheablePrompt;
   projectId?: number;
   blockNumber?: number;
   customIdSuffix?: string;
@@ -159,20 +180,20 @@ export async function runClaudeUserPrompt(input: {
   return textOut;
 }
 
-export async function generateScriptBlock(input: {
+export type RoteiroPromptInput = {
   promptBase: string;
   title: string;
   niche: string;
   audience: string;
   transcript?: string;
-  /** Voz/persona do canal — tipicamente bloco 1; opcional. */
   channelVoiceContext?: string;
-  /** Texto dos blocos anteriores (1..N-1) para continuidade; opcional. */
   previousBlocksText?: string;
   blockNumber: number;
   totalBlocks: number;
-  projectId?: number;
-}): Promise<string> {
+  qualityFeedback?: string;
+};
+
+export function buildRoteiroUserPrompt(input: RoteiroPromptInput): CacheablePrompt {
   const formattedPrompt = input.promptBase
     .replaceAll("[NOME DO NICHO]", input.niche)
     .replaceAll("[PUBLICO]", input.audience)
@@ -214,17 +235,35 @@ FORMATO OBRIGATORIO DA RESPOSTA (o pipeline e automatico; nao simule chat):
 - Markdown leve no corpo e permitido (negrito, listas) quando fizer sentido na narracao.
 `.trim();
 
-  const userPrompt = `
-${formattedPrompt}
+  // Parte estatica: mesmo para todos os 8 blocos do mesmo projeto (mesmos nicho/publico/total).
+  // Marcada com cache_control ephemeral — economiza ~70% dos input tokens a partir do bloco 2.
+  const cacheablePart = `${formattedPrompt}\n\n${formatRules}`;
 
+  const qualityFeedbackSection = input.qualityFeedback?.trim()
+    ? `
+FEEDBACK DE QUALIDADE (versao anterior foi avaliada e teve pontuacao insuficiente; aplique TODAS as sugestoes abaixo na nova versao):
+---
+${input.qualityFeedback.trim()}
+---
+`.trim()
+    : "";
+
+  // Parte dinamica: especifica de cada bloco — titulo, voz do canal (so bloco 1),
+  // numero do bloco, contexto acumulado dos blocos anteriores, transcricao e feedback de qualidade.
+  const dynamicPart = `
 ${channelVoiceSection ? `${channelVoiceSection}\n\n` : ""}Titulo do video: ${input.title}
 Quantidade total de blocos: ${input.totalBlocks}
 Gere apenas o bloco ${input.blockNumber} de ${input.totalBlocks}.
-
-${formatRules}
-${previousBlocksSection ? `${previousBlocksSection}\n\n` : ""}${referenceBlock ? `${referenceBlock}` : ""}
+${previousBlocksSection ? `\n${previousBlocksSection}\n` : ""}${referenceBlock ? `\n${referenceBlock}` : ""}${qualityFeedbackSection ? `\n${qualityFeedbackSection}` : ""}
 `.trim();
 
+  return { cacheable: cacheablePart, dynamic: dynamicPart };
+}
+
+export async function generateScriptBlock(
+  input: RoteiroPromptInput & { projectId?: number },
+): Promise<string> {
+  const userPrompt = buildRoteiroUserPrompt(input);
   const textChunks = await runClaudeUserPrompt({
     stage: "roteiro",
     userPrompt,
@@ -239,6 +278,119 @@ ${previousBlocksSection ? `${previousBlocksSection}\n\n` : ""}${referenceBlock ?
   }
 
   return cleaned;
+}
+
+// --- QualityGateAgent ---
+
+export type QualityGateCriteria = {
+  hook: number;
+  analogias: number;
+  curiosity_gap: number;
+  pacing: number;
+  visual_direction: number;
+  argument_depth: number;
+  cta: number;
+  unique_value: number;
+};
+
+export type QualityGateResult = {
+  score_total: number;
+  criteria: QualityGateCriteria;
+  blockers: string[];
+  suggestions: string[];
+};
+
+const QUALITY_GATE_STATIC_PROMPT = `
+You are an expert YouTube script quality evaluator. Score the given script block using 8 criteria, each from 0 to 100. Return ONLY valid JSON — no markdown fences, no explanation outside the JSON.
+
+Criteria definitions:
+- hook (0-100): Do the first 3 sentences contain a shocking statistic, bold promise, provocative question, or unexpected contrast? 0 = generic opener, 100 = irresistible first 3 seconds.
+- analogias (0-100): Are abstract concepts grounded in concrete, relatable comparisons? 0 = pure jargon, 100 = every concept has a vivid analogy.
+- curiosity_gap (0-100): Are there "open loops" — statements that promise a revelation the viewer has not received yet? 0 = everything resolved immediately, 100 = multiple unresolved tensions pulling the viewer forward.
+- pacing (0-100): Do sentence lengths vary? Is there rhythm — short punchy lines alternating with longer explanations? 0 = uniform wall of text, 100 = natural spoken cadence.
+- visual_direction (0-100): Does the text suggest visual actions, physical metaphors, or movement an editor can work with? 0 = purely abstract, 100 = each paragraph implies a clear visual.
+- argument_depth (0-100): Are claims backed by data, cause-and-effect chains, or specific examples? 0 = unsupported assertions only, 100 = every point has a substantive basis.
+- cta (0-100): For non-final blocks score 50 automatically. For the final block: is there a clear, specific call-to-action? 0 = vague or missing, 100 = direct and emotionally resonant.
+- unique_value (0-100): Does this block contain at least one insight or framing the viewer is unlikely to find in 5 other videos on the same topic? 0 = completely generic, 100 = distinctly original.
+
+score_total: weighted average using hook*1.5 + curiosity_gap*1.5 + argument_depth*1.2 + unique_value*1.2 + analogias + pacing + visual_direction + cta, then normalize to 0-100.
+
+blockers: array of strings describing actionable problems (empty array if score_total >= 65).
+suggestions: array of 2-4 specific, actionable improvement suggestions regardless of score.
+
+Required JSON schema (return ONLY this):
+{"score_total":number,"criteria":{"hook":number,"analogias":number,"curiosity_gap":number,"pacing":number,"visual_direction":number,"argument_depth":number,"cta":number,"unique_value":number},"blockers":string[],"suggestions":string[]}
+`.trim();
+
+/**
+ * Avalia a qualidade de um bloco de roteiro usando Claude Sonnet.
+ * Sempre sincronico (inline no pipeline — nao usa batch).
+ */
+export async function evaluateScriptQuality(input: {
+  blockText: string;
+  blockNumber: number;
+  totalBlocks: number;
+}): Promise<QualityGateResult> {
+  const dynamicContent = `Script block ${input.blockNumber}/${input.totalBlocks}:
+---
+${input.blockText}
+---
+
+Return ONLY JSON. No markdown fences.`.trim();
+
+  const response = await getClient().messages.create({
+    model: QUALITY_GATE_MODEL,
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: QUALITY_GATE_STATIC_PROMPT, cache_control: { type: "ephemeral" } },
+          { type: "text", text: dynamicContent },
+        ],
+      },
+    ],
+  });
+
+  const raw = response.content
+    .filter((p) => p.type === "text")
+    .map((p) => ("text" in p ? p.text : ""))
+    .join("")
+    .trim();
+
+  // Extrai JSON mesmo que a resposta tenha texto ao redor
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    throw new Error(`QualityGate: resposta nao contem JSON valido. Bloco ${input.blockNumber}. Raw: ${raw.slice(0, 200)}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonMatch[0]);
+  } catch {
+    throw new Error(`QualityGate: JSON invalido no bloco ${input.blockNumber}. Raw: ${raw.slice(0, 200)}`);
+  }
+
+  const r = parsed as Record<string, unknown>;
+  const c = (r.criteria ?? {}) as Record<string, unknown>;
+
+  const result: QualityGateResult = {
+    score_total: Number(r.score_total ?? 0),
+    criteria: {
+      hook: Number(c.hook ?? 0),
+      analogias: Number(c.analogias ?? 0),
+      curiosity_gap: Number(c.curiosity_gap ?? 0),
+      pacing: Number(c.pacing ?? 0),
+      visual_direction: Number(c.visual_direction ?? 0),
+      argument_depth: Number(c.argument_depth ?? 0),
+      cta: Number(c.cta ?? 0),
+      unique_value: Number(c.unique_value ?? 0),
+    },
+    blockers: Array.isArray(r.blockers) ? (r.blockers as string[]) : [],
+    suggestions: Array.isArray(r.suggestions) ? (r.suggestions as string[]) : [],
+  };
+
+  return result;
 }
 
 export async function generateAssetsPlanJson(input: {
@@ -310,9 +462,8 @@ export async function generateSegmentationPlanJson(input: {
   maxScenes: number;
   projectId?: number;
 }): Promise<string> {
-  const userPrompt = `
-${input.promptBase}
-
+  // promptBase (segmenta01.md) e identico para todos os projetos e blocos — cache maximo.
+  const dynamicPart = `
 Context:
 - block_number: ${input.blockNumber}
 - total_blocks: ${input.totalBlocks}
@@ -327,7 +478,7 @@ Return ONLY JSON following segmenta01 schema (schema_version "2.0-segmentation",
 
   return runClaudeUserPrompt({
     stage: "segmentation",
-    userPrompt,
+    userPrompt: { cacheable: input.promptBase.trim(), dynamic: dynamicPart },
     projectId: input.projectId,
     blockNumber: input.blockNumber,
     emptyError: `Claude retornou segmentacao vazia para bloco ${input.blockNumber}`,
@@ -361,9 +512,10 @@ export async function generateVisualizationPlanJson(input: {
 - Wojak must comically act out each narration_text; prefer type "video" with motion cues in description
 `.trim()
     : "";
-  const userPrompt = `
-${input.promptBase}
 
+  // promptBase (visualiza01.md + addon wojak se ativo) e estatico por modalidade —
+  // identico para todos os blocos e projetos com a mesma modalidade visual.
+  const dynamicPart = `
 Context:
 - block_number: ${input.blockNumber}
 - total_blocks: ${input.totalBlocks}
@@ -380,7 +532,7 @@ Return ONLY JSON following visualiza01 schema (schema_version "2.0-visualization
 
   return runClaudeUserPrompt({
     stage: "visualization",
-    userPrompt,
+    userPrompt: { cacheable: input.promptBase.trim(), dynamic: dynamicPart },
     projectId: input.projectId,
     blockNumber: input.blockNumber,
     customIdSuffix: input.customIdSuffix,

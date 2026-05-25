@@ -705,13 +705,14 @@ Gravado ao falhar parse/validacao em segmentacao ou visualizacao (`writePlanPars
 
 **Perfil inicial:** `wojak-images-only` — `max_videos` forcado a 0; imagens via Google Batch; ordem:
 
-1. `roteiro` (por bloco, ate `--max-retries-per-block`)
-2. `imagens` (plano v2 + enqueue batch por bloco)
-3. `image_sync` (poll ate sem `image_jobs` pendentes ou `--image-sync-max-rounds`)
-4. `imagens_retry` (blocos com `image_jobs.outcome=failed`: apaga failed, re-render bloco, sync curto)
-5. `narracao` (ElevenLabs por cena; requer `blockNN.assets.json`)
-6. `montagem` (FFmpeg; requer `scXX.mp3` + PNG)
-7. `thumbnails` (opcional; `--skip-thumbnails`)
+1. `roteiro` (por bloco ou `GENTUBE_ROTEIRO_STAGE_BATCH=1` — um batch para todos os blocos pendentes)
+2. `quality_gate` (Sonnet; score + regeneracao opcional; nunca bloqueia o pipeline)
+3. `imagens` (plano v2 + enqueue batch por bloco)
+4. `image_sync` (poll ate sem `image_jobs` pendentes ou `--image-sync-max-rounds`)
+5. `imagens_retry` (blocos com `image_jobs.outcome=failed`: apaga failed, re-render bloco, sync curto)
+6. `narracao` (ElevenLabs por cena + cache TTS; requer `blockNN.assets.json`)
+7. `montagem` (FFmpeg; requer `scXX.mp3` + PNG)
+8. `thumbnails` (opcional; `--skip-thumbnails`)
 
 **Rastreio (SQLite):**
 
@@ -725,11 +726,9 @@ Gravado ao falhar parse/validacao em segmentacao ou visualizacao (`writePlanPars
 
 **CLI auxiliar:** `gentube pipeline-report --project <id|slug> [--run-id N]`.
 
-**Retomada:** `--from-stage <etapa>` — etapas **anteriores na ordem do pipeline** sao ignoradas (nao reexecutadas). Ex.: `--from-stage narracao` **nao** corre `imagens` nem `image_sync` — use `--from-stage imagens` se o plano ja existe e faltam PNG. Blocos ja `success` em `script_blocks` / `media_blocks` / `narration_blocks` sao marcados `skipped` nos steps.
+**Retomada:** `--from-stage <etapa>` — etapas anteriores sao ignoradas; blocos ja `success` em `script_blocks` / `media_blocks` / `narration_blocks` sao marcados `skipped` nos steps.
 
-**Render Wojak imagens-only:** em `runImagensVideosBlock`, quando `maxVideos === 0` (perfil `wojak-images-only`), cenas com `visual.type === video` geram **bootstrap PNG** (`scXX__bootstrap.png`) e **nao** invocam Veo. Montagem resolve bootstrap se `.mp4` ausente (`resolveSceneVisualPath`).
-
-**Flags:** `--no-continue-on-error`, `--voice-id`, `--avatar-file`, `--max-images-block1`, `--max-images-other`, `--image-sync-interval`, `--google-batch-mode`, `--scene-plan-v2`, `--skip-thumbnails`, `--montagem-force`, `--from-stage`, `--through-stage`.
+**Flags:** `--no-continue-on-error`, `--voice-id`, `--avatar-file`, `--max-images-block1`, `--max-images-other`, `--image-sync-interval`, `--google-batch-mode`, `--scene-plan-v2`.
 
 **Implementacao:** `src/services/pipeline-orchestrator.ts`, `src/repository-pipeline.ts`, migracao em `src/db.ts` (`migratePipelineRunsSchema`).
 
@@ -1219,21 +1218,6 @@ npm run gentube -- sync-from-disk --project <id> --only montagem
 - Idempotencia: `GENTUBE_MONTAGEM_SKIP_EXISTING=1` — saltar se saida mais recente que entradas (`--force` re-encode).
 - `create-video` / template criam pasta `06 - Montagem/`.
 
-### 23.12 Concatenacao xfade em lotes (blocos longos)
-
-Quando `clipPaths.length > GENTUBE_MONTAGEM_XFADE_MAX_SCENES_SINGLE` (default **40**), `concatClipsWithXfadeChunked` em `src/utils/montagem-render.ts`:
-
-1. Divide as cenas em lotes de ate N clipes.
-2. Cada lote: um `filter_complex` single-pass → ficheiro `.xfade-chunk-{i}-blockNN.mp4`.
-3. Funde os lotes com outro single-pass (ou recursao se ainda > N).
-
-**Motivo:** um unico encode com 80–105 inputs (`block06` do projeto 12) causa OOM / `ffmpeg: exit null`. O modo `pairwise` (104 encodes sequenciais) funciona mas e muito lento.
-
-| Variavel | Default | Uso |
-|----------|---------|-----|
-| `GENTUBE_MONTAGEM_XFADE_MAX_SCENES_SINGLE` | `40` | Tamanho maximo de um lote na concat |
-| `GENTUBE_MONTAGEM_XFADE_CONCAT` | `single` | Dentro de cada lote; evitar `pairwise` em blocos longos |
-
 ### 23.11 Prototipo local
 
 ```bash
@@ -1312,37 +1296,713 @@ npm run gentube -- claude:sync --project 20260521-The-10-Brutal-Truths-how-AI-En
 npm run gentube -- pipeline-report --project 20260521-The-10-Brutal-Truths-how-AI-Ends
 ```
 
-### 24.6 Cobertura de texto na segmentacao
-
-`validateSceneTextsCoverBlock` (`src/utils/text-coverage.ts`) exige que a concatenacao das `narration_text` das cenas seja identica ao `blockNN.md` apos normalizacao.
-
-**Separadores Markdown `---`:** linhas so com `---` no roteiro (quebras de secao) **nao** entram na narracao por cena; sao removidas na normalizacao (`replace(/^\s*---\s*$/gm, " ")`). Sem isto, blocos com `---` (ex. `block07.md`) falham com *Cobertura de texto falhou* mesmo com segmentacao correta.
-
-**Blocos muito longos:** se `sc59` (ou ultima cena) exceder `GENTUBE_MAX_WORDS_PER_SCENE`, aumente cenas via `GENTUBE_MAX_SCENES_WORDS_DIVISOR` (ex. `10` para ~100 cenas em 1000 palavras) e regenere segmentacao.
-
-### 24.7 Roteiro importado (sem step roteiro)
-
-Fluxo para texto ja gerado no Claude (ou outro editor):
-
-1. `create-video --mode iterativo` (ou flags `--channel`, `--title`, `--blocks`).
-2. Copiar `block01.md` … `blockNN.md` para `01 - Roteiro/`.
-3. `sync-from-disk --only roteiro` → `script_blocks.status = success`.
-4. Continuar com `plan-only` / `run-pipeline --from-stage imagens`.
-
-Nao executar `run-step --step roteiro` salvo para regerar texto.
-
-### 24.8 Google Gemini — teto de gastos mensal
-
-Sintoma: `429 RESOURCE_EXHAUSTED` com *Your project has exceeded its monthly spending cap* em `image:sync`, bootstrap sync ou submit batch.
-
-| Acao | Detalhe |
-|------|---------|
-| Gestao | [Google AI Studio — Spend](https://ai.studio/spend) |
-| Pipeline | `image_sync` em loop nao avanca; `imagens` falha em todos os blocos |
-| Retomada | Apos aumentar cap ou novo ciclo: `--from-stage imagens` + `image:sync --watch` |
-
-Distinto de quota **Veo** (`429` rate limit) — ver `wojak.md`.
-
-### 24.9 Roteiro — alinhamento futuro (opcional)
+### 24.6 Roteiro — alinhamento futuro (opcional)
 
 Matriz atual: 8 blocos com **multiplas portas** por bloco (ex. bloco 5 = portas 4+5, bloco 6 = 6+7). Medio prazo: **10 blocos / 1 porta** no `create-video` ou revisao manual de `block06.md` … `block08.md` para evitar >100 cenas/bloco.
+
+---
+
+## 25) Analise de arquitetura e roadmap de evolucao (2026-05-25)
+
+Sessao de revisao tecnica completa do estado atual do GenTube, cobrindo tres eixos: **arquitetura de agentes**, **otimizacao de custo** e **background processing com rastreabilidade**.
+
+### 25.1 Diagnostico do estado atual
+
+#### 25.1.1 O que funciona bem
+
+- Rastreamento solido via SQLite (`pipeline_runs`, `pipeline_run_steps`, `project_logs`, `claude_batch_jobs`, `image_jobs`).
+- Batch APIs ja utilizados: Claude Message Batch (~50% custo) e Google Batch API (~50% custo imagens).
+- Retry por bloco com `continueOnError` e `fromStage`/`throughStage` para retomada.
+- Modularidade entre etapas com salto inteligente (blocos `status=success` sao pulados).
+- Modo Wojak completo com validacoes rigidas (sem stock, character_required, variante inferida).
+
+#### 25.1.2 Problemas identificados
+
+| Problema | Impacto |
+|---|---|
+| Nenhum agente de avaliacao de qualidade | Roteiro fraco avanca para imagens + TTS + video sem checagem |
+| Claude Opus 4.7 em segmentacao e visualizacao | Segmentacao e tarefa de divisao de frases; visualizacao e JSON estruturado — Opus e overkill e caro |
+| `promptBase` (matriz.md) enviado sem prompt caching | 50K+ tokens repetidos a cada bloco sem reutilizacao de cache |
+| 1 batch Claude por bloco por etapa | 8 blocos × 3 etapas = 24 batches vs 3 possiveis |
+| CLI bloqueante | Terminal precisa ficar aberto durante todo o pipeline; queda mata a corrida |
+| Retentativas sem distincao de tipo de erro | Erro de validacao JSON tratado igual a erro de quota (429) |
+| Sem loop de feedback script → qualidade | Roteiro ruim consome ElevenLabs + Gemini + Veo sem possibilidade de correcao |
+
+---
+
+### 25.2 Proposta: arquitetura de multi-agentes
+
+> **Implementacao:** P1–P8 descritos abaixo estao codificados na branch **`multiagent`**; detalhes de ficheiros, schema e CLI em **secao 26**. A tabela **25.5** marca o status de cada prioridade.
+
+O codigo atual possui **servicos**, nao **agentes**. A diferenca critica: agente tem responsabilidade propria, criterio de aceitacao e pode rejeitar/refinar antes de passar adiante.
+
+#### 25.2.1 Grafo de agentes proposto
+
+```
+[ScriptAgent] → [QualityGateAgent] → [PlanAgent] → [AssetAgent] → [AssemblyAgent]
+                      ↑ loop de feedback (max 2 iteracoes)
+```
+
+#### 25.2.2 ScriptAgent
+
+Corresponde ao `runRoteiroBlock` atual. Sem mudanca estrutural — se beneficia das otimizacoes de custo (secao 25.3) e do loop de feedback do QualityGateAgent.
+
+#### 25.2.3 QualityGateAgent (novo — maior impacto em qualidade)
+
+**Objetivo:** avaliar o roteiro gerado antes de gastar recursos em imagens, TTS ou video.
+
+**Quando roda:** apos cada bloco de roteiro, antes de submeter plano de imagens ou narracao.
+
+**Modelo:** Claude Sonnet 4.6 (avaliacao estruturada JSON; ~5x mais barato que Opus).
+
+**Criterios de avaliacao (score 0–100 por criterio):**
+
+| Criterio | O que o agente verifica |
+|---|---|
+| **Forca do hook** | Primeiras 3 frases: pergunta, dado chocante ou promessa especifica? |
+| **Analogias** | Conceitos abstratos tem comparacao concreta? |
+| **Curiosity gap** | Tem "loops abertos" — afirmacoes que prometem revelacao futura? |
+| **Ritmo (pacing)** | Sentencas variam em tamanho? Evita paragrafos longos sem respiro? |
+| **Direcao visual** | Texto da pistas visuais — acoes, metaforas fisicas, movimento? |
+| **Profundidade argum.** | Tem dados, causa + efeito ou so afirmacoes vazias? |
+| **CTA final** | Bloco final tem chamada clara e especifica? |
+| **Valor unico** | Existe insight que o viewer nao encontraria em 5 outros videos? |
+
+**Output esperado:**
+```json
+{
+  "score_total": 72,
+  "criteria": {
+    "hook": 85, "analogias": 60, "curiosity_gap": 70,
+    "pacing": 80, "visual_direction": 65, "argument_depth": 55,
+    "cta": 90, "unique_value": 60
+  },
+  "blockers": ["argument_depth abaixo de 50 — sem dados ou causa/efeito"],
+  "suggestions": ["Adicionar estatistica no paragrafo 3", "Reescrever CTA do bloco 2 como pergunta especifica"]
+}
+```
+
+**Politica de regeneracao:**
+- `score_total >= threshold` (default 65, variavel `GENTUBE_QUALITY_GATE_THRESHOLD`): aprovado, segue.
+- `score_total < threshold` (1a avaliacao): regenera roteiro do bloco com `suggestions` injetado como contexto adicional; avalia novamente.
+- 2a avaliacao: passa independente do score (evita loop infinito e custo extra).
+- Custo por bloco: ~$0.05 (Sonnet). Previne desperdicar $1–3 em imagens + TTS de bloco fraco.
+
+**Variaveis `.env`:**
+
+| Variavel | Default | Uso |
+|---|---|---|
+| `GENTUBE_QUALITY_GATE_ENABLED` | `1` | Ativa/desativa o agente |
+| `GENTUBE_QUALITY_GATE_THRESHOLD` | `65` | Score minimo para aprovacao (0–100) |
+| `GENTUBE_QUALITY_GATE_MAX_REGEN` | `1` | Maximo de regeneracoes por bloco |
+| `GENTUBE_CLAUDE_MODEL_QUALITY_GATE` | `claude-sonnet-4-6` | Modelo do agente |
+
+**Posicao no pipeline:** entre `roteiro` e `imagens` no `pipeline-orchestrator.ts`. Novo estagio: `quality_gate`.
+
+**Ordem de estagios atualizada:**
+```
+roteiro → quality_gate → imagens → image_sync → imagens_retry → narracao → montagem → thumbnails
+```
+
+**Rastreamento:** nova coluna `quality_gate_score` e `quality_gate_attempts` em `script_blocks`; registro em `pipeline_run_steps` com `stage=quality_gate`.
+
+#### 25.2.4 PlanAgent (segmentacao + visualizacao — refatoracao de modelos)
+
+Manter estrutura atual, mas separar modelos por sub-tarefa (ver secao 25.3.2).
+
+#### 25.2.5 AssetAgent (imagens + video — deduplicacao)
+
+Manter estrutura atual, adicionar deduplicacao por hash de prompt (ver secao 25.3.4).
+
+#### 25.2.6 AssemblyAgent (montagem — sem mudanca estrutural agora)
+
+Sem mudancas nesta fase. Beneficia-se indiretamente da melhoria de qualidade upstream.
+
+---
+
+### 25.3 Otimizacao de custo: cinco pontos de acao
+
+#### 25.3.1 Prompt Caching da Anthropic (impacto: -60 a 70% nos tokens de entrada)
+
+**Problema:** `promptBase` (matriz.md, ~50K tokens) e enviado inteiro em cada chamada sem cache.
+
+**Solucao:** usar `cache_control: { type: "ephemeral" }` na parte estatica do prompt.
+
+```typescript
+// src/integrations/claude.ts — buildMessageCreateParams()
+messages: [{
+  role: "user",
+  content: [
+    { type: "text", text: promptBase, cache_control: { type: "ephemeral" } },
+    { type: "text", text: contextoDinamico }  // bloco-especifico, nao cachear
+  ]
+}]
+```
+
+Cache ephemeral da Anthropic: TTL de 5 minutos para chamadas sincronas; reutilizavel dentro de um mesmo batch. Com 8 blocos × 3 etapas = 24 chamadas enviando o mesmo `promptBase`, o cache economiza ~70% dos tokens de entrada a partir da 2a chamada.
+
+**Arquivos a modificar:** `src/integrations/claude.ts` (`buildMessageCreateParams`, `generateScriptBlock`, `generateSegmentationPlanJson`, `generateVisualizationPlanJson`).
+
+#### 25.3.2 Model tiering — usar modelo certo por etapa
+
+As variaveis `GENTUBE_CLAUDE_MODEL_SEGMENTATION` e `GENTUBE_CLAUDE_MODEL_VISUALIZATION` ja existem no codigo mas provavelmente nao estao setadas no `.env`, caindo no default `CLAUDE_MODEL` (Opus 4.7). Definir esses valores ja reduz custo significativamente sem nenhuma mudanca de codigo.
+
+| Etapa | Modelo atual | Modelo proposto | Justificativa | Economia est. |
+|---|---|---|---|---|
+| Roteiro | Opus 4.7 | **Manter Opus** | Qualidade criativa e o diferencial | 0% |
+| QualityGate | (nao existe) | **Sonnet 4.6** | Avaliacao estruturada JSON | baseline |
+| Segmentacao | Opus 4.7 (default) | **Haiku 4.5** | Tarefa pura de divisao de frases em cenas | ~90% |
+| Visualizacao | Opus 4.7 (default) | **Sonnet 4.6** | JSON estruturado com regras claras | ~80% |
+| Thumbnails | Opus 4.7 (default) | **Sonnet 4.6** | Descricao de imagem estruturada | ~80% |
+
+**Acao imediata (so .env, sem codigo):**
+```
+GENTUBE_CLAUDE_MODEL_SEGMENTATION=claude-haiku-4-5-20251001
+GENTUBE_CLAUDE_MODEL_VISUALIZATION=claude-sonnet-4-6
+```
+
+#### 25.3.3 Agrupar batches Claude por etapa, nao por bloco
+
+**Problema atual:** 8 blocos × 3 etapas = 24 batches Claude separados, cada um com polling proprio.
+
+**Proposta:** 1 batch por etapa com N requests internos.
+
+```
+Batch "segmentacao-p123": [
+  { custom_id: "p123-seg-b1", params: {...} },
+  { custom_id: "p123-seg-b2", params: {...} },
+  ...ate bloco 8
+]
+```
+
+A Message Batches API suporta ate 10K requests por batch. Um batch com 8 items termina no mesmo tempo que um batch com 1 item — o overhead de polling e fixo por batch, nao por item.
+
+**Impacto:** reduz polling de 24 rounds para 3 (roteiro, segmentacao, visualizacao). Reduz latencia total e simplifica o fluxo de `claude:sync`.
+
+**Arquivos a modificar:** `src/integrations/claude.ts` (submissao em grupo), `src/services/pipeline.ts` (coordenacao por etapa antes de aguardar), `src/repository-claude-batch.ts` (agrupamento de batch_id por etapa).
+
+#### 25.3.4 Deduplicacao de imagens por hash de prompt
+
+**Problema:** mesmo prompt Wojak (ex. "Wojak neutro olhando para cima") aparece em multiplos blocos ou projetos similares, gerando imagem identica N vezes.
+
+**Proposta:** antes de submeter `image_job`, calcular `SHA256(prompt_text + reference_image_path + provider + model)`. Se hash ja existe em `image_jobs` com `outcome=done`, reusar o arquivo sem novo job.
+
+**Schema:** adicionar coluna `prompt_hash TEXT` em `image_jobs` com indice unico `(prompt_hash, provider)`.
+
+**Arquivos a modificar:** `src/db.ts` (migracao), `src/services/image-generation.ts` (checagem pre-submit), `src/repository.ts` (lookup por hash).
+
+#### 25.3.5 Cache TTS por hash de texto
+
+**Problema:** `runNarracaoBlock` ja verifica existencia de arquivo (≥1 KiB no mesmo caminho), mas nao reutiliza entre projetos nem quando `block_number` muda.
+
+**Proposta:** tabela `tts_cache` com `(text_hash, voice_id, model_id) → file_path`. Antes de chamar ElevenLabs, consultar o cache. Intros padrao do canal, frases recorrentes ou blocos regenerados reusam MP3 existente.
+
+```sql
+CREATE TABLE tts_cache (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  text_hash TEXT NOT NULL,
+  voice_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  char_count INTEGER,
+  created_at TEXT NOT NULL,
+  UNIQUE(text_hash, voice_id, model_id)
+);
+```
+
+**Arquivos a modificar:** `src/db.ts`, `src/integrations/elevenlabs.ts`, `src/services/pipeline.ts` (`runNarracaoBlock`).
+
+---
+
+### 25.4 Background processing e rastreabilidade aprimorada
+
+#### 25.4.1 Problema atual: CLI bloqueante
+
+`run-pipeline` bloqueia o terminal ate tudo terminar. O `image_sync` interno faz polling ativo em loop (`while rounds < maxRounds`). Isso e fragil: queda de conexao SSH, laptop fechado ou processo morto interrompem o pipeline sem recovery automatico.
+
+#### 25.4.2 Proposta: tabela de fila de jobs (Tier 1 — minimo viavel)
+
+Nova tabela `job_queue` no SQLite para desacoplar submissao de execucao:
+
+```sql
+CREATE TABLE job_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  stage TEXT NOT NULL,
+  block_number INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  error_type TEXT,          -- 'transient' | 'permanent' | 'quota'
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  next_retry_at TEXT,       -- ISO; backoff exponencial
+  payload_json TEXT,
+  result_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(project_id) REFERENCES video_projects(id)
+);
+CREATE INDEX idx_job_queue_runnable ON job_queue(status, next_retry_at);
+```
+
+#### 25.4.3 Proposta: processo daemon (Tier 2)
+
+Comando `gentube daemon start` que:
+1. Processa fila via `SELECT ... WHERE status='pending' AND next_retry_at <= datetime('now')`.
+2. Marca `status=running` antes de executar (evita duplo processamento em multiplos processos).
+3. Ao concluir etapa, enfileira automaticamente a proxima conforme grafo de dependencias.
+4. Persiste estado entre reinicializacoes — retoma do ponto exato sem perder trabalho.
+5. Roda em background sem terminal aberto (`gentube daemon stop`, `gentube daemon status`).
+
+#### 25.4.4 Distincao de tipo de erro nas retentativas
+
+**Problema atual:** `continueOnError: true` trata qualquer falha identicamente.
+
+**Proposta:** categorizar erros no `recordStep` antes de decidir sobre retry:
+
+| Tipo | Exemplos | Acao |
+|---|---|---|
+| `transient` | Timeout, 5xx, network error | Retry com backoff exponencial (5s, 15s, 45s) |
+| `permanent` | JSON invalido, validacao Wojak falhou, roteiro vazio | Sem retry — reportar imediatamente, nao gastar mais tokens |
+| `quota` | 429 rate limit (Veo, ElevenLabs, Claude) | Retry apos janela especifica por provedor (Veo: 1h, ElevenLabs: aguardar reset, Claude: 60s) |
+
+**Impacto:** erro de validacao do plano Wojak para na hora sem gastar tokens; quota do Veo agenda retry autonomo; timeout de ElevenLabs e re-tentado sem intervencao manual.
+
+**Arquivos a modificar:** `src/utils/provider-errors.ts` (ja existe — expandir), `src/services/pipeline-orchestrator.ts` (`recordStep`), `src/services/pipeline.ts` (propagacao de tipo de erro).
+
+#### 25.4.5 Notificacoes de conclusao (Tier 3)
+
+- Arquivo flag ao finalizar pipeline: `05 - Modelagem/pipeline-done.flag` com `runId` e status.
+- Webhook URL configuravel: `GENTUBE_WEBHOOK_URL` — POST com payload `RunSummary` ao terminar.
+- Integracao opcional com `mcp__scheduled-tasks` para triggers agendados.
+
+---
+
+### 25.5 Prioridade de implementacao
+
+| Prioridade | Acao | Impacto custo | Impacto qualidade | Complexidade | Status |
+|---|---|---|---|---|---|
+| 🔴 1 | Setar `.env`: `GENTUBE_CLAUDE_MODEL_SEGMENTATION=claude-haiku-4-5-20251001`, `GENTUBE_CLAUDE_MODEL_VISUALIZATION=claude-sonnet-4-6` | Alto (-80% seg/viz) | Nenhum | Minima (so .env) | ✅ sec. 26.1 |
+| 🔴 2 | Prompt caching em `buildMessageCreateParams` | Alto (-60% input tokens) | Nenhum | Baixa | ✅ sec. 26.2 |
+| 🟡 3 | QualityGateAgent (Sonnet 4.6) com loop de feedback por bloco | Medio (evita desperdicio downstream) | **Alto** | Media | ✅ sec. 26.3 |
+| 🟡 4 | Batch Claude por etapa em vez de por bloco | Medio (menos overhead polling) | Nenhum | Media | ✅ sec. 26.4 |
+| 🟡 5 | Categorizacao de erros transient/permanent/quota | Medio (evita retries inutils) | Nenhum | Media | ✅ sec. 26.7 |
+| 🟢 6 | Deduplicacao de imagens por hash de prompt | Baixo-Medio | Nenhum | Baixa | ✅ sec. 26.8 |
+| 🟢 7 | Cache TTS por hash de texto | Baixo | Nenhum | Baixa | ✅ sec. 26.9 |
+| 🔵 8 | Tabela `job_queue` + daemon background | Nenhum | Nenhum | Alta | ✅ sec. 26.10 |
+| 🔵 9 | Notificacoes webhook ao finalizar pipeline | Nenhum | Nenhum | Baixa | Pendente |
+
+**Observacoes:**
+- Prioridades 1 e 2 reduzem custo Claude em 60–80% sem alterar comportamento do pipeline.
+- Prioridade 3 (QualityGateAgent) protege todos os gastos subsequentes — cada $0.05 no gate pode evitar $1–3 em recursos de producao aplicados a roteiro fraco.
+- Prioridade 8 (daemon) esta implementada na secao 26.10; prioridade 9 (webhook) permanece pendente.
+
+---
+
+### 25.6 Arquivos principais afetados por cada proposta
+
+| Proposta | Arquivos principais |
+|---|---|
+| Prompt caching | `src/integrations/claude.ts` |
+| Model tiering | `.env`, `src/config.ts` (documentacao de defaults) |
+| QualityGateAgent | `src/integrations/claude.ts`, `src/services/pipeline.ts`, `src/services/pipeline-orchestrator.ts`, `src/db.ts`, `src/repository.ts` |
+| Batch por etapa | `src/integrations/claude.ts`, `src/services/pipeline.ts`, `src/repository-claude-batch.ts` |
+| Categorizacao de erros | `src/utils/provider-errors.ts`, `src/services/pipeline-orchestrator.ts` |
+| Dedup imagens | `src/db.ts`, `src/services/image-generation.ts`, `src/repository.ts` |
+| Cache TTS | `src/db.ts`, `src/integrations/elevenlabs.ts`, `src/services/pipeline.ts` |
+| Daemon + fila | `src/db.ts`, `src/services/pipeline-orchestrator.ts`, novo `src/services/daemon.ts` |
+
+---
+
+## 26) Implementacao das otimizacoes P1–P8 (branch `multiagent`, 2026-05-25)
+
+Esta secao registra o que foi efetivamente implementado na sessao de 2026-05-25, seguindo o roadmap da **secao 25**. A secao 25 descreve a **proposta** (agentes, custo, daemon); aqui ficam ficheiros, schema, CLI e comportamento real. Branch de referencia: **`multiagent`** (em cima de `main` com Claude batch + `run-pipeline`).
+
+### 26.1 P1 — Model tiering por etapa
+
+**Status: ✅ Implementado**
+
+Variaveis adicionadas ao `.env`:
+
+```
+GENTUBE_CLAUDE_MODEL_SEGMENTATION=claude-haiku-4-5-20251001
+GENTUBE_CLAUDE_MODEL_VISUALIZATION=claude-sonnet-4-6
+# Roteiro continua usando CLAUDE_MODEL=claude-opus-4-7 (criatividade)
+```
+
+Funcoes de configuracao adicionadas em `src/config.ts`:
+
+- `claudeModelForStage(stage)` — retorna o modelo correto por etapa
+- `claudeThinkingForStage(stage)` — retorna o modo de thinking correto por etapa
+
+O modelo Haiku (-90% vs Opus) e suficiente para segmentacao (divisao de frases em cenas — tarefa estruturada). Sonnet (-80%) e suficiente para visualizacao (JSON com regras claras). Opus e mantido apenas para o roteiro criativo.
+
+---
+
+### 26.2 P2 — Prompt Caching da Anthropic
+
+**Status: ✅ Implementado**
+
+Tipo exportado em `src/integrations/claude.ts`:
+
+```typescript
+export type CacheablePrompt = string | { cacheable: string; dynamic: string };
+```
+
+Funcao `buildMessageCreateParams(stage, userPrompt)` atualizada: quando `userPrompt` e `{ cacheable, dynamic }`, constroi array de content com `cache_control: { type: "ephemeral" }` no bloco estatico e sem cache no dinamico.
+
+Funcoes refatoradas para separar parte estatica (mesmo para todos os blocos/projetos) da parte dinamica (especifica por bloco):
+
+| Funcao | Parte cacheable | Parte dinamica |
+|---|---|---|
+| `generateScriptBlock` | `formattedPrompt` + `formatRules` | titulo, voz do canal, blocos anteriores, feedback |
+| `generateSegmentationPlanJson` | `promptBase` inteiro | contexto do bloco (roteiro, cenas, numero) |
+| `generateVisualizationPlanJson` | `promptBase` inteiro | contexto por bloco (personagens, roteiro, cenas) |
+
+Economia esperada: ~70% nos input tokens a partir da 2a chamada (TTL 5 min do cache Anthropic).
+
+---
+
+### 26.3 P3 — QualityGateAgent
+
+**Status: ✅ Implementado**
+
+#### 26.3.1 Configuracao
+
+Variaveis adicionadas ao `.env`:
+
+```
+GENTUBE_QUALITY_GATE_ENABLED=1
+GENTUBE_QUALITY_GATE_THRESHOLD=65
+GENTUBE_QUALITY_GATE_MAX_REGEN=1
+# GENTUBE_CLAUDE_MODEL_QUALITY_GATE=claude-sonnet-4-6  # default
+```
+
+Funcoes de config em `src/config.ts`: `qualityGateEnabled()`, `QUALITY_GATE_THRESHOLD`, `QUALITY_GATE_MAX_REGEN`, `QUALITY_GATE_MODEL`.
+
+#### 26.3.2 Schema de banco de dados
+
+Migracao idempotente em `src/db.ts` (`migrateQualityGateSchema`): adiciona colunas `quality_gate_score INTEGER` e `quality_gate_attempts INTEGER NOT NULL DEFAULT 0` na tabela `script_blocks`.
+
+Funcao de repositorio em `src/repository.ts`: `updateScriptBlockQualityGate(projectId, blockNumber, score, attempts)`.
+
+#### 26.3.3 Avaliacao de qualidade
+
+Tipos exportados em `src/integrations/claude.ts`: `QualityGateCriteria`, `QualityGateResult`.
+
+Prompt estatico `QUALITY_GATE_STATIC_PROMPT` com 8 criterios de avaliacao (hook, analogias, curiosity_gap, pacing, visual_direction, argument_depth, cta, unique_value). Marcado com `cache_control` ephemeral — prompt de avaliacao e identico para todos os blocos.
+
+Funcao `evaluateScriptQuality(input)` — sempre sincrona (modo `sync`, independente de `GENTUBE_CLAUDE_DELIVERY`), sempre Sonnet, retorna `QualityGateResult`.
+
+#### 26.3.4 Loop de regeneracao
+
+Funcao `runQualityGateBlock(project, blockNumber, opts?)` em `src/services/pipeline.ts`:
+- Le o bloco do disco (`blockNN.md`)
+- Avalia com `evaluateScriptQuality`
+- Se score >= threshold: passa imediatamente
+- Se score < threshold e attempts < maxRegen: regenera com `runRoteiroBlock` passando `qualityFeedback` (blockers + suggestions formatados)
+- Persiste score e tentativas no banco via `updateScriptBlockQualityGate`
+- **Sempre retorna `passed: true` apos maxRegen iteracoes** — nunca bloqueia o pipeline
+
+Etapa `"quality_gate"` adicionada ao `PipelineStage` e `STAGE_ORDER` em `src/services/pipeline-orchestrator.ts`, entre `"roteiro"` e `"imagens"`.
+
+---
+
+### 26.4 P4 — Batch Claude por etapa (stage-level batching)
+
+**Status: ✅ Implementado**
+
+#### 26.4.1 Helper exportavel de prompt
+
+Tipo `RoteiroPromptInput` e funcao `buildRoteiroUserPrompt(input): CacheablePrompt` extraidos de `generateScriptBlock` em `src/integrations/claude.ts`. Permite reutilizacao da logica de construcao de prompt sem duplicacao entre modo sincrono e batch.
+
+#### 26.4.2 Novo modulo de batch por etapa
+
+Arquivo criado: `src/integrations/claude-stage-batch.ts`
+
+Funcao `runRoteiroBatchAll(items, opts?)`:
+- Recebe array de `RoteiroPromptInput & { projectId }` (todos os blocos pendentes)
+- Constroi requests com `buildMessageCreateParams("roteiro", buildRoteiroUserPrompt(item))` para cada bloco
+- Submete como unico `Message Batch` via `createClaudeMessageBatch`
+- Registra jobs no banco via `insertClaudeBatchJob` (rastreabilidade)
+- Aguarda conclusao via `pollClaudeBatchUntilEnded`
+- Distribui resultados: extrai texto, sanitiza, atualiza job por bloco
+- Retorna `Map<blockNumber, textoLimpo>`
+- Lanca erro agregado se algum bloco falhar
+
+**Tradeoff documentado:** blocos submetidos em paralelo — `previousBlocksText` carregado do disco antes da submissao. Em execucao inicial (todos pendentes), context cruzado entre blocos sera vazio. Em reruns parciais, blocos ja no disco fornecem contexto.
+
+#### 26.4.3 Funcao de orquestracao de etapa
+
+Funcao `runRoteiroBatchStage(project, opts?)` adicionada em `src/services/pipeline.ts`:
+- Coleta blocos pendentes (status != "success")
+- Carrega previousBlocksText e channelVoiceContext antes da submissao
+- Marca blocos como "processing" no banco
+- Chama `runRoteiroBatchAll`
+- Em sucesso: persiste texto no disco e no banco para cada bloco
+- Em falha: marca todos os blocos como "error" e lanca excecao
+
+#### 26.4.4 Integracao no orquestrador
+
+Em `src/services/pipeline-orchestrator.ts`, etapa roteiro agora tem dois modos:
+
+```
+GENTUBE_ROTEIRO_STAGE_BATCH=1  →  runRoteiroBatchStage (1 batch N blocos)
+GENTUBE_ROTEIRO_STAGE_BATCH=   →  loop runRoteiroBlock (1 batch por bloco, default)
+```
+
+Config em `src/config.ts`: `roteiroStageBatchEnabled()`.
+
+O modo default (sem a variavel) mantem o comportamento atual de loop por bloco — sem regressao.
+
+---
+
+### 26.5 Tabela de status das otimizacoes
+
+| Prioridade | Otimizacao | Status | Data |
+|---|---|---|---|
+| P1 | Model tiering (.env + config.ts) | ✅ Implementado | 2026-05-25 |
+| P2 | Prompt Caching (CacheablePrompt + buildMessageCreateParams) | ✅ Implementado | 2026-05-25 |
+| P3 | QualityGateAgent (avaliacao + regeneracao + DB) | ✅ Implementado | 2026-05-25 |
+| P4 | Stage-level batch roteiro (buildRoteiroUserPrompt + claude-stage-batch.ts) | ✅ Implementado | 2026-05-25 |
+| P5 | Categorizacao de erros transient/permanent/quota | ✅ Implementado | 2026-05-25 |
+| P6 | Deduplicacao de imagens por hash de prompt | ✅ Implementado | 2026-05-25 |
+| P7 | Cache TTS por hash de texto | ✅ Implementado | 2026-05-25 |
+| P8 | Daemon + tabela job_queue | ✅ Implementado | 2026-05-25 |
+
+---
+
+### 26.6 Variaveis de ambiente — resumo completo
+
+| Variavel | Default | Descricao |
+|---|---|---|
+| `CLAUDE_MODEL` | — | Modelo para roteiro (criativo; usar Opus) |
+| `GENTUBE_CLAUDE_MODEL_SEGMENTATION` | `CLAUDE_MODEL` | Modelo para segmentacao (Haiku suficiente) |
+| `GENTUBE_CLAUDE_MODEL_VISUALIZATION` | `CLAUDE_MODEL` | Modelo para visualizacao (Sonnet suficiente) |
+| `GENTUBE_CLAUDE_MODEL_QUALITY_GATE` | `claude-sonnet-4-6` | Modelo do QualityGateAgent |
+| `GENTUBE_QUALITY_GATE_ENABLED` | `1` | `0` / `false` / `off` desativa QualityGate |
+| `GENTUBE_QUALITY_GATE_THRESHOLD` | `65` | Score minimo (0–100) para passar sem regenerar |
+| `GENTUBE_QUALITY_GATE_MAX_REGEN` | `1` | Max tentativas de regeneracao por bloco |
+| `GENTUBE_CLAUDE_DELIVERY` | `batch` | `sync` ou `batch` (per-call) |
+| `GENTUBE_ROTEIRO_STAGE_BATCH` | — | `1` para batch todos os blocos em 1 request |
+| `GENTUBE_QUOTA_RETRY_DELAY_MS` | `30000` | Espera (ms) antes de retry em erro de rate limit |
+| `GENTUBE_DAEMON_POLL_MS` | `10000` | Intervalo de polling do daemon (ms) |
+
+---
+
+### 26.7 P5 — Categorizacao de erros transient/permanent/quota
+
+**Status: ✅ Implementado**
+
+#### 26.7.1 Motivacao
+
+Antes do P5, todos os erros dos provedores eram tratados identicamente: retry ate `maxRetriesPerBlock`. Isso desperdicava:
+- **Erros permanentes** (prompt invalido, API key errada): retries nunca vao resolver — falha imediata e mais rapida.
+- **Erros de quota (429)**: retry imediato agrava o rate limit — precisa de backoff.
+- **Erros transientes** (5xx, timeout, ECONNRESET): retry imediato correto.
+
+#### 26.7.2 Implementacao
+
+Funcao `classifyClaudeError(error: unknown): ClaudeErrorKind` adicionada a `src/utils/provider-errors.ts`:
+
+| Tipo | HTTP / campo Anthropic | Comportamento |
+|------|------------------------|---------------|
+| `quota` | 429, `rate_limit_error` | Retry com backoff (`GENTUBE_QUOTA_RETRY_DELAY_MS`, default 30s) |
+| `permanent` | 400, 401, 403, `invalid_request_error`, `authentication_error` | Break imediato — sem retry |
+| `transient` | 500, 502, 503, 529, `overloaded_error`, timeout, ECONNRESET | Retry imediato (comportamento anterior) |
+| *(default)* | Qualquer outro | Tratado como `transient` — conservador |
+
+Constante `QUOTA_RETRY_DELAY_MS` (default 30s, configuravel via `GENTUBE_QUOTA_RETRY_DELAY_MS`).
+
+O SDK Anthropic expoe `.status: number` e `.error.type: string` nas excecoes — extraidos via `extractHttpStatus` e `extractAnthropicErrorType`.
+
+#### 26.7.3 Integracao no orquestrador
+
+`recordStep` em `src/services/pipeline-orchestrator.ts` modificado para retornar `{ status, caughtError? }` em vez de so `PipelineStepStatus`.
+
+Loops de retry atualizados nas etapas **roteiro** (modo sequencial), **imagens**, **imagens_retry** e **narracao**:
+
+```typescript
+const { status, caughtError } = await recordStep(...);
+if (status === "error") {
+  const kind = classifyClaudeError(caughtError);
+  if (kind === "permanent") break;                          // sem retry
+  if (kind === "quota") await sleep(QUOTA_RETRY_DELAY_MS); // backoff
+  // transient: retry imediato (continua o loop)
+}
+```
+
+O campo `attemptsUsed` agora reflete o numero real de tentativas realizadas (antes era sempre `maxRetriesPerBlock` mesmo com break antecipado).
+
+---
+
+### 26.8 P6 — Deduplicacao de imagens por hash de prompt
+
+**Status: ✅ Implementado**
+
+#### 26.8.1 Motivacao
+
+Em reruns parciais e projetos com cenas similares, o mesmo prompt de imagem era submetido multiplas vezes ao Gemini/HF gerando custo redundante. Com dedup por hash, a segunda geracao de imagem identica tem custo zero.
+
+#### 26.8.2 Implementacao
+
+**Schema** (`src/db.ts`, `migrateImageHashSchema`):
+```sql
+ALTER TABLE image_jobs ADD COLUMN prompt_hash TEXT;
+CREATE INDEX idx_image_jobs_prompt_hash ON image_jobs(prompt_hash, outcome);
+```
+
+**Hash** (`src/services/image-generation.ts`, `computeImagePromptHash`):
+```typescript
+sha256(prompt + "|" + (referenceImagePath ?? ""))
+```
+Inclui `referenceImagePath` pois mesmo prompt com imagem de referencia diferente = imagem diferente.
+
+**Lookup** (`src/repository.ts`, `findDoneImageJobByHash`):
+Consulta `image_jobs WHERE prompt_hash = ? AND outcome = 'done'` — retorna o job mais recente.
+
+**Fluxo em `renderSceneImage`**:
+1. Compute hash no inicio
+2. Se modo sincrono (nao batch) e hash existir em job done com arquivo no disco → copia arquivo para `outPathNoExt`, insere job com `status="dedup"`, retorna imediatamente
+3. Caso contrario: executa pipeline normal, passando `promptHash` para `insertImageJob`
+
+O dedup **nao se aplica** a modos `google_batch` / `local_batch` (arquivo nao disponivel no momento da submissao) nem a `forceSync` (bootstrap de video — nao pode depender de cache).
+
+---
+
+### 26.9 P7 — Cache TTS por hash de texto
+
+**Status: ✅ Implementado**
+
+#### 26.9.1 Motivacao
+
+Quando um bloco de roteiro e regenerado (QualityGate, retry manual) mas o texto final nao muda, a narracao ElevenLabs era re-gerada sem necessidade, consumindo caracteres do plano.
+
+#### 26.9.2 Implementacao
+
+**Schema** (`src/db.ts`, `migrateTtsCacheSchema`):
+```sql
+CREATE TABLE tts_cache (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  text_hash TEXT NOT NULL UNIQUE,
+  voice_id TEXT NOT NULL,
+  file_path TEXT NOT NULL,        -- canonical em data/tts_cache/{hash}.mp3
+  text_length INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_tts_cache_hash ON tts_cache(text_hash);
+```
+
+**Hash**: `sha256(stripMarkdownForSpeech(text) + "|" + voiceId)` — depois de remover Markdown (idempotente ao que ElevenLabs recebe).
+
+**Novo modulo** `src/services/tts-cache.ts`, funcao `cachedTextToSpeech(input, destPath)`:
+- Cache hit: copia `data/tts_cache/{hash}.mp3` para `destPath`, retorna `{ cacheHit: true }`
+- Cache miss: chama `textToSpeechMp3`, escreve `destPath`, copia canonical para `data/tts_cache/`, insere registro no banco, retorna `{ cacheHit: false }`
+- Tolerante a arquivo removido manualmente do cache (regera sem erro)
+
+**Integracao** em `src/services/pipeline.ts`:
+- Chamadas `textToSpeechMp3` + `fs.writeFile` substituidas por `cachedTextToSpeech` (por cena e monolitico)
+- Import de `textToSpeechMp3` removido do `pipeline.ts` (indireto via `tts-cache.ts`)
+
+---
+
+### 26.10 P8 — Daemon + tabela job_queue
+
+**Status: ✅ Implementado**
+
+#### 26.10.1 Motivacao
+
+O CLI era bloqueante: o usuario precisava manter o terminal aberto durante toda a execucao do pipeline (30–90 min por video). Com o daemon, os videos sao enfileirados e processados em background.
+
+#### 26.10.2 Schema
+
+**`src/db.ts`**, `migrateJobQueueSchema`:
+```sql
+CREATE TABLE job_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL,
+  profile TEXT NOT NULL DEFAULT 'wojak-images-only',
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending','running','done','failed','cancelled')),
+  priority INTEGER NOT NULL DEFAULT 0,
+  options_json TEXT NOT NULL,   -- JobQueueOptions serializado
+  run_id INTEGER,               -- pipeline_runs.id apos inicio
+  worker_pid INTEGER,           -- PID do processo daemon
+  error_message TEXT,
+  queued_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_job_queue_status ON job_queue(status, priority DESC, id ASC);
+```
+
+#### 26.10.3 Novos arquivos
+
+**`src/repository-jobs.ts`** — CRUD da fila:
+- `enqueueJob(input)` — insere job com status `pending`
+- `claimNextPendingJob(pid)` — SELECT + UPDATE atomico (previne race conditions)
+- `finishJob(id, result)` — atualiza para `done` ou `failed`
+- `cancelJob(id)` — cancela job `pending`
+- `listJobs(opts)` — lista com filtro de status
+- `recoverStalledJobs()` — ao iniciar, marca como `failed` jobs `running` com PID morto
+
+**`src/services/daemon.ts`** — loop de polling:
+- `DAEMON_PID_FILE = data/daemon.pid`
+- `DAEMON_LOG_FILE = data/daemon.log`
+- `runDaemonLoop()` — escreve PID, registra SIGTERM, recupera jobs travados, loop `claimNextPendingJob → runJob → finishJob`
+- `isDaemonRunning()` — verifica PID via `process.kill(pid, 0)`
+- Interval configuravel via `GENTUBE_DAEMON_POLL_MS` (default 10s)
+- Em `runJob`: desserializa `options_json` → `PipelineOrchestratorOptions` → `runFullPipeline`
+
+#### 26.10.4 Comandos CLI
+
+| Comando | Descricao |
+|---------|-----------|
+| `gentube daemon:start` | Inicia daemon detached (`--foreground` para debug) |
+| `gentube daemon:stop` | Envia SIGTERM ao daemon |
+| `gentube daemon:status` | Mostra PID, log path e ultimos 10 jobs |
+| `gentube daemon:run` | Loop interno (chamado por `daemon:start`, nao usar diretamente) |
+| `gentube job:add --project <slug>` | Enfileira projeto com mesmas opcoes de `run-pipeline` |
+| `gentube job:list [--status <s>]` | Lista jobs (filtro por status opcional) |
+| `gentube job:cancel --id <n>` | Cancela job `pending` |
+
+#### 26.10.5 Fluxo tipico
+
+```bash
+# 1. Criar projetos
+gentube create-video --title "Video 1" ...
+gentube create-video --title "Video 2" ...
+
+# 2. Enfileirar
+gentube job:add --project video-1 --voice-id <id>
+gentube job:add --project video-2 --voice-id <id> --priority 1
+
+# 3. Iniciar daemon
+gentube daemon:start
+
+# 4. Monitorar
+gentube daemon:status
+gentube job:list
+
+# 5. Parar quando ocioso
+gentube daemon:stop
+```
+
+#### 26.10.6 Tolerancia a falhas
+
+- `recoverStalledJobs()` ao iniciar: jobs `running` com PID morto → `failed` (evita ficar preso)
+- `claimNextPendingJob` usa UPDATE com WHERE condicional para prevenir dois daemons pegando o mesmo job
+- SIGTERM gracioso: termina o job atual antes de encerrar
+- Daemon nao inicia se PID file existir e processo estiver vivo
+
+#### 26.10.7 Branch e ficheiros novos
+
+| Ficheiro | Papel |
+|----------|--------|
+| `src/services/daemon.ts` | Loop `claimNextPendingJob` → `runFullPipeline` |
+| `src/repository-jobs.ts` | CRUD `job_queue` |
+| `src/integrations/claude-stage-batch.ts` | `runRoteiroBatchAll` (P4) |
+| `src/services/tts-cache.ts` | `cachedTextToSpeech` (P7) |
+
+**Retomada via fila:** `job:add --from-stage imagens` equivale a `run-pipeline --from-stage imagens` (util quando o terminal nao pode ficar aberto). O perfil default do job e `wojak-images-only` (mesmo que `run-pipeline`).
