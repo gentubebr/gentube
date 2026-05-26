@@ -11,6 +11,7 @@ CLI em **Node.js** para organizar projetos de vídeo no estilo YouTube: **roteir
 - Áudio por bloco (`block01.mp3`, …) ou **por cena** (`02 - Narracao/block01/sc01.mp3`, …) quando existe plano v2; concat com `ffmpeg` → `help run-step` (etapa narracao).
 - Status de cada etapa e de cada bloco gravados localmente (sem depender só de arquivos soltos).
 - Modalidade visual **Wojak** (opt-in): avatar line-art, plano só `ai_generated` (sem stock), validação v2, render Gemini+Veo — ver **[wojak.md](wojak.md)** e secção **18.10** de `ESPECIFICACAO_TECNICA.md`.
+- Modalidade **Stoic Patrol** (opt-in): stock Magnific com fallback Pexels + cartões de citação (typing) — ver **[stoic-patrol.md](stoic-patrol.md)** e secção **18.12** da especificação.
 
 ## Pré-requisitos: contas, chaves e ferramentas
 
@@ -29,11 +30,26 @@ Antes de clonar o GenTube, reúna o seguinte (sem gravar segredos em ficheiros v
 3. O comando `elevenlabs:status` exige permissão `user_read` na chave.
 4. Antes do TTS, o texto passa por **`stripMarkdownForSpeech`** (remove `**negrito**`, listas, links, etc.) para o modelo não ler pontuação Markdown em voz alta.
 
-### Magnific (stock — imagens e vídeos)
+### Stock — Magnific e Pexels (imagens e vídeos)
+
+O step **imagens** baixa cenas `source: stock` via `GENTUBE_STOCK_PROVIDER` (`src/integrations/stock-download.ts` → Magnific e/ou Pexels).
+
+#### Magnific (primário por defeito)
 
 1. Conta / API em [Magnific](https://www.magnific.com/) (documentação da API B2B).
-2. No `.env`: `MAGNIFIC_API_KEY`. Planos sem download premium podem falhar em parte dos assets (o pipeline faz fallback para IA — Higgsfield ou Gemini, conforme `GENTUBE_IMAGE_BACKEND`).
-3. Stock **16:9**: a busca de vídeo usa `filters[aspect_ratio][]=16:9`; imagens usam metadados `source.size` e validação pós-download (`image-size`). Vídeos podem ser confirmados com **`ffprobe`** se estiver no `PATH` (pacote `ffmpeg`).
+2. No `.env`: `MAGNIFIC_API_KEY`. Planos sem download premium podem falhar em parte dos assets.
+3. Stock **16:9**: vídeo com `filters[aspect_ratio][]=16:9`; imagens validadas pós-download (`image-size`) e, se necessário, recorte com FFmpeg (`GENTUBE_FFMPEG_PATH` ou `experiments/ffmpeg-bin/ffmpeg`).
+4. Em falha (429, 500, asset desativado, sem match 16:9), o pipeline pode tentar **Pexels** se `GENTUBE_STOCK_PROVIDER=magnific_then_pexels`.
+
+#### Pexels (alternativa / fallback)
+
+1. Conta e chave em [Pexels API](https://www.pexels.com/api/documentation/) (header `Authorization`).
+2. No `.env`: `PEXELS_API_KEY`.
+3. Endpoints: `GET /v1/search` (fotos, `orientation=landscape`) e `GET /v1/videos/search` (vídeos, `orientation=landscape`). Download por URL direta em `photo.src` / `video_files[]` (não conta como chamada API extra).
+4. Limites default: **200 pedidos/hora**, **20 000/mês**; headers `X-Ratelimit-Remaining`, `X-Ratelimit-Reset`. Projetos grandes devem usar **cache** (`data/stock_cache/`) e fallback (não substituir Magnific por Pexels em todas as cenas de uma vez).
+5. **Atribuição:** crédito ao fotógrafo / link Pexels na descrição ou créditos do vídeo (requisito da API).
+
+**Modo `default`:** se Magnific falhar no stock, fallback para **IA** (Higgsfield ou Gemini, conforme `GENTUBE_IMAGE_BACKEND`). **Stoic Patrol** (`stoic_patrol`): sem fallback IA no stock — usar `magnific_then_pexels` e retomar com `--enqueue-only`.
 
 ### Higgsfield CLI (geração IA imagens/vídeo)
 
@@ -149,9 +165,11 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `CLAUDE_THINKING` | Opcional | `adaptive` (Opus 4.7), `disabled` (sem thinking, permite temperature) ou vazio |
 | `ELEVENLABS_API_KEY` | Sim | API da ElevenLabs (TTS) |
 | `ELEVENLABS_VOICE_ID` | Recomendada | Voz padrão se você não passar `--voice-id` |
-| `MAGNIFIC_API_KEY` | Sim (step imagens) | API da Magnific/Freepik (stock footage e imagens) |
-| `GENTUBE_STOCK_RATIO_BLOCK1` | Opcional | % de shots do bloco 1 vindos do stock Magnific (default: `50`) |
-| `GENTUBE_STOCK_RATIO_OTHER` | Opcional | % de shots dos blocos 2..N vindos do stock (default: `90`) |
+| `MAGNIFIC_API_KEY` | Sim (step imagens, se usar Magnific) | API Magnific/Freepik |
+| `PEXELS_API_KEY` | Sim se `GENTUBE_STOCK_PROVIDER` incluir Pexels | API Pexels ([documentação](https://www.pexels.com/api/documentation/)) |
+| `GENTUBE_STOCK_PROVIDER` | Opcional | `magnific` (default), `pexels`, `magnific_then_pexels`, `pexels_then_magnific` |
+| `GENTUBE_STOCK_RATIO_BLOCK1` | Opcional | % de shots do bloco 1 com `source: stock` (default: `50`) |
+| `GENTUBE_STOCK_RATIO_OTHER` | Opcional | % de shots dos blocos 2..N com stock (default: `90`) |
 | `GENTUBE_PROMPT_MATRIX` | Opcional | Ficheiro em `Prompts/` para o **roteiro** (ex.: `matriz_tutorial.md`). Tem prioridade sobre `GENTUBE_ROTEIRO_MODE`. A flag `--prompt-matrix` tem prioridade sobre ambos |
 | `GENTUBE_ROTEIRO_MODE` | Opcional | Com `tutorial` (e sem `GENTUBE_PROMPT_MATRIX` nem `--prompt-matrix`), usa **`matriz_tutorial.md`**. Sem esta variável ou com outro valor, o default do ficheiro continua **`matriz.md`** |
 | `GENTUBE_PROMPT_CANAL_VOICE` | Opcional | Ficheiro em `Prompts/` com **voz/persona do canal** (default `canal_voice.md`), injetado **só no bloco 1** do roteiro; `none` desativa. A flag `--prompt-canal-voice` tem prioridade |
@@ -163,7 +181,9 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `GENTUBE_MAX_VIDEOS_OTHER_BLOCKS` | Opcional | Máx. vídeos nos **blocos 2..N** (default `10`) |
 | `GENTUBE_MAX_IMAGES_OTHER_BLOCKS` | Opcional | Máx. imagens nos **blocos 2..N** (default `40`) |
 | `GENTUBE_SCENE_PLAN_V2` | Opcional | `1` / `true` / `yes`: step **imagens** em modo plano por cenas (dois passos Claude). A flag `--scene-plan-v2` tem prioridade quando passada |
-| `GENTUBE_VISUAL_MODALITY` | Opcional | `default` ou `wojak` — em `wojak`: plano só `ai_generated`, `stock_ratio` efetivo 0, validação `assertWojakBlockPlan`; ver [wojak.md](wojak.md) |
+| `GENTUBE_VISUAL_MODALITY` | Opcional | `default`, `wojak` ou `stoic_patrol` — ver [wojak.md](wojak.md) / [stoic-patrol.md](stoic-patrol.md) |
+| `GENTUBE_VERBOSE` | Opcional | `1` ou flag `--verbose` / `-v`: progresso Claude batch, etapas plano v2, poll de batches |
+| `GENTUBE_QUOTE_RENDER` | Opcional | Stoic Patrol: `hyperframes` (default auto), `ffmpeg` — cartoes `quote_card` |
 | `GENTUBE_PROMPT_VISUALIZA` | Opcional | Ficheiro em `Prompts/` para visualização; em `wojak` o default é `visualiza01.md` + `visualiza_wojak.md` |
 | `GENTUBE_WOJAK_STYLE_TOKEN` | Opcional | Override do prefixo de estilo no render (modo wojak) |
 | `GENTUBE_WOJAK_VEO_USE_REF` | Opcional | `0` (default): Veo sem PNG ref; prompt sanitizado. `1`: envia bootstrap ao Veo (pode disparar RAI) |
@@ -244,7 +264,25 @@ npm run gentube -- create-video --channel 1 \
   --audience "adultos EUA 30+" \
   --blocks 8 \
   --transcript-file Transcripts/minha-referencia.txt \
-  --mode iterativo
+  --create-only
+
+# Stoic Patrol — projeto com transcricao de referencia (roteiro em ingles, fidelidade de tom/arco)
+# Canal id: gentube channel:list  |  .env: GENTUBE_VISUAL_MODALITY=stoic_patrol GENTUBE_SCENE_PLAN_V2=1
+npm run gentube -- create-video --channel 2 \
+  --title "Changing Hurts… But It Changes Everything" \
+  --niche "stoicism, psychology, faith, meaning — removal and transition" \
+  --audience "American adults 30+" \
+  --blocks 8 \
+  --transcript-file "Transcripts/[Claudio Duarte] Changes hurt, but worth" \
+  --prompt-matrix matriz_stoic_patrol.md \
+  --prompt-canal-voice canal_voice_stoic_patrol.md \
+  --create-only
+
+npm run gentube -- run-step --project <slug-do-projeto> --step roteiro \
+  --prompt-matrix matriz_stoic_patrol.md --prompt-canal-voice canal_voice_stoic_patrol.md --verbose
+npm run gentube -- run-step --project <slug> --step imagens --scene-plan-v2 --plan-only --verbose
+npm run gentube -- quote:render --project <slug> --force
+npm run gentube -- run-pipeline --project <slug> --profile stoic-patrol-stock --voice-id <id> --verbose
 
 # Apagar um projeto sem prompts (scripts)
 npm run gentube -- delete-project --project 2 --yes
@@ -455,13 +493,13 @@ npm start -- --help
 
 Arquivos gerados em `Videos/` e imagens em `Avatars/` **não** são versionados (ver `.gitignore`); no clone o diretório `Videos/` vem vazio. O mesmo vale para o conteúdo de `Transcripts/` (só `.gitkeep` no clone). O ficheiro `EXAMPLE.md` também é local-only — use-o como runbook privado.
 
-### Produção mista: IA (Higgsfield + Gemini) + Magnific (stock)
+### Produção mista: IA (Higgsfield + Gemini) + stock (Magnific / Pexels)
 
 O step **imagens** combina até três fontes por cena:
 
 - **Higgsfield (IA)**: imagens e **vídeos** (`nano_banana_flash`, `kling3_0`) — hook e momentos de maior impacto quando `GENTUBE_IMAGE_BACKEND` permite HF.
 - **Google Gemini (IA)**: **só imagens** — sync, batch Google (`--google-batch-mode`) ou batch local (`--batch-local`); fallback ou produção principal conforme `.env` e flags.
-- **Magnific (stock)**: ilustrações e transições genéricas.
+- **Stock (Magnific e/ou Pexels)**: ilustrações e B-roll via `search_keywords` no plano; provedor em `GENTUBE_STOCK_PROVIDER`.
 
 A proporção é configurável via `.env`:
 
@@ -478,7 +516,7 @@ O Claude decide **quais** shots são IA vs stock no plano de direção (`blockXX
 
 **Planeado (migração opção B):** a tabela `image_jobs` unifica jobs HF e Gemini Batch (`provider`, `delivery_mode`, `external_id`, `batch_id`, `outcome`). A tabela legada `hf_cli_jobs` deixa de receber novas imagens; vídeos HF podem migrar depois.
 
-Com `GENTUBE_HF_ASYNC` e backend HF, imagens `ai_generated` vão para a fila sem `--wait`. Conclua com **`image:sync`** (recomendado) ou **`higgsfield:sync`** (alias HF). Com `--google-batch-mode`, o submit é Batch API Google por **bloco** no pipeline; poll via `image:sync`. Stock Magnific continua imediato.
+Com `GENTUBE_HF_ASYNC` e backend HF, imagens `ai_generated` vão para a fila sem `--wait`. Conclua com **`image:sync`** (recomendado) ou **`higgsfield:sync`** (alias HF). Com `--google-batch-mode`, o submit é Batch API Google por **bloco** no pipeline; poll via `image:sync`. Stock (Magnific/Pexels) continua **síncrono** no `enqueue-only` / step imagens.
 
 **Fases do step imagens (schema 2.0):** `--plan-only` (só Claude → `blockNN.assets.json`, todos os blocos); `--enqueue-only` (stock + filas + vídeos HF, **sem** submit por bloco); no fim do `enqueue-only` o CLI submete **N batches** Google (1 por bloco). Modo legado sem essas flags: plano + enqueue + submit **por bloco** como antes. `--plan-only` e `--enqueue-only` exigem `--scene-plan-v2` e são mutuamente exclusivas.
 

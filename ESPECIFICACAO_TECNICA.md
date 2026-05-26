@@ -196,7 +196,7 @@ Tanto `runRoteiro` quanto `runNarracao` verificam o status de cada bloco antes d
 - **Direcao**: Claude le `01 - Roteiro/blockXX.md` e grava o plano em `03 - Imagens e Videos/blockXX.assets.json` (ver secao 18). Modo **classico**: um JSON com `shots[]`; cada shot usa `source: "ai_generated"` ou `source: "stock"` conforme proporcao. Modo **`--scene-plan-v2` / `GENTUBE_SCENE_PLAN_V2`**: dois pedidos Claude (`segmenta01.md`, `visualiza01.md`), JSON com `schema_version: "2.0"` e `scenes[]`; cada cena pode usar `source` em `ai_generated`, `stock` ou `manual_capture` (placeholder PNG no repo ate gravacao).
 - **Producao mista**:
   - Shots `ai_generated` → Higgsfield (`hf generate create`)
-  - Shots `stock` → API Magnific (busca por `search_keywords` + download)
+  - Shots `stock` → API Magnific e/ou Pexels (`GENTUBE_STOCK_PROVIDER`; busca por `search_keywords` + download)
 - **Persistencia**: uma linha `media_blocks` por `(project_id, block_number)` com `plan_status`, `renders_status`, contadores de renders; jobs do CLI em `hf_cli_jobs` quando assincrono.
 - **Politica criativa, modelos, limites e retry de shot**: secao 18. Proporcao IA/stock: secao 20.
 
@@ -368,8 +368,10 @@ Variaveis em `.env`:
 - `ELEVENLABS_API_KEY`
 - `ELEVENLABS_VOICE_ID` (opcional): voice padrao quando `--voice-id` nao e passado no CLI
 - `MAGNIFIC_API_KEY`: chave da API Magnific (ex-Freepik) para busca e download de stock footage/imagens
-- `GENTUBE_STOCK_RATIO_BLOCK1` (opcional): % de shots do bloco 1 vindos do stock Magnific (default: `50`)
-- `GENTUBE_STOCK_RATIO_OTHER` (opcional): % de shots dos blocos 2..N vindos do stock (default: `90`)
+- `PEXELS_API_KEY`: chave da API [Pexels](https://www.pexels.com/api/documentation/) (stock alternativo)
+- `GENTUBE_STOCK_PROVIDER` (opcional): `magnific` (default), `pexels`, `magnific_then_pexels`, `pexels_then_magnific` — ver secao **20.6** / **20.6.1**
+- `GENTUBE_STOCK_RATIO_BLOCK1` (opcional): % de shots do bloco 1 com `source: stock` (default: `50`)
+- `GENTUBE_STOCK_RATIO_OTHER` (opcional): % de shots dos blocos 2..N com stock (default: `90`)
 - `GENTUBE_PROMPT_MATRIX` (opcional): ficheiro do roteiro em `Prompts/`; tem prioridade sobre `GENTUBE_ROTEIRO_MODE`
 - `GENTUBE_ROTEIRO_MODE` (opcional): `tutorial` usa `matriz_tutorial.md` quando `GENTUBE_PROMPT_MATRIX` esta vazio e nao ha `--prompt-matrix`; caso contrario o default do ficheiro e `matriz.md`
 - `GENTUBE_PROMPT_CANAL_VOICE` (opcional): ficheiro Markdown em `Prompts/` com voz do canal para o **bloco 1** do roteiro (default `canal_voice.md` quando a injecao esta ativa); `none` nao carrega
@@ -430,7 +432,10 @@ Politica de versionamento (Git):
 - `src/integrations/elevenlabs/` cliente ElevenLabs
 - `src/integrations/higgsfield-cli.ts` — execucao do CLI `hf` (create/get, sync e async)
 - `src/integrations/higgsfield-agents.ts` — HTTP agents (status), resolucao do binario `hf`
-- `src/integrations/magnific.ts` — busca e download de stock footage/imagens via API Magnific
+- `src/integrations/magnific.ts` — busca e download de stock via API Magnific
+- `src/integrations/pexels.ts` — busca e download de stock via API Pexels
+- `src/integrations/stock-download.ts` — facade `searchAndDownload` (Magnific + Pexels + fallback + variantes de keywords)
+- `src/utils/stock-media.ts` — keywords, 16:9, FFmpeg crop, download HTTP partilhado
 - `src/services/hf-cli-sync.ts` — sincronizacao legada de `hf_cli_jobs`
 - `src/integrations/gemini-image.ts` — sync inline Gemini (**planeado**)
 - `src/integrations/gemini-batch.ts` — submit/poll Batch API Google (**planeado**)
@@ -734,6 +739,63 @@ Gravado ao falhar parse/validacao em segmentacao ou visualizacao (`writePlanPars
 
 **`create-video --mode pipeline`:** apos criar projeto, invoca `run-pipeline` com o mesmo perfil.
 
+### 18.12 Modalidade visual Stoic Patrol (opt-in)
+
+**Documento mestre:** [stoic-patrol.md](stoic-patrol.md).
+
+**Objetivo:** canais de filosofia / estoicismo / fe (ex. **Stoic Patrol**, publico EUA 30+): plano v2 com **stock** (Magnific primario, **Pexels** como fallback) na maior parte dos beats e **cartoes de citacao** (fundo preto, texto branco Montserrat, animacao typing) quando o roteiro traz citacao **explicita**.
+
+**Criar projeto (CLI — preferir a scripts ad-hoc):**
+
+```bash
+npm run gentube -- create-video --channel <id_stoic_patrol> \
+  --title "Changing Hurts… But It Changes Everything" \
+  --niche "stoicism, psychology, faith, meaning" \
+  --audience "American adults 30+" \
+  --blocks 8 \
+  --transcript-file "Transcripts/[Claudio Duarte] Changes hurt, but worth" \
+  --prompt-matrix matriz_stoic_patrol.md \
+  --prompt-canal-voice canal_voice_stoic_patrol.md \
+  --create-only
+```
+
+Grava `05 - Modelagem/transcript.txt` e regista o texto no SQLite (`video_projects.transcript`). O roteiro (`matriz_stoic_patrol.md`) exige **fidelidade de tom e arco** ao transcript, com **ingles original** (proibido copiar frases do PT).
+
+**Ativacao:** `GENTUBE_VISUAL_MODALITY=stoic_patrol` (alias aceite: `stoic-patrol`, `religious`). Corrida recomendada: `GENTUBE_SCENE_PLAN_V2=1`, `GENTUBE_STOCK_RATIO_BLOCK1=100`, `GENTUBE_STOCK_RATIO_OTHER=100`, `GENTUBE_STOCK_PROVIDER=magnific_then_pexels`, `PEXELS_API_KEY` no `.env`, sem HF/Gemini no MVP.
+
+**Plano v2:** `stock_ratio` efetivo **100** entre cenas nao-quote (`resolveStockRatioForBlock`). Nova fonte `source: "quote_card"` com `quote_text`, `quote_attribution?`, `animation_type: "typing"`, `render_engine: "hyperframes"`. Validacao: `assertStoicPatrolBlockPlan` em `src/utils/stoic-patrol-prompt.ts`.
+
+**Prompts:**
+
+| Etapa | Ficheiros |
+|-------|-----------|
+| Roteiro | `Prompts/matriz_stoic_patrol.md` (default se modality ativa e sem `GENTUBE_PROMPT_MATRIX`) |
+| Voz bloco 1 | `Prompts/canal_voice_stoic_patrol.md` (default analogo) |
+| Segmentacao | `segmenta01.md` + `Prompts/segmenta_stoic_patrol.md` (`quote_hint`) |
+| Visualizacao | `visualiza01.md` + `Prompts/visualiza_stoic_patrol.md` |
+
+**Render:**
+
+| `source` | Comportamento |
+|----------|----------------|
+| `stock` | Magnific; se falhar → Pexels (`magnific_then_pexels`); cache `data/stock_cache/` por `type+keywords`; **sem** fallback IA |
+| `quote_card` | `renderQuoteCardMp4` → `scXX.mp4` (Hyperframes template em `src/assets/stoic-patrol/hyperframes-quote/` ou FFmpeg ASS); cache `data/quote_cache/` |
+| `ai_generated` / `manual_capture` | Proibidos no plano |
+
+**CLI:** `quote:render --project <slug> [--block N] [--force]` · `run-pipeline --profile stoic-patrol-stock` · `--verbose` em `run-step` / `run-pipeline`
+
+**Env:** `GENTUBE_QUOTE_RENDER=auto|hyperframes|ffmpeg` · `GENTUBE_STOCK_PROVIDER=magnific_then_pexels` · `PEXELS_API_KEY` · `GENTUBE_VERBOSE=1`
+
+**Quote cards (layout):** duracao ate 30s proporcional ao texto; `data-duration` injetado antes do Hyperframes render; fonte com auto-fit no DOM (`quote-card-layout.ts`, cache `QUOTE_CARD_LAYOUT_VERSION`). Citacoes **> ~150 caracteres** no ecra: duas cenas `quote_card` consecutivas (prompts segmenta/visualiza).
+
+**Montagem:** `scXX.mp3` sincronizado com `scXX.mp4`; se narracao > video em `quote_card`, **ultimo frame estatico** (`holdLastFrame` / `tpad=stop_mode=clone`). Apos quote, cena seguinte stock.
+
+**video-use:** nao integrado no pipeline (edicao conversacional de footage bruto; ver `stoic-patrol.md`).
+
+**Pre-requisito:** plano v2 (`--scene-plan-v2` / `GENTUBE_SCENE_PLAN_V2=1`).
+
+**Ficheiros:** `stoic-patrol.md`, `Prompts/*_stoic_patrol.md`, `src/config.ts`, `src/utils/stoic-patrol-prompt.ts`, `src/types/scenes-plan.ts`, `src/utils/scenes-plan.ts`, `src/integrations/claude.ts`, `src/services/pipeline.ts`.
+
 ## 19) Politica aprovada — Step 4 (Thumbnails)
 
 ### 19.1 Objetivo
@@ -832,20 +894,22 @@ Flags:
 - `05 - Modelagem/Thumbnail_<videoId>.jpg` — referencia baixada (fluxo A)
 - `04 - Thumbnails/thumb_ref_XX.png` ou `thumb_gen_XX.png` — thumbnails geradas
 
-## 20) Politica aprovada — Producao mista Higgsfield (IA) + Magnific (Stock)
+## 20) Politica aprovada — Producao mista Higgsfield (IA) + stock (Magnific / Pexels)
 
 ### 20.1 Objetivo
 
-Reduzir o consumo de creditos Higgsfield usando stock footage/imagens da Magnific (ex-Freepik) para a maioria dos shots, reservando a geracao por IA apenas para momentos de maior impacto visual.
+Reduzir o consumo de creditos Higgsfield usando stock footage/imagens (Magnific e, em falha ou rate limit, **Pexels**) para a maioria dos shots, reservando a geracao por IA apenas para momentos de maior impacto visual.
 
 ### 20.2 Provedores
 
 - **Higgsfield (IA)**: gera imagens e videos unicos via `hf generate create`
-- **Magnific (stock)**: busca e baixa imagens/videos do banco Magnific via API REST (`api.magnific.com`)
+- **Magnific (stock primario)**: busca e baixa via API REST (`api.magnific.com`)
+- **Pexels (stock alternativo)**: busca e baixa via API REST (`api.pexels.com`); ver **20.6.1**
+- **Orquestracao**: `GENTUBE_STOCK_PROVIDER` escolhe ordem e fallback; modulo alvo `src/integrations/stock-download.ts`
 
 ### 20.3 Proporcao configuravel
 
-| | Higgsfield (IA) | Magnific (Stock) | Variavel |
+| | Higgsfield (IA) | Stock (plano) | Variavel |
 |---|---|---|---|
 | **Bloco 1** | 50% | 50% | `GENTUBE_STOCK_RATIO_BLOCK1=50` |
 | **Blocos 2..N** | 10% | 90% | `GENTUBE_STOCK_RATIO_OTHER=90` |
@@ -884,8 +948,8 @@ Cada shot no `blockXX.assets.json` agora inclui:
 }
 ```
 
-- `source`: `"ai_generated"` (Higgsfield) ou `"stock"` (Magnific)
-- `search_keywords`: termos de busca em ingles para a API Magnific (obrigatorio quando `source="stock"`, `null` quando `source="ai_generated"`)
+- `source`: `"ai_generated"` (Higgsfield) ou `"stock"` (Magnific/Pexels)
+- `search_keywords`: termos de busca em ingles (obrigatorio quando `source="stock"`, `null` quando `source="ai_generated"`); mesma string para ambos os provedores
 
 ### 20.6 API Magnific
 
@@ -894,16 +958,44 @@ Cada shot no `blockXX.assets.json` agora inclui:
 - **Download video**: `GET https://api.magnific.com/v1/videos/{id}/download`; apos download, `ffprobe` (se existir no PATH) confirma largura/altura ~16:9; se `ffprobe` nao estiver disponivel, confia-se no filtro da API e no `aspect_ratio` quando presente
 - **Busca imagens**: `GET .../v1/resources` com `filters[content_type][photo]=1`, `filters[orientation][landscape]=1`, `filters[orientation][panoramic]=0`; quando `image.source.size` vem como `WxH`, candidatos fora de ~16:9 sao saltados sem download
 - **Download imagem**: `GET https://api.magnific.com/v1/resources/{id}/download?image_size=large`; apos download usa-se `image-size` para validar ~16:9 (tolerancia relativa ~2%) e descartar ficheiro se falhar, tentando o proximo resultado
+- **Resiliencia**: assets 404/disabled ignorados; **reducao de keywords** (remove tokens do fim da query ate minimo 3 palavras) antes de desistir ou passar ao proximo provedor
 - Modulo: `src/integrations/magnific.ts`
+
+### 20.6.1 API Pexels (alternativa)
+
+Documentacao: [pexels.com/api/documentation](https://www.pexels.com/api/documentation/).
+
+- **Autenticacao**: header `Authorization: <PEXELS_API_KEY>`
+- **Busca fotos**: `GET https://api.pexels.com/v1/search?query=...&orientation=landscape&per_page=...`
+- **Busca videos**: `GET https://api.pexels.com/v1/videos/search?query=...&orientation=landscape&per_page=...` (path legado `/videos/` em deprecacao)
+- **Download**: URL direta em `photo.src` (ex. `landscape`, `large2x`) ou entrada em `video.video_files[]` (escolher ficheiro mais proximo de 16:9); fetch HTTP do binario — **nao** ha endpoint `/download` separado
+- **16:9**: fotos 3:2 comuns — recorte para 1920x1080 com FFmpeg (mesma politica que Magnific); videos validados com `ffprobe` quando disponivel
+- **Rate limit (default)**: 200 pedidos/hora, 20 000/mes; headers `X-Ratelimit-Remaining`, `X-Ratelimit-Reset` em respostas 2xx; `429` exige backoff ate reset
+- **Keywords**: mesma **reducao progressiva** que Magnific (query completa → remover ultimo token ate minimo 3 palavras)
+- **Atribuição**: link/credito ao fotografo na publicacao (requisito Pexels); nao altera ficheiros em `renders/`
+- **Cache**: reutiliza `data/stock_cache/` (chave `sha256(type|keywords)` agnostica ao provedor)
+- Modulos: `src/integrations/pexels.ts`, `src/integrations/stock-download.ts`
+
+#### `GENTUBE_STOCK_PROVIDER`
+
+| Valor | Comportamento |
+|-------|----------------|
+| `magnific` | So Magnific (default retrocompativel) |
+| `pexels` | So Pexels |
+| `magnific_then_pexels` | Magnific primeiro; em falha (erro HTTP, rate limit, sem match 16:9, `fetch failed`) → Pexels com mesmas keywords. **Recomendado Stoic Patrol** |
+| `pexels_then_magnific` | Ordem inversa (opcional) |
+
+**Modo `default`:** falha de stock Magnific pode cair para **IA** (Higgsfield/Gemini). **Stoic Patrol:** sem IA no stock — falha so apos esgotar Magnific **e** Pexels (e variantes de keywords).
 
 ### 20.7 Fluxo de execucao no pipeline
 
 Para cada shot no plano:
 
 1. Se `source = "stock"`:
-   - Buscar na API Magnific usando `search_keywords`
-   - Baixar o resultado mais relevante
-   - Salvar em `03 - Imagens e Videos/renders/blockXX/`
+   - Consultar cache `data/stock_cache/` por `type` + `search_keywords`
+   - Buscar no provedor configurado (`GENTUBE_STOCK_PROVIDER`) usando `search_keywords` (e variantes mais curtas se necessario)
+   - Baixar o resultado mais relevante (~16:9)
+   - Salvar em `03 - Imagens e Videos/renders/blockXX/` e atualizar cache
    - Download e imediato (nao depende de `higgsfield:sync`)
 
 2. Se `source = "ai_generated"`:
