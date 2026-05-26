@@ -369,11 +369,11 @@ Variaveis em `.env`:
 - `ELEVENLABS_VOICE_ID` (opcional): voice padrao quando `--voice-id` nao e passado no CLI
 - `MAGNIFIC_API_KEY`: chave da API Magnific (ex-Freepik) para busca e download de stock footage/imagens
 - `PEXELS_API_KEY`: chave da API [Pexels](https://www.pexels.com/api/documentation/) (stock alternativo)
-- `GENTUBE_STOCK_PROVIDER` (opcional): `magnific` (default), `pexels`, `magnific_then_pexels`, `pexels_then_magnific`; planeado: `local_then_pexels_then_magnific`, `local_then_pexels_then_split` — ver secao **20.6** / **20.6.1**
-- `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT` (opcional, planeado): percentual `X` do fallback split para Magnific no modo `local_then_pexels_then_split` (default sugerido `60`)
-- `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT` (opcional, planeado): percentual `Y` do fallback split para Google Batch imagem (default sugerido `40`; `X + Y = 100`)
-- `GENTUBE_STOCK_LIBRARY_FTS_MIN_SCORE` (opcional, planeado): limiar de match FTS no reuso local (default conservador sugerido `0.60`)
-- `GENTUBE_STOCK_LIBRARY_MIN_TERMS` (opcional, planeado): minimo de termos na regressao de keywords para match local/remoto (default `3`)
+- `GENTUBE_STOCK_PROVIDER` (opcional): `magnific` (default), `pexels`, `magnific_then_pexels`, `pexels_then_magnific`, `local_then_pexels_then_magnific`, `local_then_pexels_then_split` — ver secao **20.6** / **20.6.1**
+- `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT` (opcional): percentual `X` do fallback split para Magnific no modo `local_then_pexels_then_split` (default `60`)
+- `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT` (opcional): percentual `Y` do fallback split para Google Batch no modo `local_then_pexels_then_split` (default `40`; `X + Y = 100`)
+- `GENTUBE_STOCK_LIBRARY_FTS_MIN_SCORE` (opcional): limiar de match FTS no reuso local (default conservador `0.60`)
+- `GENTUBE_STOCK_LIBRARY_MIN_TERMS` (opcional): minimo de termos na regressao de keywords para match local/remoto (default `3`)
 - `GENTUBE_STOCK_RATIO_BLOCK1` (opcional): % de shots do bloco 1 com `source: stock` (default: `50`)
 - `GENTUBE_STOCK_RATIO_OTHER` (opcional): % de shots dos blocos 2..N com stock (default: `90`)
 - `GENTUBE_PROMPT_MATRIX` (opcional): ficheiro do roteiro em `Prompts/`; tem prioridade sobre `GENTUBE_ROTEIRO_MODE`
@@ -747,7 +747,7 @@ Gravado ao falhar parse/validacao em segmentacao ou visualizacao (`writePlanPars
 
 **Documento mestre:** [stoic-patrol.md](stoic-patrol.md).
 
-**Objetivo:** canais de filosofia / estoicismo / fe (ex. **Stoic Patrol**, publico EUA 30+): plano v2 com **stock** na maior parte dos beats e **cartoes de citacao** (fundo preto, texto branco Montserrat, animacao typing) quando o roteiro traz citacao **explicita**. Cadeia recomendada em evolucao: biblioteca local -> Pexels -> Magnific.
+**Objetivo:** canais de filosofia / estoicismo / fe (ex. **Stoic Patrol**, publico EUA 30+): plano v2 com **stock** na maior parte dos beats e **cartoes de citacao** (fundo preto, texto branco Montserrat, animacao typing) quando o roteiro traz citacao **explicita**. Cadeia recomendada: biblioteca local -> Pexels -> fallback configuravel (Magnific e/ou Google Batch em split para imagens).
 
 **Criar projeto (CLI — preferir a scripts ad-hoc):**
 
@@ -765,7 +765,7 @@ npm run gentube -- create-video --channel <id_stoic_patrol> \
 
 Grava `05 - Modelagem/transcript.txt` e regista o texto no SQLite (`video_projects.transcript`). O roteiro (`matriz_stoic_patrol.md`) exige **fidelidade de tom e arco** ao transcript, com **ingles original** (proibido copiar frases do PT).
 
-**Ativacao:** `GENTUBE_VISUAL_MODALITY=stoic_patrol` (alias aceite: `stoic-patrol`, `religious`). Corrida atual recomendada: `GENTUBE_SCENE_PLAN_V2=1`, `GENTUBE_STOCK_RATIO_BLOCK1=100`, `GENTUBE_STOCK_RATIO_OTHER=100`, `GENTUBE_STOCK_PROVIDER=magnific_then_pexels`, `PEXELS_API_KEY` no `.env`, sem HF/Gemini no MVP. Planeado: `local_then_pexels_then_magnific` como default recomendado apos indexacao local.
+**Ativacao:** `GENTUBE_VISUAL_MODALITY=stoic_patrol` (alias aceite: `stoic-patrol`, `religious`). Corrida recomendada: `GENTUBE_SCENE_PLAN_V2=1`, `GENTUBE_STOCK_RATIO_BLOCK1=100`, `GENTUBE_STOCK_RATIO_OTHER=100`, `GENTUBE_STOCK_PROVIDER=local_then_pexels_then_split`, `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT=50`, `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT=50`, `PEXELS_API_KEY` no `.env`.
 
 **Plano v2:** `stock_ratio` efetivo **100** entre cenas nao-quote (`resolveStockRatioForBlock`). Nova fonte `source: "quote_card"` com `quote_text`, `quote_attribution?`, `animation_type: "typing"`, `render_engine: "hyperframes"`. Validacao: `assertStoicPatrolBlockPlan` em `src/utils/stoic-patrol-prompt.ts`.
 
@@ -782,13 +782,21 @@ Grava `05 - Modelagem/transcript.txt` e regista o texto no SQLite (`video_projec
 
 | `source` | Comportamento |
 |----------|----------------|
-| `stock` | Atual: Magnific; se falhar -> Pexels (`magnific_then_pexels`). Planeado: local (`data/stock_library/`) -> Pexels -> Magnific, e variante split `X/Y` com Google Batch para imagens sem avatar; **sem** fallback IA em `stoic_patrol` |
+| `stock` | local (`data/stock_library/`) -> Pexels -> fallback (`Magnific` ou split `X/Y` com Google Batch para imagens sem avatar); **sem** fallback IA em `stoic_patrol` |
 | `quote_card` | `renderQuoteCardMp4` → `scXX.mp4` (Hyperframes template em `src/assets/stoic-patrol/hyperframes-quote/` ou FFmpeg ASS); cache `data/quote_cache/` |
 | `ai_generated` / `manual_capture` | Proibidos no plano |
 
 **CLI:** `quote:render --project <slug> [--block N] [--force]` · `run-pipeline --profile stoic-patrol-stock` · `--verbose` em `run-step` / `run-pipeline`
 
-**Env:** `GENTUBE_QUOTE_RENDER=auto|hyperframes|ffmpeg` · `GENTUBE_STOCK_PROVIDER` (`magnific_then_pexels` atual; `local_then_pexels_then_magnific` planeado) · `PEXELS_API_KEY` · `GENTUBE_VERBOSE=1`
+**Ordem recomendada (manual, por etapas):**
+
+1. `run-step --step roteiro`
+2. `run-step --step imagens --scene-plan-v2 --enqueue-only`
+3. `image:sync --watch`
+4. `run-step --step narracao`
+5. `run-step --step montagem`
+
+**Env:** `GENTUBE_QUOTE_RENDER=auto|hyperframes|ffmpeg` · `GENTUBE_STOCK_PROVIDER=local_then_pexels_then_split` · `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT` · `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT` · `PEXELS_API_KEY` · `GENTUBE_VERBOSE=1`
 
 **Quote cards (layout):** duracao ate 30s proporcional ao texto; `data-duration` injetado antes do Hyperframes render; fonte com auto-fit no DOM (`quote-card-layout.ts`, cache `QUOTE_CARD_LAYOUT_VERSION`). Citacoes **> ~150 caracteres** no ecra: duas cenas `quote_card` consecutivas (prompts segmenta/visualiza).
 
@@ -988,37 +996,38 @@ Documentacao: [pexels.com/api/documentation](https://www.pexels.com/api/document
 | `pexels` | So Pexels |
 | `magnific_then_pexels` | Magnific primeiro; em falha (erro HTTP, rate limit, sem match 16:9, `fetch failed`) → Pexels com mesmas keywords. **Recomendado Stoic Patrol** |
 | `pexels_then_magnific` | Ordem inversa (opcional) |
-| `local_then_pexels_then_magnific` | **Planeado**: tenta biblioteca local (`data/stock_library/`) primeiro; depois Pexels; por fim Magnific |
-| `local_then_pexels_then_split` | **Planeado**: local -> Pexels -> fallback split para `type=image` (`X%` Magnific + `Y%` Google Batch, com `character_required=false`) |
+| `local_then_pexels_then_magnific` | Biblioteca local (`data/stock_library/`) primeiro; depois Pexels; por fim Magnific |
+| `local_then_pexels_then_split` | Local -> Pexels -> fallback split para `type=image` (`X%` Magnific + `Y%` Google Batch, com `character_required=false`) |
 
 **Modo `default`:** falha de stock Magnific pode cair para **IA** (Higgsfield/Gemini). **Stoic Patrol:** sem IA no stock — falha so apos esgotar Magnific **e** Pexels (e variantes de keywords).
 
-No modo split planeado:
+No modo split:
 
 - `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT = X`
 - `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT = Y`
 - Restricao: `X + Y = 100`
 - Se `type=video`, o fallback permanece remoto (`Magnific`) — Google Batch aplica-se apenas a imagem
-- Se a cena exigir personagem/avatar (`character_required=true`), nao enviar para Google Batch no split
+- Se a cena exigir personagem/avatar (`character_required=true`), nao enviar para fallback Google Batch no split
 
 ### 20.7 Fluxo de execucao no pipeline
 
 Para cada shot no plano:
 
 1. Se `source = "stock"`:
-   - (Atual) Consultar cache `data/stock_cache/` por `type` + `search_keywords`
-   - (Planeado) Consultar biblioteca local `data/stock_library/` por `type` + keywords:
+   - Consultar cache `data/stock_cache/` por `type` + `search_keywords`
+   - Consultar biblioteca local `data/stock_library/` por `type` + keywords:
      - match exato (`keywords_norm`)
      - FTS aproximado com limiar conservador (`GENTUBE_STOCK_LIBRARY_FTS_MIN_SCORE`, sugerido `0.60`)
      - regressao progressiva de termos (remove tokens do fim ate minimo `GENTUBE_STOCK_LIBRARY_MIN_TERMS`, default `3`)
    - Buscar no provedor configurado (`GENTUBE_STOCK_PROVIDER`) usando `search_keywords` (e variantes mais curtas se necessario)
    - Baixar o resultado mais relevante (~16:9)
-   - Salvar em `03 - Imagens e Videos/renders/blockXX/`, atualizar cache e (planeado) registar na biblioteca local
-   - Download e imediato (nao depende de `higgsfield:sync`)
+   - Salvar em `03 - Imagens e Videos/renders/blockXX/`, atualizar cache e registar na biblioteca local
+   - Se o split escolher Google Batch (`type=image`): enfileirar `image_jobs` assíncrono e concluir com `image:sync`
+   - Download remoto e imediato para Magnific/Pexels; ramo Google Batch conclui de forma assincrona
 
 2. Se `source = "ai_generated"`:
    - Fluxo atual via Higgsfield (sincrono ou assincrono)
-   - Planeado (quando imagem sem avatar e com significado amplo): permitir registo na biblioteca local para reuso futuro
+   - Quando imagem sem avatar e com significado amplo: permitir registo na biblioteca local para reuso futuro
 
 ### 20.8 Entregaveis por bloco
 
@@ -1027,7 +1036,7 @@ Mesmo diretorio de saida: `03 - Imagens e Videos/renders/blockXX/`
 - `s01.png`, `s02.mp4`, etc. — independente da fonte (IA ou stock)
 - `blockXX.assets.json` — plano com campo `source` indicando a origem de cada shot
 
-### 20.9 Biblioteca local de stock e indexacao (planeado)
+### 20.9 Biblioteca local de stock e indexacao
 
 Objetivo: evitar chamadas desnecessarias para Pexels/Magnific reutilizando media ja disponivel em projetos anteriores.
 
@@ -1037,7 +1046,7 @@ Objetivo: evitar chamadas desnecessarias para Pexels/Magnific reutilizando media
 - SQLite (`data/gentube.db`) — metadados por asset (`type`, `search_keywords`, `description`, hash do conteudo, dimensoes, origem, provider)
 - Indice FTS para busca aproximada por keywords/descricao
 
-#### Comando CLI (planeado)
+#### Comando CLI
 
 - `gentube stock:index [--project <id|slug>] [--root <dir>] [--dry-run] [--force]`
 - Escaneia `Videos/**/03 - Imagens e Videos/block*.assets.json`

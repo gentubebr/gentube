@@ -361,7 +361,13 @@ export const MAGNIFIC_API_KEY = (process.env.MAGNIFIC_API_KEY ?? "").trim();
 /** API key Pexels — stock alternativo (https://www.pexels.com/api/documentation/) */
 export const PEXELS_API_KEY = (process.env.PEXELS_API_KEY ?? "").trim();
 
-export type StockProviderMode = "magnific" | "pexels" | "magnific_then_pexels" | "pexels_then_magnific";
+export type StockProviderMode =
+  | "magnific"
+  | "pexels"
+  | "magnific_then_pexels"
+  | "pexels_then_magnific"
+  | "local_then_pexels_then_magnific"
+  | "local_then_pexels_then_split";
 
 /** Provedor de stock no step imagens (default: magnific). */
 export function resolveStockProvider(): StockProviderMode {
@@ -369,8 +375,37 @@ export function resolveStockProvider(): StockProviderMode {
   if (raw === "pexels") return "pexels";
   if (raw === "magnific_then_pexels" || raw === "magnific-then-pexels") return "magnific_then_pexels";
   if (raw === "pexels_then_magnific" || raw === "pexels-then-magnific") return "pexels_then_magnific";
+  if (raw === "local_then_pexels_then_magnific" || raw === "local-then-pexels-then-magnific") {
+    return "local_then_pexels_then_magnific";
+  }
+  if (raw === "local_then_pexels_then_split" || raw === "local-then-pexels-then-split") {
+    return "local_then_pexels_then_split";
+  }
   return "magnific";
 }
+
+function envPercent(key: string, fallback: number): number {
+  const raw = (process.env[key] ?? "").trim();
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(100, n));
+}
+
+/** Split de fallback para modo local->pexels->split (imagem sem avatar). */
+export const STOCK_SPLIT_MAGNIFIC_PERCENT = envPercent("GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT", 60);
+/** Complementar ao split acima; se X+Y != 100, o runtime normaliza automaticamente. */
+export const STOCK_SPLIT_GOOGLE_BATCH_PERCENT = envPercent("GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT", 40);
+
+/** Limiar conservador para match aproximado no indice local (0..1). */
+export const STOCK_LIBRARY_FTS_MIN_SCORE = Math.max(
+  0,
+  Math.min(1, Number.parseFloat(process.env.GENTUBE_STOCK_LIBRARY_FTS_MIN_SCORE ?? "0.60") || 0.6),
+);
+/** Regressao de termos: minimo de palavras mantidas na query. */
+export const STOCK_LIBRARY_MIN_TERMS = Math.max(
+  2,
+  Number.parseInt(process.env.GENTUBE_STOCK_LIBRARY_MIN_TERMS ?? "3", 10) || 3,
+);
 
 /** % de shots do bloco 1 vindos do stock Magnific (default: 50) */
 export const STOCK_RATIO_BLOCK1 = Math.min(

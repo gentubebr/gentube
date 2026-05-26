@@ -160,6 +160,7 @@ export function getDb(): Database.Database {
   migratePipelineRunsSchema(db);
   migrateClaudeBatchSchema(db);
   migrateQualityGateSchema(db);
+  migrateStockLibrarySchema(db);
 
   return db;
 }
@@ -285,6 +286,57 @@ function migrateClaudeBatchSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_claude_batch_project ON claude_batch_jobs(project_id, outcome);
     CREATE INDEX IF NOT EXISTS idx_claude_batch_batch ON claude_batch_jobs(batch_id);
+  `);
+}
+
+/** Biblioteca local de stock com aliases e FTS para busca aproximada. */
+function migrateStockLibrarySchema(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS stock_library_assets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      media_type TEXT NOT NULL CHECK(media_type IN ('image', 'video')),
+      content_sha256 TEXT NOT NULL UNIQUE,
+      file_path TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'unknown',
+      provider_asset_id TEXT,
+      source_kind TEXT NOT NULL DEFAULT 'stock',
+      character_required INTEGER NOT NULL DEFAULT 0,
+      width INTEGER,
+      height INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_used_at TEXT,
+      use_count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_stock_library_assets_media ON stock_library_assets(media_type);
+    CREATE INDEX IF NOT EXISTS idx_stock_library_assets_provider ON stock_library_assets(provider);
+
+    CREATE TABLE IF NOT EXISTS stock_library_aliases (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      asset_id INTEGER NOT NULL,
+      keywords_raw TEXT NOT NULL,
+      keywords_norm TEXT NOT NULL,
+      description TEXT,
+      role TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(asset_id, keywords_norm),
+      FOREIGN KEY(asset_id) REFERENCES stock_library_assets(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_stock_library_aliases_keywords_norm ON stock_library_aliases(keywords_norm);
+    CREATE INDEX IF NOT EXISTS idx_stock_library_aliases_asset_id ON stock_library_aliases(asset_id);
+  `);
+
+  database.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS stock_library_aliases_fts
+    USING fts5(
+      keywords_norm,
+      keywords_raw,
+      description,
+      role,
+      content='',
+      tokenize='unicode61 remove_diacritics 2'
+    );
   `);
 }
 

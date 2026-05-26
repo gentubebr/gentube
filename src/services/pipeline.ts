@@ -17,6 +17,7 @@ import {
   resolveVisualizaPromptContent,
   resolvePromptMatrixPath,
   resolveCanalVoicePath,
+  resolveStockProvider,
   ROOT_DIR,
   ROTEIRO_PREV_CONTEXT_MAX_CHARS,
   roteiroPrevContextEnabled,
@@ -93,7 +94,7 @@ import {
   step3LimitsFromSceneCaps,
   visualizationShouldSplit,
 } from "../utils/max-scenes.js";
-import { searchAndDownload } from "../integrations/stock-download.js";
+import { StockGoogleBatchFallbackError, searchAndDownload } from "../integrations/stock-download.js";
 import { sceneRenderOutputExists } from "../utils/media-output.js";
 import { Step3Limits } from "../types/step3-limits.js";
 import type { BlockScenesPlanV2, SegmentationPlanV2 } from "../types/scenes-plan.js";
@@ -213,8 +214,8 @@ async function finalizeDeferredBatchSubmits(
 ): Promise<void> {
   if (!opts?.enqueueOnly) return;
   const delivery = resolveImageDelivery(imageFlags);
-  if (isGoogleBatchMode(imageFlags)) {
-    const submitted = await submitPendingGoogleBatches(projectId);
+  const submitted = await submitPendingGoogleBatches(projectId);
+  if (submitted > 0 || isGoogleBatchMode(imageFlags)) {
     console.log(
       chalk.bold.cyan(
         `Submit diferido: ${submitted} batch(es) Google submetido(s) para o projeto. ` +
@@ -1281,9 +1282,11 @@ async function imagensBlockPlanAndRenderV2(input: {
   await fs.mkdir(input.rendersDir, { recursive: true });
 
   const delivery = resolveSceneImageDelivery(input.imageFlags);
-  const blockBatchId =
+  let blockBatchId =
     delivery === "google_batch" || delivery === "local_batch" ? crypto.randomUUID() : undefined;
   const batchIds: string[] = blockBatchId ? [blockBatchId] : [];
+  let forcedGoogleBatchJobs = false;
+  const stockProviderMode = resolveStockProvider();
 
   let done = 0;
   let hfJobTotal = 0;
@@ -1352,6 +1355,9 @@ async function imagensBlockPlanAndRenderV2(input: {
             type: v.type,
             keywords,
             destPathNoExt: destNoExt,
+            description: v.description,
+            role: v.role,
+            characterRequired: Boolean(v.character_required),
           });
           if (visualModality === "stoic_patrol") {
             await saveStockToCache({ type: v.type, keywords, localPath });
@@ -1364,6 +1370,48 @@ async function imagensBlockPlanAndRenderV2(input: {
           });
           upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
         } catch (stockErr) {
+          if (
+            stockErr instanceof StockGoogleBatchFallbackError &&
+            stockProviderMode === "local_then_pexels_then_split" &&
+            v.type === "image" &&
+            !Boolean(v.character_required)
+          ) {
+            if (!blockBatchId) {
+              blockBatchId = crypto.randomUUID();
+              batchIds.push(blockBatchId);
+            }
+            const batchResult = await renderSceneImage(
+              {
+                projectId: input.projectId,
+                blockNumber: bn,
+                shotId: scene.id,
+                prompt: stockErr.prompt,
+                outPathNoExt: path.join(input.rendersDir, scene.id),
+                referenceImageUrl: undefined,
+                flags: { googleBatchMode: true, batchLocal: false },
+              },
+              blockBatchId
+            );
+            if (batchResult.queued) {
+              forcedGoogleBatchJobs = true;
+              hfJobTotal += 1;
+              console.log(
+                chalk.dim(`  ${blockTag(bn, tb)} Stock split → Google Batch enfileirado: ${scene.id}`)
+              );
+              addProjectLog(
+                input.projectId,
+                "imagens_videos",
+                "info",
+                `Stock split Google enfileirado bloco ${bn} cena ${scene.id}`,
+                {
+                  provider: batchResult.provider,
+                  batchId: batchResult.batchId ?? blockBatchId,
+                  keywords,
+                },
+              );
+            }
+            continue;
+          }
           const msg = stockErr instanceof Error ? stockErr.message : "Erro stock";
           if (visualModality === "stoic_patrol") {
             throw new Error(`Stock falhou ${scene.id} (stoic_patrol sem fallback IA): ${msg}`);
@@ -1606,7 +1654,7 @@ async function imagensBlockPlanAndRenderV2(input: {
   }
 
   if (!input.enqueueOnly) {
-    if (isGoogleBatchMode(input.imageFlags) && batchIds.length > 0) {
+    if ((isGoogleBatchMode(input.imageFlags) || forcedGoogleBatchJobs) && batchIds.length > 0) {
       await flushPendingGoogleBatches(batchIds);
     }
     if (delivery === "local_batch" && batchIds.length > 0) {

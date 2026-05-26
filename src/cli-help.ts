@@ -12,10 +12,9 @@ export const CLI_HELP = {
 ${chalk.bold("Fluxo tipico (projeto por pasta em Videos/<canal>/<data>-<titulo>/")}
   1. init · channel:create · create-video
   2. run-step --step roteiro
-  3. run-step --step narracao          (ElevenLabs; ver narracao abaixo)
-  4. run-step --step imagens           (--scene-plan-v2 recomendado)
-  4b. cost-estimate (modo Wojak) · image:sync --watch · claude:sync (se batch fire-and-forget)
-  5. video:status · video:retry (HF/Veo) · retry imagens (Wojak)
+  3. run-step --step imagens           (--scene-plan-v2 recomendado)
+  4. image:sync --watch                (quando houver jobs assíncronos)
+  5. run-step --step narracao          (ElevenLabs; ver narracao abaixo)
   6. run-step --step montagem          (FFmpeg: clipes + blocos em 06 - Montagem/)
   7. run-step --step thumbnails
   Ou: run-pipeline (Wojak completo, com rastreio) · run-all (legado) · retry --stage <etapa>
@@ -34,10 +33,12 @@ ${ex([
   "npm run gentube -- run-pipeline --project 10 --voice-id <id>",
   "npm run gentube -- pipeline-report --project 10",
   "npm run gentube -- status --project 10",
-  "npm run gentube -- run-step --project 10 --step narracao",
+  "npm run gentube -- run-step --project 10 --step roteiro",
   "npm run gentube -- run-step --project 10 --step imagens --scene-plan-v2 --google-batch-mode",
-  "npm run gentube -- image:status --project 10",
   "npm run gentube -- image:sync --project 10 --watch --interval 30s",
+  "npm run gentube -- run-step --project 10 --step narracao",
+  "npm run gentube -- run-step --project 10 --step montagem",
+  "npm run gentube -- image:status --project 10",
   "npm run gentube -- video:status --project 10",
   "npm run gentube -- video:retry --project 10 --block 5",
   "npm run gentube -- retry --project 10 --stage narracao --block 3",
@@ -47,8 +48,9 @@ ${ex([
 ])}
 
 ${chalk.bold("Modalidade Wojak")}  GENTUBE_VISUAL_MODALITY=wojak (ver wojak.md)
-  Plano: --scene-plan-v2 --plan-only → revisar blockNN.assets.json → narracao
+  Plano: --scene-plan-v2 --plan-only → revisar blockNN.assets.json
   Render: Gemini batch (imagens) + sync (bootstrap) + Veo (videos); sem stock/HF
+  Ordem recomendada: roteiro → imagens → image:sync → narracao → montagem
   Retomada se Veo 429: npx tsx scripts/continue-missing-renders.ts --project <id> --block N
   Depois: image:sync --watch · retry --stage imagens quando cota Veo voltar
 
@@ -94,7 +96,7 @@ ${chalk.bold("Modo Wojak")}  GENTUBE_VISUAL_MODALITY=wojak + --scene-plan-v2
   Imagens estaticas: Google Batch com PNG ref (forcado no codigo; opcao B).
   Video: bootstrap sync (scXX__bootstrap.png) → Veo sync (sem ref PNG por defeito).
   Env: GENTUBE_IMAGE_BACKEND=gemini · GENTUBE_VIDEO_BACKEND=veo · GENTUBE_HF_ASYNC=0
-  Ordem: plan-only → narracao → retry/run-step imagens → image:sync --watch
+  Ordem: plan-only → retry/run-step imagens → image:sync --watch → narracao
   Custo antes da corrida: cost-estimate --project <id>
   Se retry parar em Veo 429: scripts/continue-missing-renders.ts + image:sync; depois retry.
   Detalhe: wojak.md
@@ -176,6 +178,9 @@ Pipeline completo com rastreio em SQLite (pipeline_runs, pipeline_run_steps) e r
 ${chalk.bold("Ordem (perfil wojak-images-only)")}
   roteiro → imagens (plano v2 + Google batch, 0 videos) → image_sync → imagens_retry
   → narracao (ElevenLabs por cena) → montagem → thumbnails
+${chalk.bold("Ordem (perfil stoic-patrol-stock)")}
+  roteiro → quality_gate → imagens (stock/local + split opcional) → image_sync
+  → narracao (por cena) → montagem → thumbnails
 
 ${chalk.bold("Rastreio")}
   - Cada passo/bloco: pipeline_run_steps (status, tentativa, error_message)

@@ -33,7 +33,7 @@ Antes de clonar o GenTube, reúna o seguinte (sem gravar segredos em ficheiros v
 ### Stock — Magnific, Pexels e biblioteca local (imagens e vídeos)
 
 O step **imagens** baixa cenas `source: stock` via `GENTUBE_STOCK_PROVIDER` (`src/integrations/stock-download.ts`).
-No fluxo atual, os provedores remotos são Magnific/Pexels; a cadeia com biblioteca local (`data/stock_library/`) está documentada abaixo como **planejada** para reduzir chamadas externas.
+O fluxo já suporta cadeia com biblioteca local (`data/stock_library/`) para reduzir chamadas externas antes de cair em provedores remotos.
 
 #### Magnific (primário por defeito)
 
@@ -50,9 +50,9 @@ No fluxo atual, os provedores remotos são Magnific/Pexels; a cadeia com bibliot
 4. Limites default: **200 pedidos/hora**, **20 000/mês**; headers `X-Ratelimit-Remaining`, `X-Ratelimit-Reset`. Projetos grandes devem usar **cache** (`data/stock_cache/`) e fallback (não substituir Magnific por Pexels em todas as cenas de uma vez).
 5. **Atribuição:** crédito ao fotógrafo / link Pexels na descrição ou créditos do vídeo (requisito da API).
 
-**Modo `default`:** se Magnific falhar no stock, fallback para **IA** (Higgsfield ou Gemini, conforme `GENTUBE_IMAGE_BACKEND`). **Stoic Patrol** (`stoic_patrol`): sem fallback IA no stock — usar `magnific_then_pexels` (atual) ou `local_then_pexels_then_magnific` (planejado) e retomar com `--enqueue-only`.
+**Modo `default`:** se Magnific falhar no stock, fallback para **IA** (Higgsfield ou Gemini, conforme `GENTUBE_IMAGE_BACKEND`). **Stoic Patrol** (`stoic_patrol`): sem fallback IA no stock — preferir `local_then_pexels_then_magnific` e retomar com `--enqueue-only`.
 
-#### Biblioteca local + split Magnific/Google Batch (planejado)
+#### Biblioteca local + split Magnific/Google Batch
 
 Objetivo: maximizar reuso de imagens já baixadas/geradas no histórico de projetos, com busca local antes de chamar APIs externas.
 
@@ -60,7 +60,8 @@ Objetivo: maximizar reuso de imagens já baixadas/geradas no histórico de proje
 - Cadeia alvo 2: `local → pexels → (X% magnific + Y% google_batch)` para `type=image` e `character_required=false` (`X + Y = 100`)
 - Assets IA "genéricos" (sem avatar/personagem do canal) também entram na base local para reutilização futura.
 - Match local usa ordem: exato por keywords -> FTS aproximado (default conservador) -> regressão progressiva de termos (remove tokens finais, mínimo 3 palavras).
-- O comando de indexação dedicado (`stock:index`) e a base `data/stock_library/` ficam documentados na especificação técnica (sec. 20.9).
+- O comando de indexação dedicado é `stock:index` (indexa `block*.assets.json` + renders `source=stock` para `data/stock_library/`).
+- No ramo `google_batch`, a cena é enfileirada em `image_jobs` (assíncrono) e concluída via `image:sync`.
 
 ### Higgsfield CLI (geração IA imagens/vídeo)
 
@@ -178,11 +179,11 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `ELEVENLABS_VOICE_ID` | Recomendada | Voz padrão se você não passar `--voice-id` |
 | `MAGNIFIC_API_KEY` | Sim (step imagens, se usar Magnific) | API Magnific/Freepik |
 | `PEXELS_API_KEY` | Sim se `GENTUBE_STOCK_PROVIDER` incluir Pexels | API Pexels ([documentação](https://www.pexels.com/api/documentation/)) |
-| `GENTUBE_STOCK_PROVIDER` | Opcional | `magnific` (default), `pexels`, `magnific_then_pexels`, `pexels_then_magnific`; planejado: `local_then_pexels_then_magnific`, `local_then_pexels_then_split` |
-| `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT` | Opcional (planejado) | Percentual `X` para Magnific no split local->pexels->split (default sugerido: `60`) |
-| `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT` | Opcional (planejado) | Percentual `Y` para Google Batch no split (default sugerido: `40`; `X + Y = 100`) |
-| `GENTUBE_STOCK_LIBRARY_FTS_MIN_SCORE` | Opcional (planejado) | Limiar de match aproximado no índice local (default conservador sugerido: `0.60`) |
-| `GENTUBE_STOCK_LIBRARY_MIN_TERMS` | Opcional (planejado) | Mínimo de termos na regressão de keywords para busca local/remota (default: `3`) |
+| `GENTUBE_STOCK_PROVIDER` | Opcional | `magnific` (default), `pexels`, `magnific_then_pexels`, `pexels_then_magnific`, `local_then_pexels_then_magnific`, `local_then_pexels_then_split` |
+| `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT` | Opcional | Percentual `X` para Magnific no split local->pexels->split (default: `60`) |
+| `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT` | Opcional | Percentual `Y` para fallback Google no split (default: `40`; `X + Y = 100`) |
+| `GENTUBE_STOCK_LIBRARY_FTS_MIN_SCORE` | Opcional | Limiar de match aproximado no índice local (default conservador: `0.60`) |
+| `GENTUBE_STOCK_LIBRARY_MIN_TERMS` | Opcional | Mínimo de termos na regressão de keywords para busca local/remota (default: `3`) |
 | `GENTUBE_STOCK_RATIO_BLOCK1` | Opcional | % de shots do bloco 1 com `source: stock` (default: `50`) |
 | `GENTUBE_STOCK_RATIO_OTHER` | Opcional | % de shots dos blocos 2..N com stock (default: `90`) |
 | `GENTUBE_PROMPT_MATRIX` | Opcional | Ficheiro em `Prompts/` para o **roteiro** (ex.: `matriz_tutorial.md`). Tem prioridade sobre `GENTUBE_ROTEIRO_MODE`. A flag `--prompt-matrix` tem prioridade sobre ambos |
@@ -293,11 +294,16 @@ npm run gentube -- create-video --channel 2 \
   --prompt-canal-voice canal_voice_stoic_patrol.md \
   --create-only
 
+# Ordem recomendada (modo cenas): roteiro → imagens → image:sync → narracao → montagem
 npm run gentube -- run-step --project <slug-do-projeto> --step roteiro \
   --prompt-matrix matriz_stoic_patrol.md --prompt-canal-voice canal_voice_stoic_patrol.md --verbose
-npm run gentube -- run-step --project <slug> --step imagens --scene-plan-v2 --plan-only --verbose
-npm run gentube -- quote:render --project <slug> --force
-npm run gentube -- run-pipeline --project <slug> --profile stoic-patrol-stock --voice-id <id> --verbose
+GENTUBE_VISUAL_MODALITY=stoic_patrol GENTUBE_SCENE_PLAN_V2=1 \
+GENTUBE_STOCK_PROVIDER=local_then_pexels_then_split \
+GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT=50 GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT=50 \
+npm run gentube -- run-step --project <slug> --step imagens --scene-plan-v2 --enqueue-only --verbose
+npm run gentube -- image:sync --project <slug> --watch --interval 30s
+npm run gentube -- run-step --project <slug> --step narracao --voice-id <id>
+npm run gentube -- run-step --project <slug> --step montagem
 
 # Apagar um projeto sem prompts (scripts)
 npm run gentube -- delete-project --project 2 --yes

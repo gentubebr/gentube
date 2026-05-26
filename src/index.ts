@@ -64,6 +64,7 @@ import {
   runThumbnails,
 } from "./services/pipeline.js";
 import { syncProjectFromDisk, type SyncFromDiskScope } from "./services/sync-from-disk.js";
+import { runStockIndex } from "./services/stock-index.js";
 import { mergeMontagemRunOptions, resolveMontagemConfig, type MontagemPhase } from "./config/montagem.js";
 import { runMontagem } from "./services/montagem.js";
 import { writeShotListManualFiles } from "./services/shot-list-manual.js";
@@ -575,7 +576,11 @@ program
     if (options.step === "imagens") {
       const limits = parseStep3Limits(options);
       const imagensOpts = buildImagensVideosOpts(options);
-      await executeImagens(project, options.avatarFile, limits, imagensOpts);
+      if (blockNumber !== undefined) {
+        await executeImagensBlock(project, blockNumber, options.avatarFile, limits, imagensOpts);
+      } else {
+        await executeImagens(project, options.avatarFile, limits, imagensOpts);
+      }
       return;
     }
     if (options.step === "thumbnails") {
@@ -716,6 +721,35 @@ program
       console.log(JSON.stringify(report, null, 2));
     }
   );
+
+program
+  .command("stock:index")
+  .description("Indexa imagens/videos stock ja baixados em biblioteca local (data/stock_library)")
+  .option("--project <idOuSlug>", "Limita indexacao a um projeto")
+  .option("--root <dir>", "Raiz para scan de block*.assets.json (default: Videos/)")
+  .option("--dry-run", "Mostra contagens sem gravar no SQLite")
+  .option(
+    "--errors-file <path>",
+    "Ficheiro JSONL para log detalhado de erros/missing_render (default: out/stock-index-errors.jsonl)",
+  )
+  .option("--force", "Reservado para reindex completo (compatibilidade futura)")
+  .action(async (opts: { project?: string; root?: string; dryRun?: boolean; force?: boolean; errorsFile?: string }) => {
+    let projectPath: string | undefined;
+    if (opts.project?.trim()) {
+      const project = getProjectByIdOrSlug(opts.project.trim());
+      if (!project) throw new Error("Projeto nao encontrado");
+      projectPath = String(project.project_path);
+    }
+    const report = await runStockIndex({
+      projectPath,
+      rootDir: opts.root,
+      dryRun: Boolean(opts.dryRun),
+      force: Boolean(opts.force),
+      errorsFile: opts.errorsFile,
+    });
+    console.log(chalk.cyan("stock:index concluido"));
+    console.log(JSON.stringify(report, null, 2));
+  });
 
 program
   .command("shot-list-manual")

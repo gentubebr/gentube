@@ -15,8 +15,9 @@ export function normalizeForCoverage(raw: string): string {
       /(?:\*\*)?(?:Genesis|Psalm|Romans|John|Matthew|Mark|Luke|Acts|Hebrews|Proverbs|Ecclesiastes)\s+\d+:\d+(?:[—–]\d+)?\s+[—–]\s+/gi,
       "",
     )
-    // Titulo em negrito fechado antes de travessao (**Label —**); [^*\n] evita atravessar paragrafos
-    .replace(/\*\*[^*\n]{2,80}?\*\*\s+[—–]\s+/g, "")
+    // Rotulos em negrito com versiculo/indice antes do travessao (**Provérbios 14:1 —** / **Virtue 1 —**)
+    // Evita remover texto narrativo comum em negrito (ex.: "**perceives —**").
+    .replace(/\*\*[^*\n]{0,80}(?::|\d)[^*\n]{0,80}\*\*\s+[—–]\s+/g, "")
     .replace(/\*\*/g, "")
     .replace(/\*/g, "")
     .replace(/_([^_]+)_/g, "$1")
@@ -25,6 +26,8 @@ export function normalizeForCoverage(raw: string): string {
     // Aspas/apóstrofos tipográficos → ASCII (evita falha de cobertura quando o modelo copia ' mas o bloco tem ')
     .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
     .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+    // Aspas duplas nao sao relevantes para cobertura verbatim (modelo pode abrir/fechar quotes em cortes diferentes)
+    .replace(/"/g, "")
     .replace(/[\u2013\u2014]/g, "-")
     .replace(/\s+/g, " ")
     .trim();
