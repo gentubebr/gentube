@@ -9,7 +9,7 @@ import {
 import { sanitizeWojakPromptForVeo } from "../utils/wojak-prompt.js";
 import { generateVideoWithDefaultsCli } from "../integrations/higgsfield-cli.js";
 import { generateVeoVideoSync } from "../integrations/gemini-video.js";
-import { searchAndDownload } from "../integrations/magnific.js";
+import { searchAndDownload } from "../integrations/stock-download.js";
 import {
   isGoogleQuotaOrBillingError,
   isHfTransientError,

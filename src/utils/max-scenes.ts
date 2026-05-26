@@ -55,7 +55,9 @@ export function resolveSceneCapsForBlock(
   }
 
   const fromWords = Math.ceil(wordCount / MAX_SCENES_WORDS_DIVISOR);
-  const maxScenes = Math.min(MAX_SCENES_CAP, Math.max(fromWords, legacyCap));
+  // Margem para citacoes longas / versiculos (segmentacao costuma exceder 1-4 cenas)
+  const slack = Math.min(6, Math.ceil(wordCount / 300));
+  const maxScenes = Math.min(MAX_SCENES_CAP, Math.max(fromWords + slack, legacyCap));
 
   const effectiveMaxImages = Math.max(maxImages, maxScenes - maxVideos);
 

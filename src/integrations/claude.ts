@@ -1,10 +1,12 @@
 import Anthropic from "@anthropic-ai/sdk";
+import chalk from "chalk";
 import type { MessageCreateParamsNonStreaming } from "@anthropic-ai/sdk/resources/messages.js";
 import {
   CLAUDE_API_KEY,
   CLAUDE_MAX_TOKENS,
   CLAUDE_MODEL,
   CLAUDE_THINKING,
+  CLAUDE_BATCH_POLL_INTERVAL_MS,
   claudeDeliveryFromEnv,
   claudeModelForStage,
   claudeThinkingForStage,
@@ -21,6 +23,7 @@ import {
   streamClaudeBatchResults,
 } from "./claude-batch.js";
 import { insertClaudeBatchJob, updateClaudeBatchJob } from "../repository-claude-batch.js";
+import { verboseDim, verboseInfo } from "../utils/verbose-log.js";
 
 /**
  * Prompt com cache: `cacheable` e a parte estatica (arquivo de prompt — mesma para todos os
@@ -113,8 +116,17 @@ export async function runClaudeUserPrompt(input: {
   emptyError: string;
 }): Promise<string> {
   const params = buildMessageCreateParams(input.stage, input.userPrompt);
+  const delivery = claudeDeliveryFromEnv();
+  const model = params.model;
+  const blockLabel =
+    input.blockNumber !== undefined ? ` bloco ${input.blockNumber}` : "";
+  verboseInfo(
+    `Claude [${input.stage}]${blockLabel}: delivery=${delivery} model=${model}` +
+      (input.customIdSuffix ? ` suffix=${input.customIdSuffix}` : ""),
+  );
 
-  if (claudeDeliveryFromEnv() === "sync") {
+  if (delivery === "sync") {
+    verboseDim(`Claude [${input.stage}]${blockLabel}: POST messages (sync)...`);
     const response = await getClient().messages.create(params);
     const textOut = response.content
       .filter((part: { type: string }) => part.type === "text")
@@ -125,6 +137,9 @@ export async function runClaudeUserPrompt(input: {
       const reason = "stop_reason" in response ? String(response.stop_reason) : "unknown";
       throw new Error(`${input.emptyError} (stop_reason=${reason})`);
     }
+    verboseInfo(
+      `Claude [${input.stage}]${blockLabel}: sync OK (${textOut.length} chars, stop=${"stop_reason" in response ? response.stop_reason : "?"})`,
+    );
     return textOut;
   }
 
@@ -133,7 +148,17 @@ export async function runClaudeUserPrompt(input: {
       ? buildBatchCustomId(input.projectId, input.stage, input.blockNumber, input.customIdSuffix)
       : `adhoc-${input.stage}-${Date.now()}`;
 
+  verboseDim(`Claude [${input.stage}]${blockLabel}: criando Message Batch (custom_id=${customId})...`);
   const { id: batchId } = await createClaudeMessageBatch([{ custom_id: customId, params }]);
+  console.log(
+    chalk.dim(
+      `Aguardando Claude [${input.stage}]${blockLabel} (batch ${batchId.slice(-12)})… ` +
+        `use --verbose ou GENTUBE_VERBOSE=1 para poll detalhado`,
+    ),
+  );
+  verboseInfo(
+    `Claude [${input.stage}]${blockLabel}: batch ${batchId} — poll a cada ${CLAUDE_BATCH_POLL_INTERVAL_MS / 1000}s`,
+  );
   let jobRowId: number | undefined;
   if (input.projectId !== undefined) {
     jobRowId = insertClaudeBatchJob({
@@ -144,7 +169,18 @@ export async function runClaudeUserPrompt(input: {
       batchId,
     });
   }
-  const ended = await pollClaudeBatchUntilEnded(batchId);
+  let pollRound = 0;
+  const pollStarted = Date.now();
+  const ended = await pollClaudeBatchUntilEnded(batchId, {
+    onStatus: (status, counts) => {
+      pollRound += 1;
+      verboseDim(
+        `Claude batch ${batchId.slice(-8)} [${input.stage}] poll #${pollRound}: status=${status}` +
+          ` ok=${counts.succeeded} proc=${counts.processing} err=${counts.errored} exp=${counts.expired}` +
+          ` (+${Math.round((Date.now() - pollStarted) / 1000)}s)`,
+      );
+    },
+  });
   const { processing_status, request_counts } = ended;
   if (
     !isClaudeBatchSuccess(
@@ -291,6 +327,8 @@ export type QualityGateCriteria = {
   argument_depth: number;
   cta: number;
   unique_value: number;
+  /** Present when a reference transcript was supplied to the evaluator. */
+  reference_fidelity?: number;
 };
 
 export type QualityGateResult = {
@@ -326,15 +364,36 @@ Required JSON schema (return ONLY this):
  * Avalia a qualidade de um bloco de roteiro usando Claude Sonnet.
  * Sempre sincronico (inline no pipeline — nao usa batch).
  */
+const QUALITY_GATE_REFERENCE_CRITERION = `
+- reference_fidelity (0-100): REQUIRED when a reference transcript is attached. Does this block preserve the reference's emotional register (humor, grief, pastoral tone), argument spine, and key examples — as an original English rewrite? 0 = ignores reference, generic AI tone, or copies/translates sentences verbatim from the reference language; 100 = faithful adaptive voice without plagiarism.
+When reference_fidelity is scored, weight it at 2.0 in score_total (include in weighted average numerator and denominator).`;
+
 export async function evaluateScriptQuality(input: {
   blockText: string;
   blockNumber: number;
   totalBlocks: number;
+  /** Reference transcript (e.g. source sermon). Truncated internally. */
+  referenceTranscript?: string;
 }): Promise<QualityGateResult> {
+  const ref = input.referenceTranscript?.trim();
+  const refSlice = ref ? ref.slice(0, 18_000) : "";
+  const refSection = refSlice
+    ? `
+
+REFERENCE TRANSCRIPT (source — evaluate fidelity to spirit/arc, NOT word-for-word copy):
+---
+${refSlice}
+---
+${QUALITY_GATE_REFERENCE_CRITERION}
+
+JSON criteria must include "reference_fidelity" (number).`
+    : "";
+
   const dynamicContent = `Script block ${input.blockNumber}/${input.totalBlocks}:
 ---
 ${input.blockText}
 ---
+${refSection}
 
 Return ONLY JSON. No markdown fences.`.trim();
 
@@ -385,6 +444,9 @@ Return ONLY JSON. No markdown fences.`.trim();
       argument_depth: Number(c.argument_depth ?? 0),
       cta: Number(c.cta ?? 0),
       unique_value: Number(c.unique_value ?? 0),
+      ...(c.reference_fidelity !== undefined
+        ? { reference_fidelity: Number(c.reference_fidelity) }
+        : {}),
     },
     blockers: Array.isArray(r.blockers) ? (r.blockers as string[]) : [],
     suggestions: Array.isArray(r.suggestions) ? (r.suggestions as string[]) : [],
@@ -495,7 +557,7 @@ export async function generateVisualizationPlanJson(input: {
   segmentationJson: string;
   maxVideos: number;
   maxImages: number;
-  visualModality?: "default" | "wojak";
+  visualModality?: "default" | "wojak" | "stoic_patrol";
   projectId?: number;
   customIdSuffix?: string;
 }): Promise<string> {
@@ -504,12 +566,21 @@ export async function generateVisualizationPlanJson(input: {
       ? JSON.stringify(input.manualCaptureSignals)
       : "[]";
   const wojakMode = input.visualModality === "wojak";
+  const stoicMode = input.visualModality === "stoic_patrol";
   const wojakContext = wojakMode
     ? `
 - visual_modality: wojak (MANDATORY)
 - stock_ratio: 0 — do NOT use source "stock" or "manual_capture" on any scene
 - Every scene: source "ai_generated", character_required true, character_variant set, search_keywords null
 - Wojak must comically act out each narration_text; prefer type "video" with motion cues in description
+`.trim()
+    : "";
+  const stoicContext = stoicMode
+    ? `
+- visual_modality: stoic_patrol (MANDATORY)
+- stock_ratio: 100 among non-quote scenes — use source "stock" with English search_keywords
+- quote_hint true OR explicit quotation in narration_text → source "quote_card", type "video", quote_text, quote_attribution optional, animation_type "typing", render_engine "hyperframes", search_keywords null
+- NEVER use ai_generated or manual_capture
 `.trim()
     : "";
 
@@ -520,11 +591,11 @@ Context:
 - block_number: ${input.blockNumber}
 - total_blocks: ${input.totalBlocks}
 - audience: ${input.audience}
-- stock_ratio: ${input.stockRatio}${wojakMode ? " (wojak mode: must be 0% stock)" : ""}
-- manual_capture_signals: ${signals}${wojakMode ? " (wojak mode: ignore — no manual_capture)" : ""}
+- stock_ratio: ${input.stockRatio}${wojakMode ? " (wojak mode: must be 0% stock)" : ""}${stoicMode ? " (stoic_patrol: 100% stock except quote_card)" : ""}
+- manual_capture_signals: ${signals}${wojakMode ? " (wojak mode: ignore — no manual_capture)" : ""}${stoicMode ? " (stoic_patrol: ignore — no manual_capture)" : ""}
 - max_videos_for_this_block: ${input.maxVideos} — HARD CAP: count of scenes with visual.type "video" must be ≤ this number.
 - max_images_for_this_block: ${input.maxImages} — HARD CAP: count of scenes with visual.type "image" must be ≤ this number.
-${wojakContext ? `${wojakContext}\n` : ""}- scenes (segmentation output — copy narration fields verbatim in output):
+${wojakContext ? `${wojakContext}\n` : ""}${stoicContext ? `${stoicContext}\n` : ""}- scenes (segmentation output — copy narration fields verbatim in output; preserve quote_hint if present):
 ${input.segmentationJson}
 
 Return ONLY JSON following visualiza01 schema (schema_version "2.0-visualization").

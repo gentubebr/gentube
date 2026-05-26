@@ -58,7 +58,7 @@ export async function runRoteiroBatchAll(
 
   const ended = await pollClaudeBatchUntilEnded(batchId, {
     pollIntervalMs: opts?.pollIntervalMs,
-    onStatus: (s) => opts?.onStatus?.(s, batchId),
+    onStatus: (s, _counts) => opts?.onStatus?.(s, batchId),
   });
 
   if (!isClaudeBatchSuccess(ended.processing_status, ended.request_counts.errored, ended.request_counts.expired)) {

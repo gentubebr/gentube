@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        width: 1920px;
+        height: 1080px;
+        overflow: hidden;
+        background: #000;
+        font-family: "Montserrat", "DejaVu Sans", sans-serif;
+      }
+      #root {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 80px 120px;
+        text-align: center;
+      }
+      #quote-text {
+        color: #ffffff;
+        font-weight: 600;
+        line-height: 1.32;
+        width: 100%;
+        max-width: 1680px;
+        white-space: pre-wrap;
+        overflow-wrap: break-word;
+        word-break: normal;
+        flex-shrink: 1;
+        min-height: 0;
+      }
+      #quote-attribution {
+        color: rgba(255, 255, 255, 0.85);
+        font-weight: 400;
+        margin-top: 36px;
+        max-width: 1680px;
+        line-height: 1.35;
+        flex-shrink: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="stoic-quote"
+      data-start="0"
+      data-duration="6"
+      data-width="1920"
+      data-height="1080"
+      data-composition-variables='{"quote_text":{"type":"string","default":""},"quote_attribution":{"type":"string","default":""},"duration_seconds":{"type":"number","default":6}}'
+    >
+      <div id="quote-text"></div>
+      <div id="quote-attribution"></div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const vars =
+        typeof window.__hyperframes !== "undefined" && window.__hyperframes.getVariables
+          ? window.__hyperframes.getVariables()
+          : {};
+      const quoteText = String(vars.quote_text ?? "").trim();
+      const attribution = String(vars.quote_attribution ?? "").trim();
+      const requestedDuration = Number(vars.duration_seconds) || 6;
+
+      function resolveDurationSec(text, hasAttr, requested) {
+        const len = text.length;
+        const typingSec = Math.max(3.5, (len * 0.042) / 1.4 + 1.5);
+        const holdSec = 2;
+        const fromText = Math.ceil(typingSec + holdSec);
+        return Math.max(6, Math.min(30, Math.max(requested, fromText)));
+      }
+
+      const duration = resolveDurationSec(quoteText, Boolean(attribution), requestedDuration);
+
+      const root = document.getElementById("root");
+      root.setAttribute("data-duration", String(duration));
+
+      const FONT_SIZES = [48, 44, 40, 36, 32, 28, 26, 24, 22];
+
+      /** Mede altura real no DOM e escolhe a maior fonte que cabe. */
+      function fitQuoteFontSizePx(text, attrText) {
+        const quoteEl = document.getElementById("quote-text");
+        const attrEl = document.getElementById("quote-attribution");
+        const maxH = root.clientHeight - (attrText ? 100 : 24);
+
+        for (const px of FONT_SIZES) {
+          const attrPx = Math.max(22, Math.round(px * 0.5));
+          quoteEl.style.fontSize = px + "px";
+          attrEl.style.fontSize = attrPx + "px";
+          quoteEl.textContent = text;
+          attrEl.textContent = attrText;
+          attrEl.style.display = attrText ? "block" : "none";
+          const totalH = quoteEl.offsetHeight + (attrText ? attrEl.offsetHeight + 36 : 0);
+          if (totalH <= maxH) return px;
+        }
+        quoteEl.style.fontSize = "22px";
+        attrEl.style.fontSize = "22px";
+        return 22;
+      }
+
+      const quoteEl = document.getElementById("quote-text");
+      const attrEl = document.getElementById("quote-attribution");
+      const quotePx = fitQuoteFontSizePx(quoteText, attribution);
+      const attrPx = Math.max(22, Math.round(quotePx * 0.5));
+      quoteEl.style.fontSize = quotePx + "px";
+      attrEl.style.fontSize = attrPx + "px";
+      quoteEl.textContent = "";
+      attrEl.textContent = attribution;
+      attrEl.style.display = attribution ? "block" : "none";
+      attrEl.style.opacity = attribution ? 0 : 0;
+
+      const tl = gsap.timeline({ paused: true });
+      const chars = quoteText.split("");
+      const typingDuration = Math.max(1.0, (duration * 0.72) / 1.4);
+      const charStep = chars.length > 0 ? typingDuration / chars.length : 0.057;
+
+      chars.forEach((ch, i) => {
+        tl.call(
+          () => {
+            quoteEl.textContent += ch;
+          },
+          null,
+          i * charStep,
+        );
+      });
+
+      if (attribution) {
+        tl.to(attrEl, { opacity: 1, duration: 0.4 }, typingDuration + 0.15);
+      }
+
+      tl.to({}, { duration: Math.max(0.5, duration - typingDuration - 0.6) }, duration - 0.5);
+
+      window.__timelines["stoic-quote"] = tl;
+    </script>
+  </body>
+</html>

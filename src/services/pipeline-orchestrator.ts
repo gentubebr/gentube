@@ -34,7 +34,7 @@ import type { MontagemPhase } from "../config/montagem.js";
 import type { Step3Limits } from "../types/step3-limits.js";
 import { parseIntervalMs } from "../utils/parse-interval.js";
 
-export type PipelineProfile = "wojak-images-only";
+export type PipelineProfile = "wojak-images-only" | "stoic-patrol-stock";
 
 export type PipelineStage =
   | "roteiro"
@@ -124,6 +124,11 @@ function resolveWojakImagesOnlyLimits(limits: Step3Limits): Step3Limits {
   };
 }
 
+function resolvePipelineLimits(profile: PipelineProfile, limits: Step3Limits): Step3Limits {
+  if (profile === "wojak-images-only") return resolveWojakImagesOnlyLimits(limits);
+  return limits;
+}
+
 export function assertPipelineProfileEnv(profile: PipelineProfile): string[] {
   const warnings: string[] = [];
   if (profile === "wojak-images-only") {
@@ -132,6 +137,17 @@ export function assertPipelineProfileEnv(profile: PipelineProfile): string[] {
     }
     if (!["1", "true", "yes"].includes(String(process.env.GENTUBE_SCENE_PLAN_V2 ?? "").toLowerCase())) {
       warnings.push("GENTUBE_SCENE_PLAN_V2 recomendado (=1) para modo cenas");
+    }
+  }
+  if (profile === "stoic-patrol-stock") {
+    if (resolveVisualModality() !== "stoic_patrol") {
+      warnings.push("GENTUBE_VISUAL_MODALITY nao e stoic_patrol — defina stoic_patrol no .env");
+    }
+    if (!["1", "true", "yes"].includes(String(process.env.GENTUBE_SCENE_PLAN_V2 ?? "").toLowerCase())) {
+      warnings.push("GENTUBE_SCENE_PLAN_V2 recomendado (=1) para Stoic Patrol");
+    }
+    if (["1", "true", "yes"].includes(String(process.env.GENTUBE_HF_ASYNC ?? "").toLowerCase())) {
+      warnings.push("GENTUBE_HF_ASYNC=1 nao recomendado para stoic_patrol (stock Magnific)");
     }
   }
   return warnings;
@@ -174,10 +190,12 @@ export async function runFullPipeline(
   const totalBlocos = Number(project.total_blocos);
   const projectPath = path.resolve(String(project.project_path));
   const slug = String(project.slug);
-  const limits = resolveWojakImagesOnlyLimits(options.limits);
+  const limits = resolvePipelineLimits(options.profile, options.limits);
 
   if (!options.imagensOpts.scenePlanV2) {
-    throw new Error("run-pipeline (wojak-images-only) exige plano por cenas: --scene-plan-v2 ou GENTUBE_SCENE_PLAN_V2=1");
+    throw new Error(
+      `run-pipeline (${options.profile}) exige plano por cenas: --scene-plan-v2 ou GENTUBE_SCENE_PLAN_V2=1`,
+    );
   }
 
   const envWarnings = assertPipelineProfileEnv(options.profile);

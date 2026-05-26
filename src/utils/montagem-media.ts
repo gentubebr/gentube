@@ -5,7 +5,7 @@ import type { ScenePlanV2, SceneVisualPlanV2 } from "../types/scenes-plan.js";
 import { narrationSceneMp3, rendersBlockDir } from "./montagem-paths.js";
 
 export type SceneReadiness =
-  | { ok: true; mp3Path: string; visualPath: string; isImage: boolean }
+  | { ok: true; mp3Path: string; visualPath: string; isImage: boolean; holdLastFrame?: boolean }
   | { ok: false; sceneId: string; reason: string };
 
 async function fileSize(path: string): Promise<number> {
@@ -79,7 +79,13 @@ export async function checkSceneReady(
     };
   }
 
-  return { ok: true, mp3Path, visualPath: visual.path, isImage: visual.isImage };
+  return {
+    ok: true,
+    mp3Path,
+    visualPath: visual.path,
+    isImage: visual.isImage,
+    holdLastFrame: scene.visual.source === "quote_card",
+  };
 }
 
 export type SceneSegment = {

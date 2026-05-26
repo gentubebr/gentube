@@ -30,6 +30,8 @@ export type JobQueueOptions = {
   avatarFile?: string;
   continueOnError?: boolean;
   maxRetriesPerBlock?: string;
+  maxVideosBlock1?: string;
+  maxVideosOther?: string;
   maxImagesBlock1?: string;
   maxImagesOther?: string;
   scenePlanV2?: boolean;

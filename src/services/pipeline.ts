@@ -9,7 +9,7 @@ import {
   DEFAULT_MAX_VIDEOS_OTHER_BLOCKS,
   MANUAL_CAPTURE_PLACEHOLDER_PATH,
   PROMPT_MATRIX02_PATH,
-  PROMPT_SEGMENTA01_PATH,
+  resolveSegmentaPromptContent,
   resolveImageDelivery,
   resolveSceneImageDelivery,
   resolveStockRatioForBlock,
@@ -78,6 +78,7 @@ import { parseAndValidateAssetsPlan } from "../utils/assets-plan.js";
 import { tryConcatMp3WithFfmpeg } from "../utils/mp3-concat.js";
 import {
   clearPlanParseError,
+  loadSegmentationErrorResume,
   loadVisualizationErrorResume,
   mergeVisualizationRawHalves,
   parseSegmentationJson,
@@ -92,10 +93,14 @@ import {
   step3LimitsFromSceneCaps,
   visualizationShouldSplit,
 } from "../utils/max-scenes.js";
-import { searchAndDownload } from "../integrations/magnific.js";
+import { searchAndDownload } from "../integrations/stock-download.js";
 import { sceneRenderOutputExists } from "../utils/media-output.js";
 import { Step3Limits } from "../types/step3-limits.js";
 import type { BlockScenesPlanV2, SegmentationPlanV2 } from "../types/scenes-plan.js";
+import { renderQuoteCardMp4 } from "./quote-card-render.js";
+import { saveStockToCache, tryCopyStockFromCache } from "./stock-cache.js";
+import { assertStoicPatrolBlockPlan } from "../utils/stoic-patrol-prompt.js";
+import { verboseDim, verboseInfo } from "../utils/verbose-log.js";
 import { assertWojakBlockPlan, prepareSceneVisualRender } from "../utils/wojak-prompt.js";
 
 type ProjectRow = Record<string, unknown>;
@@ -378,6 +383,10 @@ export async function runRoteiro(project: ProjectRow, opts?: RoteiroPromptOption
       });
       console.log(chalk.green(`${blockTag(i, totalBlocos)} Roteiro salvo → ${blockFileName}`));
       addProjectLog(projectId, "roteiro", "info", `Bloco ${i} gerado com sucesso`);
+
+      if (qualityGateEnabled()) {
+        await runQualityGateBlock(project, i, opts);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Erro desconhecido";
       console.log(chalk.red(`${blockTag(i, totalBlocos)} ERRO roteiro: ${message}`));
@@ -441,6 +450,10 @@ export async function runRoteiroBlock(project: ProjectRow, blockNumber: number, 
       finished_at: new Date().toISOString(),
     });
     addProjectLog(projectId, "roteiro", "info", `Bloco ${blockNumber} do roteiro gerado com sucesso`);
+
+    if (qualityGateEnabled()) {
+      await runQualityGateBlock(project, blockNumber, opts);
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Erro desconhecido";
     upsertScriptBlock(projectId, blockNumber, { status: "error", error_message: message, finished_at: new Date().toISOString() });
@@ -604,11 +617,25 @@ export async function runQualityGateBlock(
   for (let iter = 0; iter <= maxRegen; iter += 1) {
     addProjectLog(projectId, "quality_gate", "info", `Avaliando bloco ${blockNumber} (iteracao ${iter + 1}/${maxRegen + 1})`);
 
-    lastResult = await evaluateScriptQuality({ blockText, blockNumber, totalBlocks: totalBlocos });
+    const referenceTranscript = (project.transcript as string | null)?.trim() || undefined;
+    lastResult = await evaluateScriptQuality({
+      blockText,
+      blockNumber,
+      totalBlocks: totalBlocos,
+      referenceTranscript,
+    });
     attempts = iter + 1;
 
     const scoreLabel = lastResult.score_total >= threshold ? chalk.green(`${lastResult.score_total}`) : chalk.yellow(`${lastResult.score_total}`);
-    console.log(chalk.cyan(`[quality_gate] bloco ${blockNumber}/${totalBlocos} score=${scoreLabel}/${threshold} (iter ${iter + 1})`));
+    const fid =
+      lastResult.criteria.reference_fidelity !== undefined
+        ? ` ref_fidelity=${lastResult.criteria.reference_fidelity}`
+        : "";
+    console.log(
+      chalk.cyan(
+        `[quality_gate] bloco ${blockNumber}/${totalBlocos} score=${scoreLabel}/${threshold} (iter ${iter + 1})${fid}`,
+      ),
+    );
 
     addProjectLog(projectId, "quality_gate", "info", `Score bloco ${blockNumber}: ${lastResult.score_total}`, {
       criteria: lastResult.criteria,
@@ -1026,7 +1053,11 @@ async function imagensBlockPlanAndRenderV2(input: {
   const forceVizRegen = forceScenePlanVizRegen();
   const existingPlan = forceVizRegen ? null : await tryLoadPlanFromAssetsJson(input.jsonPath);
   const errorResume =
-    forceVizRegen || existingPlan ? null : await loadVisualizationErrorResume(input.jsonPath);
+    forceVizRegen || existingPlan ? null : await loadVisualizationErrorResume(input.jsonPath, input.scriptText);
+  const segErrorResume =
+    forceVizRegen || existingPlan || errorResume
+      ? null
+      : await loadSegmentationErrorResume(input.jsonPath, input.scriptText, { maxScenes });
 
   let plan: BlockScenesPlanV2;
 
@@ -1057,106 +1088,145 @@ async function imagensBlockPlanAndRenderV2(input: {
       assets_json: path.basename(input.jsonPath),
     });
     plan = existingPlan;
-  } else {
-    const segPrompt = await fs.readFile(PROMPT_SEGMENTA01_PATH, "utf-8");
-    const vizPrompt = await resolveVisualizaPromptContent();
-
-    let seg: SegmentationPlanV2;
-    let rawViz: string;
-
-    if (errorResume) {
-      const errPath = `${input.jsonPath}.error`;
-      console.log(
-        chalk.yellow(
-          `${blockTag(input.blockNumber, input.totalBlocos)} Reutilizando segmentacao + visualizacao em ${path.basename(errPath)} (sem novo Claude). Defina GENTUBE_FORCE_VIZ_REGEN=1 para regerar.`
-        )
-      );
-      addProjectLog(input.projectId, "imagens_videos", "info", `Bloco ${input.blockNumber}: resume de ${path.basename(errPath)}`, {
-        prior_error: errorResume.parse_error,
-      });
-      seg = errorResume.segmentation_json;
-      rawViz = errorResume.raw_response;
     } else {
-      const rawSeg = await generateSegmentationPlanJson({
-        promptBase: segPrompt,
-        blockNumber: input.blockNumber,
-        totalBlocks: input.totalBlocos,
-        blockText: input.scriptText,
-        maxScenes,
-        projectId: input.projectId,
-      });
-      seg = await parseSegmentationWithErrorFile(
-        input.jsonPath,
-        rawSeg,
-        input.blockNumber,
-        input.totalBlocos,
-        input.scriptText,
-        maxScenes
+      const segPrompt = await resolveSegmentaPromptContent();
+      const vizPrompt = await resolveVisualizaPromptContent();
+      const visualModality = resolveVisualModality();
+      verboseInfo(
+        `${blockTag(bn, tb)} Plano v2: modalidade=${visualModality} stock_ratio=${input.stockRatio}% ` +
+          `roteiro=${input.scriptText.length} chars`,
+      );
+      verboseDim(
+        `${blockTag(bn, tb)} Claude delivery=${process.env.GENTUBE_CLAUDE_DELIVERY ?? "batch"} ` +
+          `(verbose: poll a cada ${process.env.GENTUBE_CLAUDE_BATCH_POLL_INTERVAL ?? "60s"})`,
       );
 
-      const visualModality = resolveVisualModality();
-      const segJsonFull = JSON.stringify(seg, null, 2);
-      if (visualizationShouldSplit(seg.scenes.length)) {
-        const [partA, partB] = splitScenesForVisualization(seg.scenes);
-        const segA: SegmentationPlanV2 = { ...seg, scenes: partA };
-        const segB: SegmentationPlanV2 = { ...seg, scenes: partB };
-        console.log(
-          chalk.dim(
-            `${blockTag(bn, tb)} Visualizacao em 2 pedidos (${partA.length}+${partB.length} cenas)`,
-          ),
-        );
-        const rawVizA = await generateVisualizationPlanJson({
-          promptBase: vizPrompt,
-          blockNumber: input.blockNumber,
-          totalBlocks: input.totalBlocos,
-          audience: String(input.project.audience),
-          stockRatio: input.stockRatio,
-          manualCaptureSignals: input.manualCaptureSignals,
-          segmentationJson: JSON.stringify(segA, null, 2),
-          maxVideos,
-          maxImages,
-          visualModality,
-          projectId: input.projectId,
-          customIdSuffix: "viz-a",
-        });
-        const rawVizB = await generateVisualizationPlanJson({
-          promptBase: vizPrompt,
-          blockNumber: input.blockNumber,
-          totalBlocks: input.totalBlocos,
-          audience: String(input.project.audience),
-          stockRatio: input.stockRatio,
-          manualCaptureSignals: input.manualCaptureSignals,
-          segmentationJson: JSON.stringify(segB, null, 2),
-          maxVideos,
-          maxImages,
-          visualModality,
-          projectId: input.projectId,
-          customIdSuffix: "viz-b",
-        });
-        rawViz = mergeVisualizationRawHalves(rawVizA, rawVizB);
-      } else {
-        rawViz = await generateVisualizationPlanJson({
-          promptBase: vizPrompt,
-          blockNumber: input.blockNumber,
-          totalBlocks: input.totalBlocos,
-          audience: String(input.project.audience),
-          stockRatio: input.stockRatio,
-          manualCaptureSignals: input.manualCaptureSignals,
-          segmentationJson: segJsonFull,
-          maxVideos,
-          maxImages,
-          visualModality,
-          projectId: input.projectId,
-        });
-      }
-    }
+      let seg: SegmentationPlanV2;
+      let rawViz: string | undefined;
 
+      if (errorResume) {
+        const errPath = `${input.jsonPath}.error`;
+        console.log(
+          chalk.yellow(
+            `${blockTag(input.blockNumber, input.totalBlocos)} Reutilizando segmentacao + visualizacao em ${path.basename(errPath)} (sem novo Claude). Defina GENTUBE_FORCE_VIZ_REGEN=1 para regerar.`
+          )
+        );
+        addProjectLog(input.projectId, "imagens_videos", "info", `Bloco ${input.blockNumber}: resume de ${path.basename(errPath)}`, {
+          prior_error: errorResume.parse_error,
+        });
+        seg = errorResume.segmentation_json;
+        rawViz = errorResume.raw_response;
+      } else if (segErrorResume) {
+        const errPath = `${input.jsonPath}.error`;
+        console.log(
+          chalk.yellow(
+            `${blockTag(input.blockNumber, input.totalBlocos)} Reutilizando segmentacao em ${path.basename(errPath)} (cauda reparada; so visualizacao Claude).`
+          )
+        );
+        addProjectLog(input.projectId, "imagens_videos", "info", `Bloco ${input.blockNumber}: segmentacao reutilizada de ${path.basename(errPath)}`, {
+          scenes: segErrorResume.scenes.length,
+        });
+        seg = segErrorResume;
+      } else {
+        verboseInfo(`${blockTag(bn, tb)} Etapa 1/2: segmentacao (max_scenes=${maxScenes})...`);
+        const rawSeg = await generateSegmentationPlanJson({
+          promptBase: segPrompt,
+          blockNumber: input.blockNumber,
+          totalBlocks: input.totalBlocos,
+          blockText: input.scriptText,
+          maxScenes,
+          projectId: input.projectId,
+        });
+        seg = await parseSegmentationWithErrorFile(
+          input.jsonPath,
+          rawSeg,
+          input.blockNumber,
+          input.totalBlocos,
+          input.scriptText,
+          maxScenes,
+        );
+        verboseInfo(
+          `${blockTag(bn, tb)} Segmentacao OK: ${seg.scenes.length} cenas, ` +
+            `${seg.scenes.filter((s) => s.quote_hint).length} quote_hint`,
+        );
+      }
+
+      if (!errorResume) {
+        const segJsonFull = JSON.stringify(seg, null, 2);
+        if (visualizationShouldSplit(seg.scenes.length)) {
+          const [partA, partB] = splitScenesForVisualization(seg.scenes);
+          const segA: SegmentationPlanV2 = { ...seg, scenes: partA };
+          const segB: SegmentationPlanV2 = { ...seg, scenes: partB };
+          console.log(
+            chalk.dim(
+              `${blockTag(bn, tb)} Visualizacao em 2 pedidos (${partA.length}+${partB.length} cenas)`,
+            ),
+          );
+          verboseInfo(`${blockTag(bn, tb)} Etapa 2/2: visualizacao parte A (${partA.length} cenas)...`);
+          const rawVizA = await generateVisualizationPlanJson({
+            promptBase: vizPrompt,
+            blockNumber: input.blockNumber,
+            totalBlocks: input.totalBlocos,
+            audience: String(input.project.audience),
+            stockRatio: input.stockRatio,
+            manualCaptureSignals: input.manualCaptureSignals,
+            segmentationJson: JSON.stringify(segA, null, 2),
+            maxVideos,
+            maxImages,
+            visualModality,
+            projectId: input.projectId,
+            customIdSuffix: "viz-a",
+          });
+          verboseInfo(`${blockTag(bn, tb)} Etapa 2/2: visualizacao parte B (${partB.length} cenas)...`);
+          const rawVizB = await generateVisualizationPlanJson({
+            promptBase: vizPrompt,
+            blockNumber: input.blockNumber,
+            totalBlocks: input.totalBlocos,
+            audience: String(input.project.audience),
+            stockRatio: input.stockRatio,
+            manualCaptureSignals: input.manualCaptureSignals,
+            segmentationJson: JSON.stringify(segB, null, 2),
+            maxVideos,
+            maxImages,
+            visualModality,
+            projectId: input.projectId,
+            customIdSuffix: "viz-b",
+          });
+          rawViz = mergeVisualizationRawHalves(rawVizA, rawVizB);
+          verboseInfo(`${blockTag(bn, tb)} Visualizacao A+B fundidas`);
+        } else {
+          verboseInfo(`${blockTag(bn, tb)} Etapa 2/2: visualizacao (${seg.scenes.length} cenas)...`);
+          rawViz = await generateVisualizationPlanJson({
+            promptBase: vizPrompt,
+            blockNumber: input.blockNumber,
+            totalBlocks: input.totalBlocos,
+            audience: String(input.project.audience),
+            stockRatio: input.stockRatio,
+            manualCaptureSignals: input.manualCaptureSignals,
+            segmentationJson: segJsonFull,
+            maxVideos,
+            maxImages,
+            visualModality,
+            projectId: input.projectId,
+          });
+        }
+      }
+
+    if (!rawViz?.trim()) {
+      throw new Error(`${blockTag(bn, tb)} Visualizacao ausente apos segmentacao`);
+    }
     plan = await parseVisualizationWithErrorFile(
       input.jsonPath,
       rawViz,
       seg,
       input.scriptText,
       step3LimitsFromSceneCaps(bn, caps, input.limits),
+    );
+    const quoteCards = plan.scenes.filter((s) => s.visual.source === "quote_card").length;
+    const stockScenes = plan.scenes.filter((s) => s.visual.source === "stock").length;
+    verboseInfo(
+      `${blockTag(bn, tb)} Visualizacao OK: ${plan.scenes.length} cenas ` +
+        `(stock=${stockScenes}, quote_card=${quoteCards})`,
     );
 
     await clearPlanParseError(input.jsonPath);
@@ -1165,6 +1235,7 @@ async function imagensBlockPlanAndRenderV2(input: {
   }
 
   assertWojakBlockPlan(plan);
+  assertStoicPatrolBlockPlan(plan);
 
   const planImages = plan.scenes.filter((s) => s.visual.type === "image").length;
   const planVideos = plan.scenes.filter((s) => s.visual.type === "video").length;
@@ -1226,7 +1297,15 @@ async function imagensBlockPlanAndRenderV2(input: {
       )
     );
   }
-  const useHfVideoQueue = GENTUBE_HF_ASYNC && visualModality !== "wojak";
+  if (visualModality === "stoic_patrol") {
+    console.log(
+      chalk.cyan(
+        `  ${blockTag(bn, tb)} Modalidade visual: stoic_patrol (Magnific stock + quote_card Hyperframes — ver stoic-patrol.md)`
+      )
+    );
+  }
+  const useHfVideoQueue =
+    GENTUBE_HF_ASYNC && visualModality !== "wojak" && visualModality !== "stoic_patrol";
   const avatarRef =
     input.avatarPath && String(input.avatarPath).trim()
       ? /^https?:\/\//i.test(String(input.avatarPath))
@@ -1249,13 +1328,34 @@ async function imagensBlockPlanAndRenderV2(input: {
         );
       }
       if (v.search_keywords?.trim()) {
-        console.log(chalk.dim(`  ${blockTag(bn, tb)} Stock ${scene.id} (${v.type}): "${v.search_keywords.trim()}"...`));
+        const keywords = v.search_keywords.trim();
+        const destNoExt = path.join(input.rendersDir, scene.id);
+        const cachedStock =
+          visualModality === "stoic_patrol"
+            ? await tryCopyStockFromCache({ type: v.type, keywords, destPathNoExt: destNoExt })
+            : null;
+        if (cachedStock) {
+          done += 1;
+          console.log(
+            chalk.green(`  ${blockTag(bn, tb)} Stock cache hit: ${scene.id} → ${path.basename(cachedStock)}`),
+          );
+          addProjectLog(input.projectId, "imagens_videos", "info", `Stock cache ${scene.id}`, {
+            mediaPath: cachedStock,
+            keywords,
+          });
+          upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
+          continue;
+        }
+        console.log(chalk.dim(`  ${blockTag(bn, tb)} Stock ${scene.id} (${v.type}): "${keywords}"...`));
         try {
           const localPath = await searchAndDownload({
             type: v.type,
-            keywords: v.search_keywords.trim(),
-            destPathNoExt: path.join(input.rendersDir, scene.id),
+            keywords,
+            destPathNoExt: destNoExt,
           });
+          if (visualModality === "stoic_patrol") {
+            await saveStockToCache({ type: v.type, keywords, localPath });
+          }
           done += 1;
           console.log(chalk.green(`  ${blockTag(bn, tb)} Stock baixado: ${scene.id} → ${path.basename(localPath)}`));
           addProjectLog(input.projectId, "imagens_videos", "info", `Stock baixado bloco ${bn} cena ${scene.id}`, {
@@ -1265,6 +1365,9 @@ async function imagensBlockPlanAndRenderV2(input: {
           upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
         } catch (stockErr) {
           const msg = stockErr instanceof Error ? stockErr.message : "Erro stock";
+          if (visualModality === "stoic_patrol") {
+            throw new Error(`Stock falhou ${scene.id} (stoic_patrol sem fallback IA): ${msg}`);
+          }
           console.log(chalk.yellow(`  ${blockTag(bn, tb)} Stock falhou ${scene.id}: ${msg} — fallback IA`));
           addProjectLog(input.projectId, "imagens_videos", "info", `Stock falhou bloco ${bn} cena ${scene.id}, fallback IA`, {
             error: msg,
@@ -1275,9 +1378,42 @@ async function imagensBlockPlanAndRenderV2(input: {
       if (effectiveSource === "stock") continue;
     }
 
+    if (effectiveSource === "quote_card") {
+      if (visualModality !== "stoic_patrol") {
+        throw new Error(`Cena ${scene.id}: quote_card so em GENTUBE_VISUAL_MODALITY=stoic_patrol`);
+      }
+      const quoteText = v.quote_text?.trim();
+      if (!quoteText) throw new Error(`Cena ${scene.id}: quote_card sem quote_text`);
+      const outMp4 = path.join(input.rendersDir, `${scene.id}.mp4`);
+      const duration =
+        scene.estimated_duration_seconds > 0
+          ? scene.estimated_duration_seconds
+          : Math.max(3, Math.min(12, v.duration_seconds_max || 6));
+      console.log(chalk.dim(`  ${blockTag(bn, tb)} Quote card ${scene.id} (${duration.toFixed(1)}s)...`));
+      const { cacheHit, engine } = await renderQuoteCardMp4({
+        quoteText,
+        quoteAttribution: v.quote_attribution ?? null,
+        durationSeconds: duration,
+        outPath: outMp4,
+      });
+      done += 1;
+      console.log(
+        chalk.green(
+          `  ${blockTag(bn, tb)} Quote ${scene.id} → ${path.basename(outMp4)} (${engine}${cacheHit ? ", cache" : ""})`,
+        ),
+      );
+      addProjectLog(input.projectId, "imagens_videos", "info", `Quote card ${scene.id}`, {
+        mediaPath: outMp4,
+        engine,
+        cacheHit,
+      });
+      upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
+      continue;
+    }
+
     if (effectiveSource === "manual_capture") {
-      if (visualModality === "wojak") {
-        throw new Error(`Cena ${scene.id}: manual_capture proibido em modo wojak`);
+      if (visualModality === "wojak" || visualModality === "stoic_patrol") {
+        throw new Error(`Cena ${scene.id}: manual_capture proibido em modo ${visualModality}`);
       }
       const dest = path.join(input.rendersDir, `${scene.id}.png`);
       await fs.copyFile(MANUAL_CAPTURE_PLACEHOLDER_PATH, dest);
@@ -1286,6 +1422,10 @@ async function imagensBlockPlanAndRenderV2(input: {
       addProjectLog(input.projectId, "imagens_videos", "info", `Placeholder manual_capture ${scene.id}`, { mediaPath: dest });
       upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
       continue;
+    }
+
+    if (visualModality === "stoic_patrol") {
+      throw new Error(`Cena ${scene.id}: source ${effectiveSource} nao renderizado em stoic_patrol`);
     }
 
     if (effectiveSource !== "ai_generated") continue;

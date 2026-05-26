@@ -1,10 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Step3Limits } from "../types/step3-limits.js";
+import { assertStoicPatrolBlockPlan } from "./stoic-patrol-prompt.js";
 import { assertWojakBlockPlan, isWojakCharacterVariant } from "./wojak-prompt.js";
 import type { BlockScenesPlanV2, ScenePlanV2, SceneVisualPlanV2, SegmentationPlanV2 } from "../types/scenes-plan.js";
 import {
   estimatedSpeechSecondsFromWordCount,
+  repairSegmentationCoverageTail,
   validateSceneTextsCoverBlock,
   wordCountForCoverage,
 } from "./text-coverage.js";
@@ -78,8 +80,53 @@ export type VisualizationErrorResume = {
 };
 
 /** Le `.assets.json.error` para reutilizar segmentacao + resposta de visualizacao (evita novo Claude). */
+/** Reutiliza segmentacao em `.error` (stage segmentation) se cobertura OK apos reparo de cauda. */
+export async function loadSegmentationErrorResume(
+  assetsJsonPath: string,
+  blockText: string,
+  opts?: ParseSegmentationOptions,
+): Promise<SegmentationPlanV2 | null> {
+  const errorPath = `${assetsJsonPath}.error`;
+  try {
+    const raw = await fs.readFile(errorPath, "utf-8");
+    const doc = JSON.parse(raw) as PlanParseErrorPayload;
+    if (doc.stage !== "segmentation" || !doc.unwrapped_for_json_parse?.trim()) return null;
+    const parsed: unknown = JSON.parse(doc.unwrapped_for_json_parse);
+    if (!isObject(parsed) || !Array.isArray(parsed.scenes) || parsed.scenes.length === 0) return null;
+    const blockNumber = typeof parsed.block_number === "number" ? parsed.block_number : 0;
+    const totalBlocks = typeof parsed.total_blocks === "number" ? parsed.total_blocks : 0;
+    let scenes: SegmentationPlanV2["scenes"] = [];
+    for (let i = 0; i < parsed.scenes.length; i += 1) {
+      const s = parsed.scenes[i];
+      if (!isObject(s) || typeof s.id !== "string" || typeof s.narration_text !== "string") return null;
+      scenes.push({
+        id: s.id.trim(),
+        narration_text: s.narration_text,
+        narration_word_count: wordCountForCoverage(s.narration_text),
+        ...(s.quote_hint === true ? { quote_hint: true as const } : {}),
+      });
+    }
+    scenes = repairSegmentationCoverageTail(blockText, scenes).map((s) => ({
+      ...s,
+      narration_word_count: wordCountForCoverage(s.narration_text),
+    }));
+    validateSceneTextsCoverBlock(blockText, scenes.map((x) => x.narration_text));
+    // Nao aplicar maxScenes no resume: segmentacao ja foi aceite pelo modelo; caps aplicam-se no merge/enforce
+    return {
+      schema_version: "2.0-segmentation",
+      stage: "segmentation",
+      block_number: blockNumber,
+      total_blocks: totalBlocks,
+      scenes,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function loadVisualizationErrorResume(
-  assetsJsonPath: string
+  assetsJsonPath: string,
+  blockText?: string,
 ): Promise<VisualizationErrorResume | null> {
   const errorPath = `${assetsJsonPath}.error`;
   try {
@@ -87,11 +134,21 @@ export async function loadVisualizationErrorResume(
     const doc = JSON.parse(raw) as PlanParseErrorPayload;
     if (doc.stage !== "visualization" || !doc.raw_response?.trim()) return null;
     if (!doc.segmentation_json?.scenes?.length) return null;
+    let segmentation_json = doc.segmentation_json;
+    if (blockText) {
+      segmentation_json = {
+        ...segmentation_json,
+        scenes: repairSegmentationCoverageTail(blockText, segmentation_json.scenes).map((s) => ({
+          ...s,
+          narration_word_count: wordCountForCoverage(s.narration_text),
+        })),
+      };
+    }
     return {
       stage: doc.stage,
       parse_error: doc.parse_error,
       raw_response: doc.raw_response,
-      segmentation_json: doc.segmentation_json,
+      segmentation_json,
     };
   } catch {
     return null;
@@ -132,7 +189,7 @@ export function parseSegmentationJson(
   if (!Array.isArray(parsed.scenes) || parsed.scenes.length === 0) {
     throw new Error("Segmentacao: scenes vazio");
   }
-  const scenes: SegmentationPlanV2["scenes"] = [];
+  let scenes: SegmentationPlanV2["scenes"] = [];
   for (let i = 0; i < parsed.scenes.length; i += 1) {
     const s = parsed.scenes[i];
     if (!isObject(s)) throw new Error(`Segmentacao: cena ${i + 1} invalida`);
@@ -141,12 +198,23 @@ export function parseSegmentationJson(
     if (typeof s.narration_word_count !== "number" || s.narration_word_count < 0) {
       throw new Error(`Segmentacao: ${s.id} narration_word_count invalido`);
     }
+    const quoteHint =
+      s.quote_hint === true || s.quote_hint === "true"
+        ? true
+        : s.quote_hint === false || s.quote_hint === "false"
+          ? false
+          : undefined;
     scenes.push({
       id: s.id.trim(),
       narration_text: s.narration_text,
       narration_word_count: wordCountForCoverage(s.narration_text),
+      ...(quoteHint !== undefined ? { quote_hint: quoteHint } : {}),
     });
   }
+  scenes = repairSegmentationCoverageTail(blockText, scenes).map((s) => ({
+    ...s,
+    narration_word_count: wordCountForCoverage(s.narration_text),
+  }));
   validateSceneTextsCoverBlock(blockText, scenes.map((x) => x.narration_text));
   const maxWordsPerScene = Math.max(
     40,
@@ -239,7 +307,12 @@ export function enforceScenePlanCaps(
 function assertVisual(v: unknown, sceneId: string): asserts v is SceneVisualPlanV2 {
   if (!isObject(v)) throw new Error(`Visual ${sceneId}: objeto ausente`);
   if (v.type !== "image" && v.type !== "video") throw new Error(`Visual ${sceneId}: type image|video`);
-  if (v.source !== "ai_generated" && v.source !== "stock" && v.source !== "manual_capture") {
+  if (
+    v.source !== "ai_generated" &&
+    v.source !== "stock" &&
+    v.source !== "manual_capture" &&
+    v.source !== "quote_card"
+  ) {
     throw new Error(`Visual ${sceneId}: source invalido`);
   }
   if (typeof v.role !== "string" || !v.role.trim()) throw new Error(`Visual ${sceneId}: role ausente`);
@@ -253,6 +326,18 @@ function assertVisual(v: unknown, sceneId: string): asserts v is SceneVisualPlan
   if (v.source === "stock") {
     if (typeof v.search_keywords !== "string" || !v.search_keywords.trim()) {
       throw new Error(`Visual ${sceneId}: search_keywords obrigatorio para stock`);
+    }
+  }
+  if (v.source === "quote_card") {
+    if (v.type !== "video") throw new Error(`Visual ${sceneId}: quote_card exige type video`);
+    if (typeof v.quote_text !== "string" || !v.quote_text.trim()) {
+      throw new Error(`Visual ${sceneId}: quote_text obrigatorio para quote_card`);
+    }
+    if (v.search_keywords != null && String(v.search_keywords).trim() !== "") {
+      throw new Error(`Visual ${sceneId}: quote_card deve ter search_keywords null`);
+    }
+    if (v.animation_type !== undefined && v.animation_type !== "typing") {
+      throw new Error(`Visual ${sceneId}: animation_type deve ser typing`);
     }
   }
   if (v.character_variant !== undefined && v.character_variant !== null && v.character_variant !== "") {
@@ -279,6 +364,79 @@ function assertVisual(v: unknown, sceneId: string): asserts v is SceneVisualPlan
   (v as { duration_seconds_max: number }).duration_seconds_max = d;
 }
 
+/** Viz as vezes cria sc48b (quote_card extra); expande segmentacao cortando o roteiro original no 2. quote_text. */
+export function expandSegmentationForVizQuoteSplits(
+  segmentation: SegmentationPlanV2,
+  vizScenes: { id: string; narration_text: string; visual?: unknown }[],
+): SegmentationPlanV2 {
+  const expanded: SegmentationPlanV2["scenes"] = [];
+  let vi = 0;
+  for (const seg of segmentation.scenes) {
+    if (vi >= vizScenes.length) {
+      expanded.push(seg);
+      continue;
+    }
+    const vMain = vizScenes[vi];
+    if (vMain.id !== seg.id) {
+      throw new Error(
+        `Visualizacao: ordem/id mismatch (segmentacao ${seg.id}, viz ${vMain?.id ?? "?"})`,
+      );
+    }
+    vi += 1;
+    const suffixRows: { id: string; visual?: unknown }[] = [];
+    while (vi < vizScenes.length) {
+      const vExtra = vizScenes[vi];
+      const suffix = vExtra.id.slice(seg.id.length);
+      if (!suffix || !/^[a-z]$/.test(suffix)) break;
+      suffixRows.push(vExtra);
+      vi += 1;
+    }
+    const extraQuote =
+      suffixRows[0] && isObject(suffixRows[0].visual) && typeof suffixRows[0].visual.quote_text === "string"
+        ? String(suffixRows[0].visual.quote_text).trim()
+        : "";
+    if (extraQuote) {
+      const needle = extraQuote.slice(0, Math.min(28, extraQuote.length));
+      const splitAt = seg.narration_text.indexOf(needle);
+      if (splitAt > 0) {
+        const first = seg.narration_text.slice(0, splitAt).trim();
+        const second = seg.narration_text.slice(splitAt).trim();
+        expanded.push({
+          ...seg,
+          narration_text: first,
+          narration_word_count: wordCountForCoverage(first),
+          quote_hint: true,
+        });
+        expanded.push({
+          id: suffixRows[0].id,
+          narration_text: second,
+          narration_word_count: wordCountForCoverage(second),
+          quote_hint: true,
+        });
+        if (suffixRows.length > 1) {
+          throw new Error(`Visualizacao: multiplos sufixos de citacao nao suportados em ${seg.id}`);
+        }
+        continue;
+      }
+    }
+    expanded.push(seg);
+    for (const sRow of suffixRows) {
+      expanded.push({
+        id: sRow.id,
+        narration_text: seg.narration_text,
+        narration_word_count: seg.narration_word_count,
+        quote_hint: seg.quote_hint,
+      });
+    }
+  }
+  if (vi !== vizScenes.length) {
+    throw new Error(
+      `Visualizacao: ${vizScenes.length - vi} cena(s) viz sem par na segmentacao`,
+    );
+  }
+  return { ...segmentation, scenes: expanded };
+}
+
 export function parseVisualizationMerge(
   raw: string,
   segmentation: SegmentationPlanV2,
@@ -300,18 +458,30 @@ export function parseVisualizationMerge(
   if (typeof parsed.block_number !== "number" || parsed.block_number !== segmentation.block_number) {
     throw new Error("Visualizacao: block_number inconsistente");
   }
-  if (!Array.isArray(parsed.scenes) || parsed.scenes.length !== segmentation.scenes.length) {
-    throw new Error("Visualizacao: numero de cenas deve igualar a segmentacao");
+  if (!Array.isArray(parsed.scenes)) {
+    throw new Error("Visualizacao: scenes ausente");
+  }
+  const vizRows = parsed.scenes as { id: string; narration_text: string; visual?: unknown }[];
+  let segPlan = segmentation;
+  if (vizRows.length !== segPlan.scenes.length) {
+    if (vizRows.length > segPlan.scenes.length) {
+      segPlan = expandSegmentationForVizQuoteSplits(segPlan, vizRows);
+    } else {
+      throw new Error("Visualizacao: numero de cenas deve igualar a segmentacao");
+    }
   }
 
   const scenes: ScenePlanV2[] = [];
-  for (let i = 0; i < segmentation.scenes.length; i += 1) {
-    const seg = segmentation.scenes[i];
-    const row = parsed.scenes[i];
+  for (let i = 0; i < segPlan.scenes.length; i += 1) {
+    const seg = segPlan.scenes[i];
+    const row = vizRows[i];
     if (!isObject(row)) throw new Error(`Visualizacao: cena ${i + 1} invalida`);
     if (row.id !== seg.id) throw new Error(`Visualizacao: ordem/id mismatch em ${seg.id}`);
-    if (row.narration_text !== seg.narration_text) {
+    if (row.narration_text !== seg.narration_text && !seg.quote_hint) {
       throw new Error(`Visualizacao: narration_text nao pode alterar em ${seg.id}`);
+    }
+    if (seg.quote_hint && row.narration_text !== seg.narration_text) {
+      /* narracao parcial em cenas de citacao apos expandSegmentationForVizQuoteSplits */
     }
     assertVisual(row.visual, seg.id);
     const visual = row.visual as SceneVisualPlanV2;
@@ -331,16 +501,24 @@ export function parseVisualizationMerge(
   );
 
   if (limits) {
-    enforceScenePlanCaps(scenes, segmentation.block_number, limits);
+    const bn = segPlan.block_number;
+    const maxVideos = bn === 1 ? limits.maxVideosBlock1 : limits.maxVideosOtherBlocks;
+    const sceneFloor = Math.max(segPlan.scenes.length, maxVideos + 1);
+    const limitsForMerge: Step3Limits =
+      bn === 1
+        ? { ...limits, maxImagesBlock1: Math.max(limits.maxImagesBlock1, sceneFloor) }
+        : { ...limits, maxImagesOtherBlocks: Math.max(limits.maxImagesOtherBlocks, sceneFloor) };
+    enforceScenePlanCaps(scenes, bn, limitsForMerge);
   }
 
   const plan: BlockScenesPlanV2 = {
     schema_version: "2.0",
-    block_number: segmentation.block_number,
-    total_blocks: segmentation.total_blocks,
+    block_number: segPlan.block_number,
+    total_blocks: segPlan.total_blocks,
     scenes,
   };
   assertWojakBlockPlan(plan);
+  assertStoicPatrolBlockPlan(plan);
   return plan;
 }
 

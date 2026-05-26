@@ -217,6 +217,7 @@ export async function runMontagemBlock(
           mp3Path: readiness.mp3Path,
           visualPath: readiness.visualPath,
           isImage: readiness.isImage,
+          holdLastFrame: readiness.holdLastFrame,
           outPath: sceneOut,
         });
         readyById.set(scene.id, { clipPath: sceneOut });

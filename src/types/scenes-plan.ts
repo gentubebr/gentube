@@ -1,7 +1,11 @@
 import type { IpRisk } from "./assets-plan.js";
 import type { WojakCharacterVariant } from "../config.js";
 
-export type VisualSourceV2 = "ai_generated" | "stock" | "manual_capture";
+export type VisualSourceV2 = "ai_generated" | "stock" | "manual_capture" | "quote_card";
+
+export type QuoteAnimationType = "typing";
+
+export type QuoteRenderEngine = "hyperframes";
 
 export type CaptureBrief = {
   method: string;
@@ -24,6 +28,11 @@ export type SceneVisualPlanV2 = {
   character_required?: boolean;
   /** Modo Wojak: expressao da referencia PNG (opcional; pipeline infere se ausente). */
   character_variant?: WojakCharacterVariant;
+  /** Stoic Patrol: texto no cartao (sem aspas externas). */
+  quote_text?: string;
+  quote_attribution?: string | null;
+  animation_type?: QuoteAnimationType;
+  render_engine?: QuoteRenderEngine;
 };
 
 export type ScenePlanV2 = {
@@ -52,5 +61,7 @@ export type SegmentationPlanV2 = {
     id: string;
     narration_text: string;
     narration_word_count: number;
+    /** Stoic Patrol: cena de citacao explicita. */
+    quote_hint?: boolean;
   }>;
 };

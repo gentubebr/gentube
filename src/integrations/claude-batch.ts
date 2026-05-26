@@ -104,15 +104,27 @@ export function isClaudeBatchSuccess(status: string, errored: number, expired: n
   return status === "ended" && errored === 0 && expired === 0;
 }
 
+export type ClaudeBatchPollCounts = {
+  processing: number;
+  succeeded: number;
+  errored: number;
+  expired: number;
+  canceled: number;
+};
+
 export async function pollClaudeBatchUntilEnded(
   batchId: string,
-  opts?: { pollIntervalMs?: number; maxRounds?: number; onStatus?: (status: string) => void },
+  opts?: {
+    pollIntervalMs?: number;
+    maxRounds?: number;
+    onStatus?: (status: string, counts: ClaudeBatchPollCounts) => void;
+  },
 ): Promise<Awaited<ReturnType<typeof retrieveClaudeMessageBatch>>> {
   const interval = opts?.pollIntervalMs ?? CLAUDE_BATCH_POLL_INTERVAL_MS;
   const maxRounds = opts?.maxRounds ?? 500;
   for (let i = 0; i < maxRounds; i += 1) {
     const batch = await retrieveClaudeMessageBatch(batchId);
-    opts?.onStatus?.(batch.processing_status);
+    opts?.onStatus?.(batch.processing_status, batch.request_counts);
     if (isClaudeBatchTerminal(batch.processing_status)) {
       return batch;
     }

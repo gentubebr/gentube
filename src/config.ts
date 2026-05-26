@@ -17,10 +17,18 @@ export const PROMPT_SEGMENTA01_PATH = path.join(PROMPTS_DIR, "segmenta01.md");
 export const PROMPT_VISUALIZA01_PATH = path.join(PROMPTS_DIR, "visualiza01.md");
 /** Addon Wojak (composicao com visualiza01 quando modality=wojak). */
 export const PROMPT_VISUALIZA_WOJAK_PATH = path.join(PROMPTS_DIR, "visualiza_wojak.md");
+/** Addon segmentacao Stoic Patrol. */
+export const PROMPT_SEGMENTA_STOIC_PATROL_PATH = path.join(PROMPTS_DIR, "segmenta_stoic_patrol.md");
+/** Addon visualizacao Stoic Patrol. */
+export const PROMPT_VISUALIZA_STOIC_PATROL_PATH = path.join(PROMPTS_DIR, "visualiza_stoic_patrol.md");
+/** Matriz de roteiro Stoic Patrol. */
+export const PROMPT_MATRIX_STOIC_PATROL_PATH = path.join(PROMPTS_DIR, "matriz_stoic_patrol.md");
+/** Voz do canal Stoic Patrol (bloco 1). */
+export const PROMPT_CANAL_VOICE_STOIC_PATROL_PATH = path.join(PROMPTS_DIR, "canal_voice_stoic_patrol.md");
 /** PNG dummy copiado para renders quando visual.source === manual_capture */
 export const MANUAL_CAPTURE_PLACEHOLDER_PATH = path.join(ROOT_DIR, "src", "assets", "manual_capture", "placeholder.png");
 
-export type VisualModality = "default" | "wojak";
+export type VisualModality = "default" | "wojak" | "stoic_patrol";
 
 export type WojakCharacterVariant =
   | "neutral"
@@ -63,13 +71,25 @@ export function wojakVeoUsesReferenceImage(): boolean {
 
 export function resolveVisualModality(): VisualModality {
   const raw = (process.env.GENTUBE_VISUAL_MODALITY ?? "default").trim().toLowerCase();
-  return raw === "wojak" ? "wojak" : "default";
+  if (raw === "wojak") return "wojak";
+  if (raw === "stoic_patrol" || raw === "stoic-patrol" || raw === "religious") return "stoic_patrol";
+  return "default";
 }
 
-/** Em modo Wojak o plano nao usa stock; caso contrario ratios por bloco. */
+/** Em modo Wojak o plano nao usa stock; Stoic Patrol 100% stock entre quotes. */
 export function resolveStockRatioForBlock(blockNumber: number): number {
   if (resolveVisualModality() === "wojak") return 0;
+  if (resolveVisualModality() === "stoic_patrol") return 100;
   return blockNumber === 1 ? STOCK_RATIO_BLOCK1 : STOCK_RATIO_OTHER;
+}
+
+/** Segmentacao v2: base + addon por modalidade. */
+export async function resolveSegmentaPromptContent(): Promise<string> {
+  const fs = await import("node:fs/promises");
+  const base = await fs.readFile(PROMPT_SEGMENTA01_PATH, "utf-8");
+  if (resolveVisualModality() !== "stoic_patrol") return base;
+  const addon = await fs.readFile(PROMPT_SEGMENTA_STOIC_PATROL_PATH, "utf-8");
+  return `${base}\n\n---\n\n${addon}`;
 }
 
 function resolvePromptFileInPromptsDir(raw: string): string {
@@ -93,9 +113,16 @@ export async function resolveVisualizaPromptContent(): Promise<string> {
     return fs.readFile(p, "utf-8");
   }
   const base = await fs.readFile(PROMPT_VISUALIZA01_PATH, "utf-8");
-  if (resolveVisualModality() !== "wojak") return base;
-  const addon = await fs.readFile(PROMPT_VISUALIZA_WOJAK_PATH, "utf-8");
-  return `${base}\n\n---\n\n${addon}`;
+  const modality = resolveVisualModality();
+  if (modality === "wojak") {
+    const addon = await fs.readFile(PROMPT_VISUALIZA_WOJAK_PATH, "utf-8");
+    return `${base}\n\n---\n\n${addon}`;
+  }
+  if (modality === "stoic_patrol") {
+    const addon = await fs.readFile(PROMPT_VISUALIZA_STOIC_PATROL_PATH, "utf-8");
+    return `${base}\n\n---\n\n${addon}`;
+  }
+  return base;
 }
 
 /**
@@ -110,7 +137,10 @@ export function resolvePromptMatrixPath(cliOverride?: string): string {
     fromCli ||
     fromEnvMatrix ||
     (mode === "tutorial" ? "matriz_tutorial.md" : "");
-  const nameIn = raw === "" ? "matriz.md" : raw;
+  let nameIn = raw === "" ? "matriz.md" : raw;
+  if (raw === "" && resolveVisualModality() === "stoic_patrol") {
+    nameIn = "matriz_stoic_patrol.md";
+  }
   const baseName = path.basename(nameIn.replace(/^\.\//, ""));
   const withMd = baseName.toLowerCase().endsWith(".md") ? baseName : `${baseName}.md`;
 
@@ -139,7 +169,10 @@ export function resolveCanalVoicePath(cliOverride?: string): string | null {
   if (!roteiroCanalVoiceEnabled()) return null;
   const raw = (cliOverride ?? process.env.GENTUBE_PROMPT_CANAL_VOICE ?? "").trim();
   if (["-", "none"].includes(raw.toLowerCase())) return null;
-  const nameIn = raw === "" ? "canal_voice.md" : raw;
+  let nameIn = raw === "" ? "canal_voice.md" : raw;
+  if (raw === "" && resolveVisualModality() === "stoic_patrol") {
+    nameIn = "canal_voice_stoic_patrol.md";
+  }
   const baseName = path.basename(nameIn.replace(/^\.\//, ""));
   const withMd = baseName.toLowerCase().endsWith(".md") ? baseName : `${baseName}.md`;
 
@@ -268,6 +301,13 @@ export const ROTEIRO_PREV_CONTEXT_MAX_CHARS = (() => {
   const n = parseInt(raw, 10);
   return Number.isFinite(n) && n >= 0 ? n : 100_000;
 })();
+/** Render de quote cards: auto | hyperframes | ffmpeg (fallback ASS typing). */
+export function quoteRenderEngine(): "auto" | "hyperframes" | "ffmpeg" {
+  const v = (process.env.GENTUBE_QUOTE_RENDER ?? "auto").trim().toLowerCase();
+  if (v === "hyperframes" || v === "ffmpeg") return v;
+  return "auto";
+}
+
 // --- QualityGateAgent ---
 
 /** Ativa/desativa o agente de avaliacao de qualidade do roteiro (default: ativo). */
@@ -317,6 +357,20 @@ export const HIGGSFIELD_CLI_PATH = (process.env.HIGGSFIELD_CLI_PATH ?? "").trim(
 
 /** API key da Magnific (ex-Freepik) para stock footage/imagens */
 export const MAGNIFIC_API_KEY = (process.env.MAGNIFIC_API_KEY ?? "").trim();
+
+/** API key Pexels — stock alternativo (https://www.pexels.com/api/documentation/) */
+export const PEXELS_API_KEY = (process.env.PEXELS_API_KEY ?? "").trim();
+
+export type StockProviderMode = "magnific" | "pexels" | "magnific_then_pexels" | "pexels_then_magnific";
+
+/** Provedor de stock no step imagens (default: magnific). */
+export function resolveStockProvider(): StockProviderMode {
+  const raw = (process.env.GENTUBE_STOCK_PROVIDER ?? "magnific").trim().toLowerCase();
+  if (raw === "pexels") return "pexels";
+  if (raw === "magnific_then_pexels" || raw === "magnific-then-pexels") return "magnific_then_pexels";
+  if (raw === "pexels_then_magnific" || raw === "pexels-then-magnific") return "pexels_then_magnific";
+  return "magnific";
+}
 
 /** % de shots do bloco 1 vindos do stock Magnific (default: 50) */
 export const STOCK_RATIO_BLOCK1 = Math.min(

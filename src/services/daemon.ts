@@ -18,6 +18,7 @@ import {
   DEFAULT_MAX_IMAGES_OTHER_BLOCKS,
   DEFAULT_MAX_VIDEOS_BLOCK1,
   DEFAULT_MAX_VIDEOS_OTHER_BLOCKS,
+  resolveVisualModality,
 } from "../config.js";
 import { parseIntervalMs } from "../utils/parse-interval.js";
 import { getProjectById } from "../repository.js";
@@ -28,7 +29,7 @@ import {
   type JobQueueRow,
   type JobQueueOptions,
 } from "../repository-jobs.js";
-import { runFullPipeline } from "./pipeline-orchestrator.js";
+import { runFullPipeline, type PipelineProfile } from "./pipeline-orchestrator.js";
 import type { PipelineStage } from "./pipeline-orchestrator.js";
 import type { Step3Limits } from "../types/step3-limits.js";
 import type { ImagensVideosOptions } from "./pipeline.js";
@@ -101,7 +102,10 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
 }
 
 function buildPipelineOptions(opts: JobQueueOptions): Parameters<typeof runFullPipeline>[1] {
-  const profile = (opts.profile ?? "wojak-images-only") as "wojak-images-only";
+  const defaultProfile: PipelineProfile =
+    resolveVisualModality() === "stoic_patrol" ? "stoic-patrol-stock" : "wojak-images-only";
+  const profile = (opts.profile ?? defaultProfile) as PipelineProfile;
+  const stoicProfile = profile === "stoic-patrol-stock";
 
   let fromStage: PipelineStage | undefined;
   let throughStage: PipelineStage | undefined;
@@ -114,15 +118,22 @@ function buildPipelineOptions(opts: JobQueueOptions): Parameters<typeof runFullP
     if (PIPELINE_STAGES.includes(s)) fromStage = s;
   }
 
-  const limits: Step3Limits = {
-    maxVideosBlock1: 0,
-    maxVideosOtherBlocks: 0,
-    maxImagesBlock1: parsePositiveInt(opts.maxImagesBlock1, DEFAULT_MAX_IMAGES_BLOCK1),
-    maxImagesOtherBlocks: parsePositiveInt(opts.maxImagesOther, DEFAULT_MAX_IMAGES_OTHER_BLOCKS),
-  };
+  const limits: Step3Limits = stoicProfile
+    ? {
+        maxVideosBlock1: parsePositiveInt(opts.maxVideosBlock1, DEFAULT_MAX_VIDEOS_BLOCK1),
+        maxVideosOtherBlocks: parsePositiveInt(opts.maxVideosOther, DEFAULT_MAX_VIDEOS_OTHER_BLOCKS),
+        maxImagesBlock1: parsePositiveInt(opts.maxImagesBlock1, DEFAULT_MAX_IMAGES_BLOCK1),
+        maxImagesOtherBlocks: parsePositiveInt(opts.maxImagesOther, DEFAULT_MAX_IMAGES_OTHER_BLOCKS),
+      }
+    : {
+        maxVideosBlock1: 0,
+        maxVideosOtherBlocks: 0,
+        maxImagesBlock1: parsePositiveInt(opts.maxImagesBlock1, DEFAULT_MAX_IMAGES_BLOCK1),
+        maxImagesOtherBlocks: parsePositiveInt(opts.maxImagesOther, DEFAULT_MAX_IMAGES_OTHER_BLOCKS),
+      };
 
   const imageFlags = imageRunFlagsFromCli({
-    googleBatchMode: opts.googleBatchMode ?? true,
+    googleBatchMode: stoicProfile ? Boolean(opts.googleBatchMode) : (opts.googleBatchMode ?? true),
     batchLocal: false,
   });
   assertImagensPhaseFlagsExclusive({});

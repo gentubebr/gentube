@@ -40,7 +40,10 @@ async function pollOneBatchGroup(
 ): Promise<{ done: number; failed: number }> {
   const ended = await pollClaudeBatchUntilEnded(batchId, {
     pollIntervalMs: CLAUDE_BATCH_POLL_INTERVAL_MS,
-    onStatus: (s) => chalk.dim(`[claude-sync] batch ${batchId.slice(-8)} status=${s}`),
+    onStatus: (s, c) =>
+      chalk.dim(
+        `[claude-sync] batch ${batchId.slice(-8)} status=${s} ok=${c.succeeded} proc=${c.processing}`,
+      ),
   });
   const results = await streamClaudeBatchResults(batchId);
   const resultPath = await persistBatchResults(batchId, projectPath, results);

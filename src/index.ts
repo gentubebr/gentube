@@ -17,6 +17,7 @@ import {
   assertImagensPhaseFlagsExclusive,
   imageRunFlagsFromCli,
   ROOT_DIR,
+  resolveVisualModality,
   VIDEOS_DIR,
 } from "./config.js";
 import { getPackageVersion } from "./version.js";
@@ -67,6 +68,7 @@ import { mergeMontagemRunOptions, resolveMontagemConfig, type MontagemPhase } fr
 import { runMontagem } from "./services/montagem.js";
 import { writeShotListManualFiles } from "./services/shot-list-manual.js";
 import { ensureDir, ensureTemplateStructure, formatDateYYYYMMDD, toSlug, writeModelagemTranscript } from "./utils/fs.js";
+import { setGentubeVerboseFromCli } from "./utils/verbose-log.js";
 import { Step3Limits } from "./types/step3-limits.js";
 import {
   fetchAccountStatus,
@@ -259,6 +261,7 @@ type CreateVideoCliOptions = {
   mode?: string;
   promptMatrix?: string;
   promptCanalVoice?: string;
+  createOnly?: boolean;
 };
 
 program
@@ -287,7 +290,11 @@ program
     "--prompt-canal-voice <ficheiro>",
     "Bloco 1: voz/persona do canal (Markdown em Prompts/; padrao canal_voice.md). Sobrescreve GENTUBE_PROMPT_CANAL_VOICE; use none para nao injetar"
   )
-  .action(async (opts: CreateVideoCliOptions) => {
+  .option(
+    "--create-only",
+    "Apenas cria pasta + SQLite + transcript em 05 - Modelagem; nao pergunta modo nem executa pipeline"
+  )
+  .action(async (opts: CreateVideoCliOptions & { createOnly?: boolean }) => {
     const channels = listChannels();
     if (channels.length === 0) {
       console.log(chalk.red("Nao existe canal cadastrado. Rode primeiro: gentube channel:create"));
@@ -400,6 +407,15 @@ program
 
     console.log(chalk.green(`Projeto criado com sucesso (id: ${projectId}) em ${projectPath}`));
 
+    if (opts.createOnly) {
+      console.log(
+        chalk.cyan(
+          "Projeto criado (--create-only). Proximo: run-step / run-pipeline com GENTUBE_VISUAL_MODALITY=stoic_patrol se aplicavel.",
+        ),
+      );
+      return;
+    }
+
     let mode: "iterativo" | "sequencial" | "pipeline";
     const modeFlag = opts.mode?.trim().toLowerCase();
     if (modeFlag) {
@@ -492,6 +508,7 @@ program
     "Montagem: apenas concatena blockNN.mp4 a partir dos clipes ja em scenes/ (sem re-renderizar cenas)",
   )
   .option("--block <N>", "Narracao, imagens, montagem, retry: somente o bloco N (base 1)")
+  .option("--verbose", "-v", "Logs detalhados (progresso Claude batch, etapas do plano v2)")
   .action(async (options: {
     project: string;
     step: "roteiro" | "narracao" | "imagens" | "montagem" | "thumbnails";
@@ -519,7 +536,9 @@ program
     montagemScenesOnly?: boolean;
     montagemAssembleOnly?: boolean;
     block?: string;
+    verbose?: boolean;
   }) => {
+    setGentubeVerboseFromCli(options.verbose);
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
 
@@ -612,7 +631,11 @@ program
   )
   .addHelpText("after", CLI_HELP.runPipeline)
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
-  .option("--profile <nome>", "Perfil de corrida (default: wojak-images-only)", "wojak-images-only")
+  .option(
+    "--profile <nome>",
+    "Perfil: wojak-images-only | stoic-patrol-stock (default conforme GENTUBE_VISUAL_MODALITY)",
+    undefined,
+  )
   .option("--voice-id <id>", "ElevenLabs (ou .env ELEVENLABS_VOICE_ID)")
   .option("--avatar-file <caminho>", "Avatar Wojak opcional")
   .option(
@@ -628,7 +651,8 @@ program
   .option("--only-imagens", "Atalho: --through-stage imagens_retry (0 videos, perfil wojak-images-only)")
   .option("--no-continue-on-error", "Para no primeiro erro fatal (default: continua e registra)")
   .option("--max-retries-per-block <n>", "Tentativas por bloco em roteiro/imagens/narracao", "2")
-  .option("--max-videos-block1 <n>", "Forcado a 0 no perfil wojak-images-only")
+  .option("--max-videos-block1 <n>", "Max videos bloco 1 (wojak: forcado 0)")
+  .option("--max-videos-other <n>", `Max videos blocos 2..N (default ${DEFAULT_MAX_VIDEOS_OTHER_BLOCKS})`)
   .option("--max-images-block1 <n>", `Max imagens bloco 1 (default ${DEFAULT_MAX_IMAGES_BLOCK1})`)
   .option("--max-images-other <n>", `Max imagens blocos 2..N (default ${DEFAULT_MAX_IMAGES_OTHER_BLOCKS})`)
   .option("--scene-plan-v2", "Plano por cenas (default se GENTUBE_SCENE_PLAN_V2=1)")
@@ -642,7 +666,9 @@ program
   .option("--montagem-force", "Re-encode montagem")
   .option("--montagem-scenes-only", "Montagem: so clipes scXX.mp4")
   .option("--montagem-assemble-only", "Montagem: so blockNN.mp4")
-  .action(async (options: RunPipelineCliOptions & { project: string }) => {
+  .option("--verbose", "-v", "Logs detalhados (Claude batch, plano v2)")
+  .action(async (options: RunPipelineCliOptions & { project: string; verbose?: boolean }) => {
+    setGentubeVerboseFromCli(options.verbose);
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
     const voiceId = await resolveVoiceId(options.voiceId);
@@ -982,6 +1008,75 @@ program
   );
 
 program
+  .command("quote:render")
+  .description("Renderiza cenas quote_card (Stoic Patrol) a partir de blockNN.assets.json")
+  .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
+  .option("--block <n>", "So um bloco (default: todos com plano)")
+  .option("--force", "Regerar mesmo se scXX.mp4 existir")
+  .action(async (opts: { project: string; block?: string; force?: boolean }) => {
+    if (resolveVisualModality() !== "stoic_patrol") {
+      throw new Error("quote:render exige GENTUBE_VISUAL_MODALITY=stoic_patrol");
+    }
+    const project = getProjectByIdOrSlug(opts.project);
+    if (!project) throw new Error("Projeto nao encontrado");
+    const projectPath = path.resolve(String(project.project_path));
+    const imagesDir = path.join(projectPath, "03 - Imagens e Videos");
+    const total = Number(project.total_blocos);
+    const blocks: number[] = [];
+    if (opts.block) {
+      const bn = parseInt(opts.block, 10);
+      if (isNaN(bn) || bn < 1) throw new Error("--block invalido");
+      blocks.push(bn);
+    } else {
+      for (let i = 1; i <= total; i += 1) blocks.push(i);
+    }
+    const { renderQuoteCardMp4 } = await import("./services/quote-card-render.js");
+    let rendered = 0;
+    for (const bn of blocks) {
+      const pad = String(bn).padStart(2, "0");
+      const planPath = path.join(imagesDir, `block${pad}.assets.json`);
+      let raw: string;
+      try {
+        raw = await fs.readFile(planPath, "utf-8");
+      } catch {
+        console.log(chalk.dim(`Bloco ${bn}: sem ${planPath}, pulando`));
+        continue;
+      }
+      const plan = JSON.parse(raw) as import("./types/scenes-plan.js").BlockScenesPlanV2;
+      const rendersDir = path.join(imagesDir, "renders", `block${pad}`);
+      await fs.mkdir(rendersDir, { recursive: true });
+      for (const scene of plan.scenes) {
+        if (scene.visual.source !== "quote_card") continue;
+        const outMp4 = path.join(rendersDir, `${scene.id}.mp4`);
+        if (!opts.force) {
+          try {
+            await fs.access(outMp4);
+            console.log(chalk.dim(`  ${scene.id} ja existe, pulando`));
+            continue;
+          } catch {
+            /* render */
+          }
+        }
+        const quoteText = scene.visual.quote_text?.trim();
+        if (!quoteText) throw new Error(`${scene.id}: quote_text ausente`);
+        const duration =
+          scene.estimated_duration_seconds > 0
+            ? scene.estimated_duration_seconds
+            : scene.visual.duration_seconds_max || 6;
+        const r = await renderQuoteCardMp4({
+          quoteText,
+          quoteAttribution: scene.visual.quote_attribution ?? null,
+          durationSeconds: duration,
+          outPath: outMp4,
+        });
+        rendered += 1;
+        console.log(chalk.green(`  bloco ${bn} ${scene.id} → ${path.basename(outMp4)} (${r.engine})`));
+      }
+    }
+    console.log(chalk.cyan(`quote:render concluido — ${rendered} clip(s)`));
+  });
+
+program
   .command("image:sync")
   .description("Poll/download de image_jobs (HF + Gemini batch); videos HF usam higgsfield:sync")
   .addHelpText("after", CLI_HELP.imageSync)
@@ -1311,10 +1406,12 @@ program
   .option("--no-partial-segments", "Stage montagem: sem segmentos parciais")
   .option("--montagem-scenes-only", "Stage montagem: so clipes por cena (ver run-step)")
   .option("--montagem-assemble-only", "Stage montagem: so blocos finais a partir dos clipes")
+  .option("--verbose", "-v", "Logs detalhados (Claude batch, plano v2)")
   .action(
     async (options: {
       project: string;
       stage: "roteiro" | "narracao" | "imagens" | "montagem" | "thumbnails";
+      verbose?: boolean;
       block?: string;
       voiceId?: string;
       avatarFile?: string;
@@ -1340,6 +1437,7 @@ program
       montagemScenesOnly?: boolean;
       montagemAssembleOnly?: boolean;
     }) => {
+      setGentubeVerboseFromCli(options.verbose);
       const project = getProjectByIdOrSlug(options.project);
       if (!project) throw new Error("Projeto nao encontrado");
 
@@ -1618,6 +1716,7 @@ type RunPipelineCliOptions = {
   noContinueOnError?: boolean;
   maxRetriesPerBlock?: string;
   maxVideosBlock1?: string;
+  maxVideosOther?: string;
   maxImagesBlock1?: string;
   maxImagesOther?: string;
   scenePlanV2?: boolean;
@@ -1631,6 +1730,7 @@ type RunPipelineCliOptions = {
   montagemForce?: boolean;
   montagemScenesOnly?: boolean;
   montagemAssembleOnly?: boolean;
+  verbose?: boolean;
 };
 
 const PIPELINE_STAGES: PipelineStage[] = [
@@ -1647,9 +1747,13 @@ async function invokeRunPipeline(
   project: ProjectRow,
   options: RunPipelineCliOptions & { voiceId: string },
 ) {
-  const profileRaw = (options.profile ?? "wojak-images-only").trim();
-  if (profileRaw !== "wojak-images-only") {
-    throw new Error(`Perfil desconhecido: ${profileRaw}. Disponivel: wojak-images-only`);
+  setGentubeVerboseFromCli(options.verbose);
+  const defaultProfile =
+    resolveVisualModality() === "stoic_patrol" ? "stoic-patrol-stock" : "wojak-images-only";
+  const profileRaw = (options.profile ?? defaultProfile).trim();
+  const allowedProfiles: PipelineProfile[] = ["wojak-images-only", "stoic-patrol-stock"];
+  if (!allowedProfiles.includes(profileRaw as PipelineProfile)) {
+    throw new Error(`Perfil desconhecido: ${profileRaw}. Disponivel: ${allowedProfiles.join(", ")}`);
   }
   const profile = profileRaw as PipelineProfile;
 
@@ -1684,16 +1788,25 @@ async function invokeRunPipeline(
   if (options.montagemScenesOnly) montagemPhase = "scenes";
   else if (options.montagemAssembleOnly) montagemPhase = "assemble";
 
-  const limits = parseStep3Limits({
-    maxVideosBlock1: "0",
-    maxVideosOther: "0",
-    maxImagesBlock1: options.maxImagesBlock1,
-    maxImagesOther: options.maxImagesOther,
-  });
+  const limits =
+    profile === "stoic-patrol-stock"
+      ? parseStep3Limits({
+          maxVideosBlock1: options.maxVideosBlock1,
+          maxVideosOther: options.maxVideosOther,
+          maxImagesBlock1: options.maxImagesBlock1,
+          maxImagesOther: options.maxImagesOther,
+        })
+      : parseStep3Limits({
+          maxVideosBlock1: "0",
+          maxVideosOther: "0",
+          maxImagesBlock1: options.maxImagesBlock1,
+          maxImagesOther: options.maxImagesOther,
+        });
 
   const imagensOpts = buildImagensVideosOpts({
     scenePlanV2: options.scenePlanV2 ?? true,
-    googleBatchMode: options.googleBatchMode ?? true,
+    googleBatchMode:
+      profile === "stoic-patrol-stock" ? Boolean(options.googleBatchMode) : (options.googleBatchMode ?? true),
   });
 
   const maxRetries = Math.max(1, parseInt(options.maxRetriesPerBlock ?? "2", 10) || 2);
@@ -1841,7 +1954,7 @@ program
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
   .option("--voice-id <id>", "ElevenLabs voice ID (ou .env ELEVENLABS_VOICE_ID)")
   .option("--priority <n>", "Prioridade (maior = primeiro, default 0)", "0")
-  .option("--profile <nome>", "Perfil (default: wojak-images-only)")
+  .option("--profile <nome>", "Perfil: wojak-images-only | stoic-patrol-stock (default conforme .env)")
   .option("--from-stage <etapa>", "Retomar a partir de etapa")
   .option("--through-stage <etapa>", "Parar apos etapa")
   .option("--prompt-matrix <ficheiro>", "Prompt de roteiro")
@@ -1859,9 +1972,12 @@ program
     const project = getProjectByIdOrSlug(opts.project);
     if (!project) throw new Error("Projeto nao encontrado");
     const voiceId = await resolveVoiceId(opts.voiceId);
+    const jobProfile =
+      opts.profile ??
+      (resolveVisualModality() === "stoic_patrol" ? "stoic-patrol-stock" : "wojak-images-only");
     const options: JobQueueOptions = {
       voiceId,
-      profile: opts.profile ?? "wojak-images-only",
+      profile: jobProfile,
       fromStage: opts.fromStage,
       throughStage: opts.throughStage,
       promptMatrix: opts.promptMatrix,
@@ -1871,7 +1987,7 @@ program
       skipThumbnails: Boolean(opts.skipThumbnails),
       continueOnError: !opts.noContinueOnError,
       scenePlanV2: true,
-      googleBatchMode: true,
+      googleBatchMode: jobProfile !== "stoic-patrol-stock",
     };
     const jobId = enqueueJob({
       projectId: Number(project.id),

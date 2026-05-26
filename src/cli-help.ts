@@ -328,8 +328,11 @@ Util antes/depois de run-step --step narracao (modo por cena consome ~chars do p
 Cria pasta do projeto + registo SQLite. Modos apos criar:
   iterativo — pergunta cada etapa
   sequencial — roteiro + narracao automaticos (como run-all)
+  pipeline — run-pipeline completo (perfil conforme GENTUBE_VISUAL_MODALITY)
+  --create-only — so pasta + SQLite + transcript (sem menu interativo)
 
-${chalk.bold("Flags uteis")}  --channel --title --niche --audience --blocks --transcript-file
+${chalk.bold("Flags uteis")}  --channel --title --niche --audience --blocks --transcript-file --create-only
+${chalk.bold("Stoic Patrol")}  transcript em 05 - Modelagem/transcript.txt + matriz_stoic_patrol (ver README)
 `),
 
   shotListManual: cliHelpAfter(`

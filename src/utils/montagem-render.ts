@@ -41,8 +41,10 @@ export async function renderSceneClip(input: {
   visualPath: string;
   isImage: boolean;
   outPath: string;
+  /** quote_card: congela ultimo frame se narracao for mais longa que o video */
+  holdLastFrame?: boolean;
 }): Promise<void> {
-  const { cfg, mp3Path, visualPath, isImage, outPath } = input;
+  const { cfg, mp3Path, visualPath, isImage, outPath, holdLastFrame } = input;
   await fs.mkdir(path.dirname(outPath), { recursive: true });
 
   const tAudio = ffprobeDurationSeconds(cfg, mp3Path);
@@ -73,25 +75,46 @@ export async function renderSceneClip(input: {
   const ratio = tVideo / tAudio;
   const vfBase = `${scalePadFilter(cfg)},format=${cfg.pixelFormat}`;
 
-  if (tAudio > tVideo * 1.01 && cfg.loopVideo) {
-    runFfmpeg(cfg, [
-      "-stream_loop",
-      "-1",
-      "-i",
-      visualPath,
-      "-i",
-      mp3Path,
-      "-vf",
-      vfBase,
-      "-map",
-      "0:v:0",
-      "-map",
-      "1:a:0",
-      "-t",
-      String(tAudio),
-      ...encodeOutArgs(cfg, outPath),
-    ]);
-    return;
+  if (tAudio > tVideo * 1.01) {
+    if (holdLastFrame) {
+      const padSec = Math.max(0.05, tAudio - tVideo);
+      runFfmpeg(cfg, [
+        "-i",
+        visualPath,
+        "-i",
+        mp3Path,
+        "-vf",
+        `${vfBase},fps=${cfg.fps},tpad=stop_mode=clone:stop_duration=${padSec.toFixed(3)}`,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-t",
+        String(tAudio),
+        ...encodeOutArgs(cfg, outPath),
+      ]);
+      return;
+    }
+    if (cfg.loopVideo) {
+      runFfmpeg(cfg, [
+        "-stream_loop",
+        "-1",
+        "-i",
+        visualPath,
+        "-i",
+        mp3Path,
+        "-vf",
+        vfBase,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-t",
+        String(tAudio),
+        ...encodeOutArgs(cfg, outPath),
+      ]);
+      return;
+    }
   }
 
   if (tAudio < tVideo) {

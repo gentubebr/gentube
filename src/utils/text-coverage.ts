@@ -10,6 +10,17 @@ export function normalizeForCoverage(raw: string): string {
     .replace(ZERO_WIDTH, "")
     // Separadores Markdown no roteiro (---) nao entram na narracao por cena
     .replace(/^\s*---\s*$/gm, " ")
+    // Rotulos de versiculo/citacao (faixa 13:14–15 usa travessao sem espacos; atribuicao usa " — ")
+    .replace(
+      /(?:\*\*)?(?:Genesis|Psalm|Romans|John|Matthew|Mark|Luke|Acts|Hebrews|Proverbs|Ecclesiastes)\s+\d+:\d+(?:[—–]\d+)?\s+[—–]\s+/gi,
+      "",
+    )
+    // Titulo em negrito fechado antes de travessao (**Label —**); [^*\n] evita atravessar paragrafos
+    .replace(/\*\*[^*\n]{2,80}?\*\*\s+[—–]\s+/g, "")
+    .replace(/\*\*/g, "")
+    .replace(/\*/g, "")
+    .replace(/_([^_]+)_/g, "$1")
+    .replace(/__/g, "")
     .normalize("NFC")
     // Aspas/apóstrofos tipográficos → ASCII (evita falha de cobertura quando o modelo copia ' mas o bloco tem ')
     .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
@@ -24,6 +35,29 @@ export function wordCountForCoverage(text: string): number {
   const t = normalizeForCoverage(text);
   if (!t) return 0;
   return t.split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * Quando o modelo trunca o fim do bloco, o texto reconstruido e prefixo do roteiro normalizado.
+ * Anexa o sufixo em falta na ultima cena (evita nova chamada de segmentacao).
+ */
+export function repairSegmentationCoverageTail<T extends { narration_text: string }>(
+  blockText: string,
+  scenes: T[],
+): T[] {
+  if (scenes.length === 0) return scenes;
+  const blockNorm = normalizeForCoverage(blockText);
+  const joinedNorm = normalizeForCoverage(scenes.map((s) => s.narration_text).join(" "));
+  if (blockNorm === joinedNorm) return scenes;
+  if (!blockNorm.startsWith(joinedNorm)) return scenes;
+  const suffix = blockNorm.slice(joinedNorm.length).trim();
+  if (!suffix) return scenes;
+  const last = scenes[scenes.length - 1];
+  const patchedText = `${last.narration_text.trimEnd()} ${suffix}`.trim();
+  return [
+    ...scenes.slice(0, -1),
+    { ...last, narration_text: patchedText },
+  ];
 }
 
 export function validateSceneTextsCoverBlock(blockText: string, narrationTexts: string[]): void {
