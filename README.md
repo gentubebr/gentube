@@ -30,9 +30,10 @@ Antes de clonar o GenTube, reúna o seguinte (sem gravar segredos em ficheiros v
 3. O comando `elevenlabs:status` exige permissão `user_read` na chave.
 4. Antes do TTS, o texto passa por **`stripMarkdownForSpeech`** (remove `**negrito**`, listas, links, etc.) para o modelo não ler pontuação Markdown em voz alta.
 
-### Stock — Magnific e Pexels (imagens e vídeos)
+### Stock — Magnific, Pexels e biblioteca local (imagens e vídeos)
 
-O step **imagens** baixa cenas `source: stock` via `GENTUBE_STOCK_PROVIDER` (`src/integrations/stock-download.ts` → Magnific e/ou Pexels).
+O step **imagens** baixa cenas `source: stock` via `GENTUBE_STOCK_PROVIDER` (`src/integrations/stock-download.ts`).
+No fluxo atual, os provedores remotos são Magnific/Pexels; a cadeia com biblioteca local (`data/stock_library/`) está documentada abaixo como **planejada** para reduzir chamadas externas.
 
 #### Magnific (primário por defeito)
 
@@ -49,7 +50,17 @@ O step **imagens** baixa cenas `source: stock` via `GENTUBE_STOCK_PROVIDER` (`sr
 4. Limites default: **200 pedidos/hora**, **20 000/mês**; headers `X-Ratelimit-Remaining`, `X-Ratelimit-Reset`. Projetos grandes devem usar **cache** (`data/stock_cache/`) e fallback (não substituir Magnific por Pexels em todas as cenas de uma vez).
 5. **Atribuição:** crédito ao fotógrafo / link Pexels na descrição ou créditos do vídeo (requisito da API).
 
-**Modo `default`:** se Magnific falhar no stock, fallback para **IA** (Higgsfield ou Gemini, conforme `GENTUBE_IMAGE_BACKEND`). **Stoic Patrol** (`stoic_patrol`): sem fallback IA no stock — usar `magnific_then_pexels` e retomar com `--enqueue-only`.
+**Modo `default`:** se Magnific falhar no stock, fallback para **IA** (Higgsfield ou Gemini, conforme `GENTUBE_IMAGE_BACKEND`). **Stoic Patrol** (`stoic_patrol`): sem fallback IA no stock — usar `magnific_then_pexels` (atual) ou `local_then_pexels_then_magnific` (planejado) e retomar com `--enqueue-only`.
+
+#### Biblioteca local + split Magnific/Google Batch (planejado)
+
+Objetivo: maximizar reuso de imagens já baixadas/geradas no histórico de projetos, com busca local antes de chamar APIs externas.
+
+- Cadeia alvo 1: `local → pexels → magnific`
+- Cadeia alvo 2: `local → pexels → (X% magnific + Y% google_batch)` para `type=image` e `character_required=false` (`X + Y = 100`)
+- Assets IA "genéricos" (sem avatar/personagem do canal) também entram na base local para reutilização futura.
+- Match local usa ordem: exato por keywords -> FTS aproximado (default conservador) -> regressão progressiva de termos (remove tokens finais, mínimo 3 palavras).
+- O comando de indexação dedicado (`stock:index`) e a base `data/stock_library/` ficam documentados na especificação técnica (sec. 20.9).
 
 ### Higgsfield CLI (geração IA imagens/vídeo)
 
@@ -167,7 +178,11 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `ELEVENLABS_VOICE_ID` | Recomendada | Voz padrão se você não passar `--voice-id` |
 | `MAGNIFIC_API_KEY` | Sim (step imagens, se usar Magnific) | API Magnific/Freepik |
 | `PEXELS_API_KEY` | Sim se `GENTUBE_STOCK_PROVIDER` incluir Pexels | API Pexels ([documentação](https://www.pexels.com/api/documentation/)) |
-| `GENTUBE_STOCK_PROVIDER` | Opcional | `magnific` (default), `pexels`, `magnific_then_pexels`, `pexels_then_magnific` |
+| `GENTUBE_STOCK_PROVIDER` | Opcional | `magnific` (default), `pexels`, `magnific_then_pexels`, `pexels_then_magnific`; planejado: `local_then_pexels_then_magnific`, `local_then_pexels_then_split` |
+| `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT` | Opcional (planejado) | Percentual `X` para Magnific no split local->pexels->split (default sugerido: `60`) |
+| `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT` | Opcional (planejado) | Percentual `Y` para Google Batch no split (default sugerido: `40`; `X + Y = 100`) |
+| `GENTUBE_STOCK_LIBRARY_FTS_MIN_SCORE` | Opcional (planejado) | Limiar de match aproximado no índice local (default conservador sugerido: `0.60`) |
+| `GENTUBE_STOCK_LIBRARY_MIN_TERMS` | Opcional (planejado) | Mínimo de termos na regressão de keywords para busca local/remota (default: `3`) |
 | `GENTUBE_STOCK_RATIO_BLOCK1` | Opcional | % de shots do bloco 1 com `source: stock` (default: `50`) |
 | `GENTUBE_STOCK_RATIO_OTHER` | Opcional | % de shots dos blocos 2..N com stock (default: `90`) |
 | `GENTUBE_PROMPT_MATRIX` | Opcional | Ficheiro em `Prompts/` para o **roteiro** (ex.: `matriz_tutorial.md`). Tem prioridade sobre `GENTUBE_ROTEIRO_MODE`. A flag `--prompt-matrix` tem prioridade sobre ambos |
