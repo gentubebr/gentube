@@ -21,6 +21,7 @@ ${chalk.bold("Fluxo tipico (projeto por pasta em Videos/<canal>/<data>-<titulo>/
 
 ${chalk.bold("Etapas do projeto (--project id ou slug da pasta)")}
   roteiro     Claude → 01 - Roteiro/blockNN.md
+  quotizador  Stoic overlay: blockNN.quotes.json (GENTUBE_STOIC_OVERLAY_MODE=1)
   narracao    ElevenLabs → 02 - Narracao/ (ver help run-step)
   imagens     Plano + stock + filas → 03 - Imagens e Videos/
   montagem    FFmpeg → 06 - Montagem/ (requer plano v2 + scXX.mp3)
@@ -338,6 +339,8 @@ Cria pasta do projeto + registo SQLite. Modos apos criar:
 
 ${chalk.bold("Flags uteis")}  --channel --title --niche --audience --blocks --transcript-file --create-only
 ${chalk.bold("Stoic Patrol")}  transcript em 05 - Modelagem/transcript.txt + matriz_stoic_patrol (ver README)
+  Overlay (novo): GENTUBE_STOIC_OVERLAY_MODE=1 → quotizador → imagens → narracao (timestamps) → montagem
+  Legado: sem OVERLAY_MODE → quote_card como cena + quote:render
 `),
 
   shotListManual: cliHelpAfter(`

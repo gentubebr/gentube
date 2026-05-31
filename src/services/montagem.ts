@@ -30,6 +30,9 @@ import {
 } from "../utils/montagem-paths.js";
 import { buildSegments, checkSceneReady } from "../utils/montagem-media.js";
 import { concatClipsWithXfade, isOutputStale, renderSceneClip } from "../utils/montagem-render.js";
+import { resolveQuoteOverlaysForBlock } from "../utils/quote-overlays.js";
+import { applyQuoteOverlaysToClip } from "../utils/montagem-quote-overlay.js";
+import { stoicOverlayModeEnabled } from "../utils/stoic-overlay-mode.js";
 
 type ProjectRow = Record<string, unknown>;
 
@@ -169,6 +172,17 @@ export async function runMontagemBlock(
     };
   }
 
+  if (stoicOverlayModeEnabled()) {
+    const prep = await resolveQuoteOverlaysForBlock(projectPath, blockNumber);
+    if (prep.applied > 0) {
+      console.log(chalk.dim(`${tag} Quote overlays: ${prep.applied} aplicado(s) no plano`));
+      plan = await loadBlockPlan(projectPath, blockNumber);
+    }
+    if (prep.skipped.length > 0) {
+      console.log(chalk.yellow(`${tag} Quote overlays ignorados: ${prep.skipped.length}`));
+    }
+  }
+
   const scenesTotal = plan.scenes.length;
   const readyById = new Map<string, { clipPath: string }>();
 
@@ -220,6 +234,13 @@ export async function runMontagemBlock(
           holdLastFrame: readiness.holdLastFrame,
           outPath: sceneOut,
         });
+        if (scene.quote_overlays && scene.quote_overlays.length > 0) {
+          await applyQuoteOverlaysToClip({
+            cfg,
+            clipPath: sceneOut,
+            overlays: scene.quote_overlays,
+          });
+        }
         readyById.set(scene.id, { clipPath: sceneOut });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);

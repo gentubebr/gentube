@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import {
+  higgsfieldDisabled,
   resolveVisualModality,
   videoBackendFromEnv,
   wojakVeoUsesReferenceImage,
@@ -120,7 +121,7 @@ export async function renderVideoWithFallback(input: RenderVideoInput): Promise<
     return tryVeoVideo(input);
   }
 
-  if (!input.skipHiggsfield) {
+  if (!input.skipHiggsfield && !higgsfieldDisabled()) {
     try {
       return await tryHiggsfieldWithRetries(input);
     } catch (error) {

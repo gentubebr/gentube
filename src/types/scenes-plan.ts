@@ -1,5 +1,6 @@
 import type { IpRisk } from "./assets-plan.js";
 import type { WojakCharacterVariant } from "../config.js";
+import type { QuoteOverlay } from "./quotes-plan.js";
 
 export type VisualSourceV2 = "ai_generated" | "stock" | "manual_capture" | "quote_card";
 
@@ -41,6 +42,8 @@ export type ScenePlanV2 = {
   narration_word_count: number;
   estimated_duration_seconds: number;
   visual: SceneVisualPlanV2;
+  /** Stoic Patrol overlay mode: preenchido na prep de montagem (secao 23.12). */
+  quote_overlays?: QuoteOverlay[];
 };
 
 /** Plano final persistido em blockXX.assets.json */
@@ -61,7 +64,10 @@ export type SegmentationPlanV2 = {
     id: string;
     narration_text: string;
     narration_word_count: number;
-    /** Stoic Patrol: cena de citacao explicita. */
+    /** Stoic Patrol legado: cena de citacao explicita. */
     quote_hint?: boolean;
+    /** Stoic Patrol overlay mode: ancoras (antes da extracao). */
+    starts_with?: string;
+    ends_with?: string;
   }>;
 };

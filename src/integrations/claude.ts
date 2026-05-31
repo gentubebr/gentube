@@ -523,20 +523,33 @@ export async function generateSegmentationPlanJson(input: {
   blockText: string;
   maxScenes: number;
   projectId?: number;
+  quotesJson?: string;
+  anchorMode?: boolean;
 }): Promise<string> {
-  // promptBase (segmenta01.md) e identico para todos os projetos e blocos — cache maximo.
+  const quotesBlock = input.quotesJson?.trim()
+    ? `
+- quotes (from Quotizador — respect boundaries when cutting scenes; do NOT copy quote text into your anchors unless it naturally starts/ends a scene):
+${input.quotesJson}
+`
+    : "";
+  const anchorNote = input.anchorMode
+    ? `
+Return ONLY JSON with per-scene "starts_with" and "ends_with" (ANCHOR MODE — no narration_text). schema_version "2.0-segmentation", stage "segmentation".
+`
+    : `
+Return ONLY JSON following segmenta01 schema (schema_version "2.0-segmentation", stage "segmentation").
+`;
+
   const dynamicPart = `
 Context:
 - block_number: ${input.blockNumber}
 - total_blocks: ${input.totalBlocks}
 - max_scenes_for_this_block: ${input.maxScenes}
-- block_text:
+${quotesBlock}- block_text:
 ---
 ${input.blockText}
 ---
-
-Return ONLY JSON following segmenta01 schema (schema_version "2.0-segmentation", stage "segmentation").
-`.trim();
+${anchorNote}`.trim();
 
   return runClaudeUserPrompt({
     stage: "segmentation",
@@ -544,6 +557,35 @@ Return ONLY JSON following segmenta01 schema (schema_version "2.0-segmentation",
     projectId: input.projectId,
     blockNumber: input.blockNumber,
     emptyError: `Claude retornou segmentacao vazia para bloco ${input.blockNumber}`,
+  });
+}
+
+export async function generateQuotizadorPlanJson(input: {
+  promptBase: string;
+  blockNumber: number;
+  totalBlocks: number;
+  blockText: string;
+  projectId?: number;
+}): Promise<string> {
+  const dynamicPart = `
+Context:
+- block_number: ${input.blockNumber}
+- total_blocks: ${input.totalBlocks}
+- block_text:
+---
+${input.blockText}
+---
+
+Return ONLY JSON (schema_version "1.0-quotes", stage "quotizador").
+`.trim();
+
+  return runClaudeUserPrompt({
+    stage: "segmentation",
+    userPrompt: { cacheable: input.promptBase.trim(), dynamic: dynamicPart },
+    projectId: input.projectId,
+    blockNumber: input.blockNumber,
+    customIdSuffix: "quotizador",
+    emptyError: `Claude retornou quotizador vazio para bloco ${input.blockNumber}`,
   });
 }
 
@@ -575,14 +617,30 @@ export async function generateVisualizationPlanJson(input: {
 - Wojak must comically act out each narration_text; prefer type "video" with motion cues in description
 `.trim()
     : "";
-  const stoicContext = stoicMode
+  const { stoicOverlayModeEnabled, stoicAllowAiMixEnabled } = await import("../utils/stoic-overlay-mode.js");
+  const stoicOverlay = stoicMode && stoicOverlayModeEnabled();
+  const stoicAiMix = stoicOverlay && stoicAllowAiMixEnabled();
+  const stoicContext = stoicAiMix
     ? `
+- visual_modality: stoic_patrol OVERLAY + AI MIX (MANDATORY)
+- stock_ratio: ${input.stockRatio} — target % scenes with source "stock"; remainder "ai_generated"
+- NEVER use quote_card or manual_capture (quotes are overlays at montagem)
+- ai_generated: type "image" ONLY (never video); search_keywords null; cinematic still description; stock: English search_keywords
+`.trim()
+    : stoicOverlay
+    ? `
+- visual_modality: stoic_patrol OVERLAY MODE (MANDATORY)
+- stock_ratio: 100 — EVERY scene source "stock" with English search_keywords
+- NEVER use quote_card, ai_generated, or manual_capture (quotes are overlays at montagem)
+`.trim()
+    : stoicMode
+      ? `
 - visual_modality: stoic_patrol (MANDATORY)
 - stock_ratio: 100 among non-quote scenes — use source "stock" with English search_keywords
 - quote_hint true OR explicit quotation in narration_text → source "quote_card", type "video", quote_text, quote_attribution optional, animation_type "typing", render_engine "hyperframes", search_keywords null
 - NEVER use ai_generated or manual_capture
 `.trim()
-    : "";
+      : "";
 
   // promptBase (visualiza01.md + addon wojak se ativo) e estatico por modalidade —
   // identico para todos os blocos e projetos com a mesma modalidade visual.
@@ -591,7 +649,7 @@ Context:
 - block_number: ${input.blockNumber}
 - total_blocks: ${input.totalBlocks}
 - audience: ${input.audience}
-- stock_ratio: ${input.stockRatio}${wojakMode ? " (wojak mode: must be 0% stock)" : ""}${stoicMode ? " (stoic_patrol: 100% stock except quote_card)" : ""}
+- stock_ratio: ${input.stockRatio}${wojakMode ? " (wojak mode: must be 0% stock)" : ""}${stoicAiMix ? " (stoic_patrol overlay+mix)" : stoicOverlay ? " (stoic_patrol overlay: 100% stock)" : stoicMode ? " (stoic_patrol: 100% stock except quote_card)" : ""}
 - manual_capture_signals: ${signals}${wojakMode ? " (wojak mode: ignore — no manual_capture)" : ""}${stoicMode ? " (stoic_patrol: ignore — no manual_capture)" : ""}
 - max_videos_for_this_block: ${input.maxVideos} — HARD CAP: count of scenes with visual.type "video" must be ≤ this number.
 - max_images_for_this_block: ${input.maxImages} — HARD CAP: count of scenes with visual.type "image" must be ≤ this number.

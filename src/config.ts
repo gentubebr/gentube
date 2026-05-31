@@ -1,6 +1,11 @@
 import path from "node:path";
 import { homedir } from "node:os";
 import dotenv from "dotenv";
+import {
+  resolveStoicOverlayMixStockRatio,
+  stoicAllowAiMixEnabled,
+  stoicOverlayModeEnabled,
+} from "./utils/stoic-overlay-mode.js";
 
 dotenv.config({ quiet: true });
 
@@ -19,8 +24,20 @@ export const PROMPT_VISUALIZA01_PATH = path.join(PROMPTS_DIR, "visualiza01.md");
 export const PROMPT_VISUALIZA_WOJAK_PATH = path.join(PROMPTS_DIR, "visualiza_wojak.md");
 /** Addon segmentacao Stoic Patrol. */
 export const PROMPT_SEGMENTA_STOIC_PATROL_PATH = path.join(PROMPTS_DIR, "segmenta_stoic_patrol.md");
-/** Addon visualizacao Stoic Patrol. */
+/** Addon visualizacao Stoic Patrol (legado: quote_card como cena). */
 export const PROMPT_VISUALIZA_STOIC_PATROL_PATH = path.join(PROMPTS_DIR, "visualiza_stoic_patrol.md");
+/** Addon visualizacao Stoic Patrol overlay (100% stock; quotes na montagem). */
+export const PROMPT_VISUALIZA_STOIC_PATROL_OVERLAY_PATH = path.join(
+  PROMPTS_DIR,
+  "visualiza_stoic_patrol_overlay.md",
+);
+/** Addon overlay com mix stock + ai_generated (quotes na montagem). */
+export const PROMPT_VISUALIZA_STOIC_PATROL_OVERLAY_MIX_PATH = path.join(
+  PROMPTS_DIR,
+  "visualiza_stoic_patrol_overlay_mix.md",
+);
+/** Quotizador Stoic Patrol. */
+export const PROMPT_QUOTIZADOR_PATH = path.join(PROMPTS_DIR, "quotizador.md");
 /** Matriz de roteiro Stoic Patrol. */
 export const PROMPT_MATRIX_STOIC_PATROL_PATH = path.join(PROMPTS_DIR, "matriz_stoic_patrol.md");
 /** Voz do canal Stoic Patrol (bloco 1). */
@@ -76,10 +93,15 @@ export function resolveVisualModality(): VisualModality {
   return "default";
 }
 
-/** Em modo Wojak o plano nao usa stock; Stoic Patrol 100% stock entre quotes. */
+/** Em modo Wojak o plano nao usa stock; Stoic overlay+mix usa ratios por bloco; senao 100% stock. */
 export function resolveStockRatioForBlock(blockNumber: number): number {
   if (resolveVisualModality() === "wojak") return 0;
-  if (resolveVisualModality() === "stoic_patrol") return 100;
+  if (resolveVisualModality() === "stoic_patrol") {
+    if (stoicAllowAiMixEnabled() && stoicOverlayModeEnabled()) {
+      return resolveStoicOverlayMixStockRatio(blockNumber);
+    }
+    return 100;
+  }
   return blockNumber === 1 ? STOCK_RATIO_BLOCK1 : STOCK_RATIO_OTHER;
 }
 
@@ -119,7 +141,14 @@ export async function resolveVisualizaPromptContent(): Promise<string> {
     return `${base}\n\n---\n\n${addon}`;
   }
   if (modality === "stoic_patrol") {
-    const addon = await fs.readFile(PROMPT_VISUALIZA_STOIC_PATROL_PATH, "utf-8");
+    const overlay = stoicOverlayModeEnabled();
+    const mix = stoicAllowAiMixEnabled();
+    const addonPath = overlay
+      ? mix
+        ? PROMPT_VISUALIZA_STOIC_PATROL_OVERLAY_MIX_PATH
+        : PROMPT_VISUALIZA_STOIC_PATROL_OVERLAY_PATH
+      : PROMPT_VISUALIZA_STOIC_PATROL_PATH;
+    const addon = await fs.readFile(addonPath, "utf-8");
     return `${base}\n\n---\n\n${addon}`;
   }
   return base;
@@ -258,7 +287,7 @@ export function claudeThinkingForStage(stage: ClaudeBatchStage): string {
 
 export const CLAUDE_BATCH_POLL_INTERVAL_MS = parseDurationMs(
   process.env.GENTUBE_CLAUDE_BATCH_POLL_INTERVAL,
-  60_000,
+  20_000,
 );
 
 /** max_scenes = min(cap, ceil(palavras/divisor)) quando dinamico ativo. */
@@ -337,6 +366,13 @@ export const QUALITY_GATE_MODEL = (
 export const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY ?? "";
 /** Voice ID padrao quando --voice-id nao e passado no CLI */
 export const ELEVENLABS_VOICE_ID = (process.env.ELEVENLABS_VOICE_ID ?? "").trim();
+/** Voz padrao canal Stoic Patrol (gravada em 05 - Modelagem/elevenlabs-voice-id.txt ao criar projeto). */
+export const DEFAULT_STOIC_PATROL_VOICE_ID = "V2bPluzT7MuirpucVAKH";
+export const STOIC_PATROL_ELEVENLABS_VOICE_ID = (
+  process.env.GENTUBE_STOIC_PATROL_VOICE_ID?.trim() ||
+  ELEVENLABS_VOICE_ID ||
+  DEFAULT_STOIC_PATROL_VOICE_ID
+).trim();
 export const HIGGSFIELD_API_KEY_ID = (process.env.HIGGSFIELD_API_KEY_ID ?? "").trim();
 export const HIGGSFIELD_API_KEY_SECRET = (process.env.HIGGSFIELD_API_KEY_SECRET ?? "").trim();
 
@@ -457,7 +493,13 @@ export const GEMINI_PARENT_FOLDER_ID = (
 export type ImageBackend = "auto" | "higgsfield" | "gemini";
 export type ImageDeliveryMode = "sync" | "google_batch" | "local_batch";
 
+/** Desliga Higgsfield CLI/API em todo o GenTube (imagens, videos, thumbnails). */
+export function higgsfieldDisabled(): boolean {
+  return ["1", "true", "yes"].includes(String(process.env.GENTUBE_DISABLE_HIGGSFIELD ?? "").toLowerCase());
+}
+
 export function imageBackendFromEnv(): ImageBackend {
+  if (higgsfieldDisabled()) return "gemini";
   const v = (process.env.GENTUBE_IMAGE_BACKEND ?? "auto").trim().toLowerCase();
   if (v === "higgsfield" || v === "gemini") return v;
   return "auto";
@@ -511,6 +553,11 @@ export const GEMINI_VEO_TIMEOUT_MS = parseDurationMs(process.env.GENTUBE_VEO_TIM
 export type VideoBackend = "auto" | "higgsfield" | "veo" | "magnific";
 
 export function videoBackendFromEnv(): VideoBackend {
+  if (higgsfieldDisabled()) {
+    const v = (process.env.GENTUBE_VIDEO_BACKEND ?? "veo").trim().toLowerCase();
+    if (v === "veo" || v === "magnific") return v;
+    return "veo";
+  }
   const v = (process.env.GENTUBE_VIDEO_BACKEND ?? "auto").trim().toLowerCase();
   if (v === "higgsfield" || v === "veo" || v === "magnific") return v;
   return "auto";
@@ -538,6 +585,7 @@ export function resolveSceneImageDelivery(
 ): ImageDeliveryMode {
   if (opts?.forceSync) return "sync";
   if (resolveVisualModality() === "wojak") return "google_batch";
+  if (resolveVisualModality() === "stoic_patrol") return "google_batch";
   return resolveImageDelivery(flags);
 }
 
@@ -546,10 +594,9 @@ export function isWojakGoogleBatchMode(flags?: ImageRunFlags): boolean {
 }
 
 export function resolveImageBackend(flags?: ImageRunFlags, delivery?: ImageDeliveryMode): ImageBackend {
+  if (higgsfieldDisabled()) return "gemini";
   if (flags?.googleBatchMode || flags?.batchLocal || delivery === "google_batch" || delivery === "local_batch") {
-    const env = imageBackendFromEnv();
-    if (env === "higgsfield") return "gemini";
-    return env === "auto" ? "gemini" : "gemini";
+    return "gemini";
   }
   return imageBackendFromEnv();
 }

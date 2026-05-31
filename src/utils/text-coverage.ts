@@ -29,6 +29,8 @@ export function normalizeForCoverage(raw: string): string {
     // Aspas duplas nao sao relevantes para cobertura verbatim (modelo pode abrir/fechar quotes em cortes diferentes)
     .replace(/"/g, "")
     .replace(/[\u2013\u2014]/g, "-")
+    // Travessao / lista entre frases no roteiro (ex.: "bruise — watch") nao entra nas ancoras
+    .replace(/\s+-\s+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 }

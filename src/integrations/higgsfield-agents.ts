@@ -7,6 +7,7 @@ import {
   HIGGSFIELD_CLI_PATH,
   ROOT_DIR,
   higgsfieldCliCredentialsPath,
+  higgsfieldDisabled,
 } from "../config.js";
 
 function isExecutableFile(filePath: string): boolean {
@@ -133,6 +134,11 @@ export function runHiggsfieldCli(hfArgv: string[]): Promise<number> {
 export function runHiggsfieldCliCaptured(
   hfArgv: string[]
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  if (higgsfieldDisabled()) {
+    return Promise.reject(
+      new Error("Higgsfield desabilitado neste projeto (GENTUBE_DISABLE_HIGGSFIELD=1). Use Gemini/Veo."),
+    );
+  }
   const bin = resolveHiggsfieldCliBinary();
   return new Promise((resolve, reject) => {
     const child = spawn(bin, hfArgv, {

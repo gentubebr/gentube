@@ -4,6 +4,7 @@ import {
   type ImageBackend,
   type ImageDeliveryMode,
   type ImageRunFlags,
+  higgsfieldDisabled,
   resolveImageBackend,
   resolveImageDelivery,
   resolveSceneImageDelivery,
@@ -60,6 +61,9 @@ async function downloadHfToDisk(
 }
 
 async function tryHiggsfieldImage(input: RenderImageInput, promptHash?: string): Promise<{ localPath?: string; hfJobId?: string }> {
+  if (higgsfieldDisabled()) {
+    throw new Error("Higgsfield desabilitado (GENTUBE_DISABLE_HIGGSFIELD=1)");
+  }
   if (GENTUBE_HF_ASYNC) {
     const hfJobId = await enqueueImageWithDefaultsCli({
       prompt: input.prompt,
@@ -238,7 +242,7 @@ export async function renderSceneImage(
     return { provider: "gemini", doneSync: true, queued: false, localPath };
   }
 
-  if (backend === "higgsfield") {
+  if (backend === "higgsfield" && !higgsfieldDisabled()) {
     const hf = await tryHiggsfieldImage(input, promptHash);
     if (hf.hfJobId) {
       return { provider: "higgsfield", doneSync: false, queued: true };
@@ -246,23 +250,28 @@ export async function renderSceneImage(
     return { provider: "higgsfield", doneSync: true, queued: false, localPath: hf.localPath };
   }
 
-  // auto: HF then Gemini sync on any failure
-  try {
-    const hf = await tryHiggsfieldImage(input, promptHash);
-    if (hf.hfJobId) {
-      return { provider: "higgsfield", doneSync: false, queued: true };
-    }
-    return { provider: "higgsfield", doneSync: true, queued: false, localPath: hf.localPath };
-  } catch (hfErr) {
-    const hfMsg = hfErr instanceof Error ? hfErr.message : String(hfErr);
+  // auto: HF then Gemini sync (HF omitido se GENTUBE_DISABLE_HIGGSFIELD=1)
+  if (!higgsfieldDisabled()) {
     try {
-      const localPath = await renderGeminiSync(input, input.referenceImageUrl, promptHash);
-      return { provider: "gemini", doneSync: true, queued: false, localPath };
-    } catch (gemErr) {
-      const gMsg = gemErr instanceof Error ? gemErr.message : String(gemErr);
-      throw new Error(`HF: ${hfMsg} | Gemini fallback: ${gMsg}`);
+      const hf = await tryHiggsfieldImage(input, promptHash);
+      if (hf.hfJobId) {
+        return { provider: "higgsfield", doneSync: false, queued: true };
+      }
+      return { provider: "higgsfield", doneSync: true, queued: false, localPath: hf.localPath };
+    } catch (hfErr) {
+      const hfMsg = hfErr instanceof Error ? hfErr.message : String(hfErr);
+      try {
+        const localPath = await renderGeminiSync(input, input.referenceImageUrl, promptHash);
+        return { provider: "gemini", doneSync: true, queued: false, localPath };
+      } catch (gemErr) {
+        const gMsg = gemErr instanceof Error ? gemErr.message : String(gemErr);
+        throw new Error(`HF: ${hfMsg} | Gemini fallback: ${gMsg}`);
+      }
     }
   }
+
+  const localPath = await renderGeminiSync(input, input.referenceImageUrl, promptHash);
+  return { provider: "gemini", doneSync: true, queued: false, localPath };
 }
 
 /** Submete batches Google pendentes (sem external_id). Falha direto se submit falhar. */

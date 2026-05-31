@@ -1,6 +1,11 @@
 import path from "node:path";
 import chalk from "chalk";
-import { resolveVisualModality, roteiroStageBatchEnabled } from "../config.js";
+import {
+  higgsfieldDisabled,
+  resolveImageDelivery,
+  resolveVisualModality,
+  roteiroStageBatchEnabled,
+} from "../config.js";
 import { classifyClaudeError, QUOTA_RETRY_DELAY_MS } from "../utils/provider-errors.js";
 import { addProjectLog, getMediaBlock, getNarrationBlock, listScriptBlocks } from "../repository.js";
 import {
@@ -23,11 +28,13 @@ import type { ImagensVideosOptions } from "./pipeline.js";
 import {
   runImagensVideosBlock,
   runNarracaoBlock,
+  runQuotizadorBlock,
   runRoteiroBlock,
   runRoteiroBatchStage,
   runQualityGateBlock,
   runThumbnails,
 } from "./pipeline.js";
+import { stoicAllowAiMixEnabled, stoicOverlayModeEnabled } from "../utils/stoic-overlay-mode.js";
 import { syncImageJobsOnce, countAllImageJobsPending } from "./image-sync.js";
 import { runMontagem } from "./montagem.js";
 import type { MontagemPhase } from "../config/montagem.js";
@@ -39,6 +46,7 @@ export type PipelineProfile = "wojak-images-only" | "stoic-patrol-stock";
 export type PipelineStage =
   | "roteiro"
   | "quality_gate"
+  | "quotizador"
   | "imagens"
   | "image_sync"
   | "imagens_retry"
@@ -49,6 +57,7 @@ export type PipelineStage =
 const STAGE_ORDER: PipelineStage[] = [
   "roteiro",
   "quality_gate",
+  "quotizador",
   "imagens",
   "image_sync",
   "imagens_retry",
@@ -148,6 +157,19 @@ export function assertPipelineProfileEnv(profile: PipelineProfile): string[] {
     }
     if (["1", "true", "yes"].includes(String(process.env.GENTUBE_HF_ASYNC ?? "").toLowerCase())) {
       warnings.push("GENTUBE_HF_ASYNC=1 nao recomendado para stoic_patrol (stock Magnific)");
+    }
+    if (!stoicOverlayModeEnabled()) {
+      warnings.push(
+        "Projetos novos Stoic overlay: GENTUBE_STOIC_OVERLAY_MODE=1 + GENTUBE_TTS_WITH_TIMESTAMPS=1",
+      );
+    }
+    if (stoicAllowAiMixEnabled() && resolveImageDelivery() !== "google_batch") {
+      warnings.push(
+        "GENTUBE_STOIC_ALLOW_AI_MIX: cenas ai_generated exigem GENTUBE_IMAGE_DELIVERY=google_batch (ou local_batch)",
+      );
+    }
+    if (higgsfieldDisabled()) {
+      warnings.push("GENTUBE_DISABLE_HIGGSFIELD=1: imagens IA via Gemini; stoic_patrol usa apenas imagens IA");
     }
   }
   return warnings;
@@ -334,6 +356,27 @@ export async function runFullPipeline(
         blockErrors.push({ stage: "quality_gate", blockNumber: bn, error: msg, attempts: 1 });
         if (!options.continueOnError) throw e;
       }
+    }
+  }
+
+  // --- Quotizador (Stoic overlay: blockNN.quotes.json) ---
+  if (stoicOverlayModeEnabled() && shouldRunStage(options.fromStage, "quotizador", options.throughStage)) {
+    updatePipelineRun(runId, { currentStage: "quotizador" });
+    console.log(chalk.bold("\n--- Etapa: quotizador (Stoic Patrol overlays) ---\n"));
+    for (let bn = 1; bn <= totalBlocos; bn += 1) {
+      const scriptRow = listScriptBlocks(projectId).find((b) => b.block_number === bn);
+      if (scriptRow?.status !== "success") {
+        console.log(chalk.yellow(`${blockTag(bn, totalBlocos)} Roteiro incompleto, pulando quotizador`));
+        continue;
+      }
+      const { status } = await recordStep(
+        runId,
+        "quotizador",
+        bn,
+        () => runQuotizadorBlock(project, bn),
+        { continueOnError: options.continueOnError },
+      );
+      bumpStage("quotizador", status);
     }
   }
 

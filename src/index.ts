@@ -13,6 +13,7 @@ import {
   DEFAULT_MAX_VIDEOS_BLOCK1,
   DEFAULT_MAX_VIDEOS_OTHER_BLOCKS,
   ELEVENLABS_VOICE_ID,
+  STOIC_PATROL_ELEVENLABS_VOICE_ID,
   GEMINI_LOCAL_BATCH_CONCURRENCY,
   assertImagensPhaseFlagsExclusive,
   imageRunFlagsFromCli,
@@ -59,6 +60,8 @@ import {
   runImagensVideosBlock,
   runNarracao,
   runNarracaoBlock,
+  runQuotizador,
+  runQuotizadorBlock,
   runRoteiro,
   runRoteiroBlock,
   runThumbnails,
@@ -68,7 +71,15 @@ import { runStockIndex } from "./services/stock-index.js";
 import { mergeMontagemRunOptions, resolveMontagemConfig, type MontagemPhase } from "./config/montagem.js";
 import { runMontagem } from "./services/montagem.js";
 import { writeShotListManualFiles } from "./services/shot-list-manual.js";
-import { ensureDir, ensureTemplateStructure, formatDateYYYYMMDD, toSlug, writeModelagemTranscript } from "./utils/fs.js";
+import {
+  ensureDir,
+  ensureTemplateStructure,
+  formatDateYYYYMMDD,
+  readModelagemElevenlabsVoiceId,
+  toSlug,
+  writeModelagemElevenlabsVoiceId,
+  writeModelagemTranscript,
+} from "./utils/fs.js";
 import { setGentubeVerboseFromCli } from "./utils/verbose-log.js";
 import { Step3Limits } from "./types/step3-limits.js";
 import {
@@ -123,6 +134,10 @@ function maskEmail(email: string): string {
   if (!domain) return "***";
   if (local.length <= 1) return `*@${domain}`;
   return `${local[0]}***@${domain}`;
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 getDb();
@@ -394,6 +409,14 @@ program
       console.log(chalk.dim(`Referencia salva em: ${transcriptPath}`));
     }
 
+    if (selectedChannel.id === 2 || String(selectedChannel.slug).toLowerCase().includes("stoic")) {
+      const voicePath = await writeModelagemElevenlabsVoiceId(
+        projectPath,
+        STOIC_PATROL_ELEVENLABS_VOICE_ID,
+      );
+      console.log(chalk.dim(`Voz ElevenLabs (Stoic Patrol): ${STOIC_PATROL_ELEVENLABS_VOICE_ID} → ${voicePath}`));
+    }
+
     const projectId = createProject({
       channelId: selectedChannel.id,
       titulo,
@@ -445,7 +468,7 @@ program
     if (mode === "sequencial") {
       await executeAll(project, undefined, opts.promptMatrix, opts.promptCanalVoice);
     } else if (mode === "pipeline") {
-      const voiceId = await resolveVoiceId(undefined);
+      const voiceId = await resolveVoiceId(undefined, String(project.project_path));
       const summary = await invokeRunPipeline(project, { voiceId, promptMatrix: opts.promptMatrix, promptCanalVoice: opts.promptCanalVoice });
       if (summary.status !== "success") process.exitCode = 1;
     } else {
@@ -456,11 +479,11 @@ program
 program
   .command("run-step")
   .description(
-    "Executa uma etapa do pipeline: roteiro | narracao | imagens | montagem | thumbnails (ver help run-step)"
+    "Executa uma etapa do pipeline: roteiro | quotizador | narracao | imagens | montagem | thumbnails (ver help run-step)"
   )
   .addHelpText("after", CLI_HELP.runStep)
   .requiredOption("--project <idOuSlug>", "ID numerico (ex.: 10) ou slug da pasta (ex.: 20260518-meu-titulo)")
-  .requiredOption("--step <etapa>", "Etapa: roteiro | narracao | imagens | montagem | thumbnails")
+  .requiredOption("--step <etapa>", "Etapa: roteiro | quotizador | narracao | imagens | montagem | thumbnails")
   .option("--voice-id <id>", "Narracao: voice ElevenLabs (padrao: ELEVENLABS_VOICE_ID ou prompt)")
   .option("--avatar-file <caminho>", "Opcional: avatar para consistencia visual (imagens e thumbnails)")
   .option("--reference-url <url>", "Step thumbnails: URL do video YouTube cuja thumbnail sera usada como referencia")
@@ -512,7 +535,7 @@ program
   .option("--verbose", "-v", "Logs detalhados (progresso Claude batch, etapas do plano v2)")
   .action(async (options: {
     project: string;
-    step: "roteiro" | "narracao" | "imagens" | "montagem" | "thumbnails";
+    step: "roteiro" | "quotizador" | "narracao" | "imagens" | "montagem" | "thumbnails";
     voiceId?: string;
     avatarFile?: string;
     referenceUrl?: string;
@@ -573,6 +596,14 @@ program
       await executeRoteiro(project, options.promptMatrix, options.promptCanalVoice);
       return;
     }
+    if (options.step === "quotizador") {
+      if (blockNumber !== undefined) {
+        await runQuotizadorBlock(project, blockNumber);
+      } else {
+        await runQuotizador(project);
+      }
+      return;
+    }
     if (options.step === "imagens") {
       const limits = parseStep3Limits(options);
       const imagensOpts = buildImagensVideosOpts(options);
@@ -596,7 +627,7 @@ program
       return;
     }
     if (options.step === "narracao") {
-      const voiceId = await resolveVoiceId(options.voiceId);
+      const voiceId = await resolveVoiceId(options.voiceId, String(project.project_path));
       const narracaoOpts = { forceRegenScenes: Boolean(options.forceNarracao) };
       if (blockNumber !== undefined) {
         await executeNarracaoBlock(project, voiceId, blockNumber, narracaoOpts);
@@ -625,7 +656,7 @@ program
   .action(async (options: { project: string; voiceId?: string; promptMatrix?: string; promptCanalVoice?: string }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
-    const voiceId = await resolveVoiceId(options.voiceId);
+    const voiceId = await resolveVoiceId(options.voiceId, String(project.project_path));
     await executeAll(project, voiceId, options.promptMatrix, options.promptCanalVoice);
   });
 
@@ -676,7 +707,7 @@ program
     setGentubeVerboseFromCli(options.verbose);
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
-    const voiceId = await resolveVoiceId(options.voiceId);
+    const voiceId = await resolveVoiceId(options.voiceId, String(project.project_path));
     const summary = await invokeRunPipeline(project, { ...options, voiceId });
     if (summary.status !== "success") process.exitCode = 1;
   });
@@ -873,7 +904,13 @@ Credenciais: ~/.config/higgsfield/credentials.json (ou HIGGSFIELD_CREDENTIALS_PA
     process.exitCode = code;
   });
 
-function cliImageJobRow(id: number, prompt: string, outPathNoExt: string, batchId: string): ImageJobRow {
+function cliImageJobRow(
+  id: number,
+  prompt: string,
+  outPathNoExt: string,
+  batchId: string,
+  referenceImagePath?: string | null,
+): ImageJobRow {
   const now = new Date().toISOString();
   return {
     id,
@@ -890,7 +927,7 @@ function cliImageJobRow(id: number, prompt: string, outPathNoExt: string, batchI
     outcome: "pending",
     result_mime: null,
     error_message: null,
-    reference_image_path: null,
+    reference_image_path: referenceImagePath ?? null,
     prompt_text: prompt,
     prompt_hash: null,
     downloaded_at: null,
@@ -966,7 +1003,7 @@ program
       if (options.batchLocal) {
         const jobs = prompts.map((p, i) => {
           const outPathNoExt = path.join(path.resolve(outDir), `img_${String(i + 1).padStart(3, "0")}`);
-          return cliImageJobRow(i + 1, p, outPathNoExt, batchId);
+          return cliImageJobRow(i + 1, p, outPathNoExt, batchId, ref);
         });
         const concurrency = Math.max(1, parseInt(String(options.concurrency ?? ""), 10) || GEMINI_LOCAL_BATCH_CONCURRENCY);
         await processLocalImageBatch(jobs, concurrency, { skipDb: true });
@@ -976,9 +1013,13 @@ program
 
       const jobs = prompts.map((p, i) => {
         const outPathNoExt = path.join(path.resolve(outDir), `img_${String(i + 1).padStart(3, "0")}`);
-        return cliImageJobRow(i + 1, p, outPathNoExt, batchId);
+        return cliImageJobRow(i + 1, p, outPathNoExt, batchId, ref);
       });
-      console.log(chalk.cyan(`Submetendo Google batch (${jobs.length} prompts)...`));
+      console.log(
+        chalk.cyan(
+          `Submetendo Google batch (${jobs.length} prompt(s)${ref ? ", com referencia" : ""})...`,
+        ),
+      );
       const batchName = await submitGoogleImageBatch(jobs, { skipDb: true });
       console.log(chalk.dim(`Batch: ${batchName}`));
 
@@ -1344,8 +1385,10 @@ program
   .requiredOption("--project <idOuSlug>", "ID ou slug do projeto")
   .option("--remote-host <host>", "Host remoto (ex.: dev-development). Ou defina GENTUBE_REMOTE_HOST no .env")
   .option("--local-dir <caminho>", "Diretorio local de destino (padrao: mesmo caminho relativo)")
+  .option("--montagem-only", "Copia somente a subpasta 06 - Montagem")
   .option("--dry-run", "Adiciona --dry-run ao rsync (simula sem copiar)")
-  .action(async (options: { project: string; remoteHost?: string; localDir?: string; dryRun?: boolean }) => {
+  .action(
+    async (options: { project: string; remoteHost?: string; localDir?: string; montagemOnly?: boolean; dryRun?: boolean }) => {
     const project = getProjectByIdOrSlug(options.project);
     if (!project) throw new Error("Projeto nao encontrado");
 
@@ -1357,22 +1400,26 @@ program
       return;
     }
 
-    const remotePath = String(project.project_path);
+    const projectPath = String(project.project_path);
+    const projectFolder = path.basename(projectPath.replace(/\/+$/, ""));
+    const remotePath = options.montagemOnly ? path.join(projectPath, "06 - Montagem") : projectPath;
     const remotePathTrailing = remotePath.endsWith("/") ? remotePath : `${remotePath}/`;
 
     let localPath: string;
     if (options.localDir?.trim()) {
       localPath = options.localDir.trim();
     } else {
-      const relPath = path.relative(ROOT_DIR, remotePath);
-      localPath = `./${relPath}/`;
+      localPath = options.montagemOnly
+        ? `./${projectFolder}/06 - Montagem/`
+        : `./${projectFolder}/`;
     }
 
     const flags = ["rsync", "-avz", "--progress"];
     if (options.dryRun) flags.push("--dry-run");
-    flags.push(`${remoteHost}:${remotePathTrailing}`, localPath);
+    flags.push(shellSingleQuote(`${remoteHost}:${remotePathTrailing}`), shellSingleQuote(localPath));
 
     console.log(chalk.cyan(`Projeto: ${project.titulo} (${project.slug})`));
+    if (options.montagemOnly) console.log(chalk.dim("Escopo: 06 - Montagem/"));
     console.log(chalk.dim(`Remoto:  ${remoteHost}:${remotePathTrailing}`));
     console.log(chalk.dim(`Local:   ${localPath}`));
     console.log();
@@ -1531,7 +1578,7 @@ program
         return;
       }
 
-      const voiceId = await resolveVoiceId(options.voiceId);
+      const voiceId = await resolveVoiceId(options.voiceId, String(project.project_path));
       const narracaoOpts = { forceRegenScenes: Boolean(options.forceNarracao) };
       if (blockNumber !== undefined) {
         await executeNarracaoBlock(project, voiceId, blockNumber, narracaoOpts);
@@ -1876,16 +1923,23 @@ async function executeAll(
   promptCanalVoice?: string
 ): Promise<void> {
   await executeRoteiro(project, promptMatrix, promptCanalVoice);
-  const voiceId = await resolveVoiceId(voiceIdFromArg);
+  const voiceId = await resolveVoiceId(voiceIdFromArg, String(project.project_path));
   const updatedProject = getProjectByIdOrSlug(String(project.id));
   if (!updatedProject) throw new Error("Projeto nao encontrado apos etapa de roteiro");
   await executeNarracao(updatedProject, voiceId);
   addProjectLog(Number(project.id), "pipeline", "info", "Execucao sequencial finalizada");
 }
 
-async function resolveVoiceId(cliVoiceId?: string): Promise<string> {
+async function resolveVoiceId(cliVoiceId?: string, projectPath?: string): Promise<string> {
   const fromCli = cliVoiceId?.trim();
   if (fromCli) return fromCli;
+  if (projectPath) {
+    const fromProject = await readModelagemElevenlabsVoiceId(projectPath);
+    if (fromProject) return fromProject;
+  }
+  if (resolveVisualModality() === "stoic_patrol" && STOIC_PATROL_ELEVENLABS_VOICE_ID) {
+    return STOIC_PATROL_ELEVENLABS_VOICE_ID;
+  }
   if (ELEVENLABS_VOICE_ID) return ELEVENLABS_VOICE_ID;
   return password({ message: "Informe voice_id da ElevenLabs:", mask: "*" });
 }
@@ -2005,7 +2059,7 @@ program
   }) => {
     const project = getProjectByIdOrSlug(opts.project);
     if (!project) throw new Error("Projeto nao encontrado");
-    const voiceId = await resolveVoiceId(opts.voiceId);
+    const voiceId = await resolveVoiceId(opts.voiceId, String(project.project_path));
     const jobProfile =
       opts.profile ??
       (resolveVisualModality() === "stoic_patrol" ? "stoic-patrol-stock" : "wojak-images-only");

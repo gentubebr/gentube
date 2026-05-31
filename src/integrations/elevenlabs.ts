@@ -34,6 +34,23 @@ export async function getSubscriptionInfo(): Promise<ElevenLabsSubscriptionInfo>
   };
 }
 
+export type CharacterAlignmentPayload = {
+  characters: string[];
+  character_start_times_seconds: number[];
+  character_end_times_seconds: number[];
+};
+
+function mapAlignment(
+  align: { characters: string[]; characterStartTimesSeconds: number[]; characterEndTimesSeconds: number[] } | undefined,
+): CharacterAlignmentPayload | null {
+  if (!align?.characters?.length) return null;
+  return {
+    characters: align.characters,
+    character_start_times_seconds: align.characterStartTimesSeconds,
+    character_end_times_seconds: align.characterEndTimesSeconds,
+  };
+}
+
 export async function textToSpeechMp3(input: { text: string; voiceId: string }): Promise<Buffer> {
   const elevenlabs = getClient();
   const text = stripMarkdownForSpeech(input.text);
@@ -51,4 +68,28 @@ export async function textToSpeechMp3(input: { text: string; voiceId: string }):
     chunks.push(Buffer.from(chunk));
   }
   return Buffer.concat(chunks);
+}
+
+/** ElevenLabs convertWithTimestamps — alinhamento caractere a caractere (Stoic overlay). */
+export async function textToSpeechMp3WithAlignment(input: {
+  text: string;
+  voiceId: string;
+}): Promise<{ audio: Buffer; alignment: CharacterAlignmentPayload }> {
+  const elevenlabs = getClient();
+  const text = stripMarkdownForSpeech(input.text);
+  if (!text.trim()) {
+    throw new Error("Texto de narracao vazio apos remover Markdown (verifique o bloco ou a cena).");
+  }
+  const response = await elevenlabs.textToSpeech.convertWithTimestamps(input.voiceId, {
+    text,
+    modelId: "eleven_multilingual_v2",
+    outputFormat: "mp3_44100_128",
+  });
+  const audio = Buffer.from(response.audioBase64, "base64");
+  const alignment =
+    mapAlignment(response.alignment) ?? mapAlignment(response.normalizedAlignment);
+  if (!alignment) {
+    throw new Error("ElevenLabs nao retornou alignment (with_timestamps)");
+  }
+  return { audio, alignment };
 }

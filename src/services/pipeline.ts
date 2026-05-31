@@ -9,6 +9,7 @@ import {
   DEFAULT_MAX_VIDEOS_OTHER_BLOCKS,
   MANUAL_CAPTURE_PLACEHOLDER_PATH,
   PROMPT_MATRIX02_PATH,
+  PROMPT_QUOTIZADOR_PATH,
   resolveSegmentaPromptContent,
   resolveImageDelivery,
   resolveSceneImageDelivery,
@@ -17,6 +18,7 @@ import {
   resolveVisualizaPromptContent,
   resolvePromptMatrixPath,
   resolveCanalVoicePath,
+  higgsfieldDisabled,
   resolveStockProvider,
   ROOT_DIR,
   ROTEIRO_PREV_CONTEXT_MAX_CHARS,
@@ -29,6 +31,7 @@ import {
 import {
   generateAssetsPlanJson,
   generateScriptBlock,
+  generateQuotizadorPlanJson,
   generateSegmentationPlanJson,
   generateVisualizationPlanJson,
   evaluateScriptQuality,
@@ -36,7 +39,7 @@ import {
 } from "../integrations/claude.js";
 import { runRoteiroBatchAll } from "../integrations/claude-stage-batch.js";
 import { extractVideoId, downloadYoutubeThumbnail } from "../utils/youtube.js";
-import { cachedTextToSpeech } from "./tts-cache.js";
+import { cachedTextToSpeech, cachedTextToSpeechWithAlignment } from "./tts-cache.js";
 import {
   enqueueImageWithDefaultsCli,
   enqueueThumbnailCli,
@@ -65,6 +68,7 @@ import {
   upsertMediaBlock,
   upsertScriptBlock,
 } from "../repository.js";
+import { generateGeminiImageSync } from "../integrations/gemini-image.js";
 import {
   flushPendingGoogleBatches,
   flushPendingLocalBatches,
@@ -101,6 +105,15 @@ import type { BlockScenesPlanV2, SegmentationPlanV2 } from "../types/scenes-plan
 import { renderQuoteCardMp4 } from "./quote-card-render.js";
 import { saveStockToCache, tryCopyStockFromCache } from "./stock-cache.js";
 import { assertStoicPatrolBlockPlan } from "../utils/stoic-patrol-prompt.js";
+import {
+  blockQuotesJsonPath,
+  stoicAllowAiMixEnabled,
+  stoicOverlayModeEnabled,
+  stoicPatrolAiImagesOnly,
+  ttsWithTimestampsEnabled,
+  tryLoadBlockQuotesPlan,
+} from "../utils/stoic-overlay-mode.js";
+import { parseBlockQuotesJson } from "../utils/quotes-plan.js";
 import { verboseDim, verboseInfo } from "../utils/verbose-log.js";
 import { assertWojakBlockPlan, prepareSceneVisualRender } from "../utils/wojak-prompt.js";
 
@@ -716,9 +729,21 @@ async function synthesizeBlockNarration(input: {
         continue;
       }
       console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} ElevenLabs ${scene.id}...`));
-      const { cacheHit } = await cachedTextToSpeech({ text: scene.narration_text, voiceId }, p);
-      if (cacheHit) {
-        console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} ${scene.id} — TTS cache hit`));
+      const alignmentPath = path.join(blockSubDir, `${scene.id}.alignment.json`);
+      if (ttsWithTimestampsEnabled()) {
+        const { cacheHit } = await cachedTextToSpeechWithAlignment(
+          { text: scene.narration_text, voiceId },
+          p,
+          alignmentPath,
+        );
+        if (cacheHit) {
+          console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} ${scene.id} — TTS+alignment cache hit`));
+        }
+      } else {
+        const { cacheHit } = await cachedTextToSpeech({ text: scene.narration_text, voiceId }, p);
+        if (cacheHit) {
+          console.log(chalk.dim(`${blockTag(blockNumber, totalBlocos)} ${scene.id} — TTS cache hit`));
+        }
       }
       scenePaths.push(p);
     }
@@ -876,6 +901,57 @@ export async function runNarracaoBlock(
   recomputeStageFromBlocks(projectId, totalBlocos, "narration_blocks", "status_narracao");
 }
 
+/** Stoic Patrol overlay: detecta citacoes → blockNN.quotes.json (requer GENTUBE_STOIC_OVERLAY_MODE=1). */
+export async function runQuotizador(project: ProjectRow): Promise<void> {
+  const projectId = Number(project.id);
+  const totalBlocos = Number(project.total_blocos);
+  if (!stoicOverlayModeEnabled()) {
+    throw new Error("Quotizador exige GENTUBE_STOIC_OVERLAY_MODE=1 e GENTUBE_VISUAL_MODALITY=stoic_patrol");
+  }
+  const scriptBlocks = listScriptBlocks(projectId);
+  for (const block of scriptBlocks) {
+    if (block.status !== "success" || !block.file_path_md) {
+      throw new Error(`Bloco ${block.block_number} do roteiro nao esta pronto para quotizador`);
+    }
+    await runQuotizadorBlock(project, block.block_number);
+  }
+}
+
+export async function runQuotizadorBlock(project: ProjectRow, blockNumber: number): Promise<void> {
+  const projectId = Number(project.id);
+  const totalBlocos = Number(project.total_blocos);
+  if (!stoicOverlayModeEnabled()) {
+    throw new Error("Quotizador exige GENTUBE_STOIC_OVERLAY_MODE=1 e GENTUBE_VISUAL_MODALITY=stoic_patrol");
+  }
+  const scriptRow = getScriptBlock(projectId, blockNumber);
+  if (!scriptRow?.file_path_md || scriptRow.status !== "success") {
+    throw new Error(`Bloco ${blockNumber} do roteiro nao esta pronto para quotizador`);
+  }
+  const blockText = await fs.readFile(scriptRow.file_path_md, "utf-8");
+  const quotesPath = blockQuotesJsonPath(String(project.project_path), blockNumber);
+  const promptBase = await fs.readFile(PROMPT_QUOTIZADOR_PATH, "utf-8");
+
+  console.log(chalk.cyan(`${blockTag(blockNumber, totalBlocos)} Quotizador (Claude)...`));
+  const raw = await generateQuotizadorPlanJson({
+    promptBase,
+    blockNumber,
+    totalBlocks: totalBlocos,
+    blockText,
+    projectId,
+  });
+  const plan = parseBlockQuotesJson(unwrapJsonFromModel(raw), blockNumber, totalBlocos, blockText);
+  await fs.mkdir(path.dirname(quotesPath), { recursive: true });
+  await fs.writeFile(quotesPath, `${JSON.stringify(plan, null, 2)}\n`, "utf-8");
+  console.log(
+    chalk.green(
+      `${blockTag(blockNumber, totalBlocos)} ${plan.quotes.length} quote(s) → ${path.basename(quotesPath)}`,
+    ),
+  );
+  addProjectLog(projectId, "imagens_videos", "info", `Quotizador bloco ${blockNumber}: ${plan.quotes.length} quotes`, {
+    quotes_path: quotesPath,
+  });
+}
+
 function extFromUrlOrType(url: string, contentType: string | null, fallback: ".bin" | ".png" | ".mp4"): string {
   if (contentType?.includes("image/png")) return ".png";
   if (contentType?.includes("image/jpeg")) return ".jpg";
@@ -942,8 +1018,18 @@ async function generateAndRenderShot(params: {
       outPathNoExt: params.outPathNoExt,
       referenceImageUrl: params.referenceImageUrl,
       magnificKeywords: params.magnificKeywords,
+      skipHiggsfield: higgsfieldDisabled(),
     });
     return { localPath: out.localPath, mediaUrl: out.mediaUrl, provider: out.provider };
+  }
+
+  if (higgsfieldDisabled()) {
+    const out = await generateGeminiImageSync({
+      prompt: params.prompt,
+      outPathNoExt: params.outPathNoExt,
+      referenceImagePath: params.referenceImageUrl,
+    });
+    return { localPath: out.localPath, provider: "gemini" };
   }
 
   const maxAttempts = 3;
@@ -971,10 +1057,11 @@ async function parseSegmentationWithErrorFile(
   blockNumber: number,
   totalBlocks: number,
   blockText: string,
-  maxScenes: number
+  maxScenes: number,
+  anchorMode?: boolean,
 ): Promise<SegmentationPlanV2> {
   try {
-    return parseSegmentationJson(raw, blockNumber, totalBlocks, blockText, { maxScenes });
+    return parseSegmentationJson(raw, blockNumber, totalBlocks, blockText, { maxScenes, anchorMode });
   } catch (e) {
     const parseError = e instanceof Error ? e.message : String(e);
     const errorPath = await writePlanParseError(assetsJsonPath, {
@@ -1052,13 +1139,18 @@ async function imagensBlockPlanAndRenderV2(input: {
   }
 
   const forceVizRegen = forceScenePlanVizRegen();
-  const existingPlan = forceVizRegen ? null : await tryLoadPlanFromAssetsJson(input.jsonPath);
+  /** enqueue-only deve sempre ler o plano em disco; FORCE_VIZ_REGEN só força Claude em plan-only/sync. */
+  const skipCachedPlan = forceVizRegen && !input.enqueueOnly;
+  const existingPlan = skipCachedPlan ? null : await tryLoadPlanFromAssetsJson(input.jsonPath);
   const errorResume =
-    forceVizRegen || existingPlan ? null : await loadVisualizationErrorResume(input.jsonPath, input.scriptText);
+    skipCachedPlan || existingPlan ? null : await loadVisualizationErrorResume(input.jsonPath, input.scriptText);
   const segErrorResume =
-    forceVizRegen || existingPlan || errorResume
+    skipCachedPlan || existingPlan || errorResume
       ? null
-      : await loadSegmentationErrorResume(input.jsonPath, input.scriptText, { maxScenes });
+      : await loadSegmentationErrorResume(input.jsonPath, input.scriptText, {
+          maxScenes,
+          anchorMode: stoicOverlayModeEnabled(),
+        });
 
   let plan: BlockScenesPlanV2;
 
@@ -1129,7 +1221,18 @@ async function imagensBlockPlanAndRenderV2(input: {
         });
         seg = segErrorResume;
       } else {
-        verboseInfo(`${blockTag(bn, tb)} Etapa 1/2: segmentacao (max_scenes=${maxScenes})...`);
+        const anchorMode = stoicOverlayModeEnabled();
+        let quotesJson: string | undefined;
+        if (anchorMode) {
+          const quotesPlan = await tryLoadBlockQuotesPlan(String(input.project.project_path), bn);
+          if (!quotesPlan) {
+            throw new Error(
+              `block${String(bn).padStart(2, "0")}.quotes.json ausente. Rode: run-step --step quotizador --block ${bn}`,
+            );
+          }
+          quotesJson = JSON.stringify(quotesPlan.quotes, null, 2);
+        }
+        verboseInfo(`${blockTag(bn, tb)} Etapa 1/2: segmentacao (max_scenes=${maxScenes}${anchorMode ? ", ancora" : ""})...`);
         const rawSeg = await generateSegmentationPlanJson({
           promptBase: segPrompt,
           blockNumber: input.blockNumber,
@@ -1137,6 +1240,8 @@ async function imagensBlockPlanAndRenderV2(input: {
           blockText: input.scriptText,
           maxScenes,
           projectId: input.projectId,
+          quotesJson,
+          anchorMode,
         });
         seg = await parseSegmentationWithErrorFile(
           input.jsonPath,
@@ -1145,10 +1250,11 @@ async function imagensBlockPlanAndRenderV2(input: {
           input.totalBlocos,
           input.scriptText,
           maxScenes,
+          anchorMode,
         );
         verboseInfo(
-          `${blockTag(bn, tb)} Segmentacao OK: ${seg.scenes.length} cenas, ` +
-            `${seg.scenes.filter((s) => s.quote_hint).length} quote_hint`,
+          `${blockTag(bn, tb)} Segmentacao OK: ${seg.scenes.length} cenas` +
+            (anchorMode ? " (modo ancora)" : `, ${seg.scenes.filter((s) => s.quote_hint).length} quote_hint`),
         );
       }
 
@@ -1301,10 +1407,18 @@ async function imagensBlockPlanAndRenderV2(input: {
     );
   }
   if (visualModality === "stoic_patrol") {
+    const overlay = stoicOverlayModeEnabled();
+    const aiMix = overlay && stoicAllowAiMixEnabled();
     console.log(
       chalk.cyan(
-        `  ${blockTag(bn, tb)} Modalidade visual: stoic_patrol (Magnific stock + quote_card Hyperframes — ver stoic-patrol.md)`
-      )
+        `  ${blockTag(bn, tb)} Modalidade visual: stoic_patrol (${
+          aiMix
+            ? `stock ${input.stockRatio}% + IA + quote overlays`
+            : overlay
+              ? "stock + quote overlays na montagem"
+              : "stock + quote_card Hyperframes legado"
+        })`,
+      ),
     );
   }
   const useHfVideoQueue =
@@ -1413,7 +1527,7 @@ async function imagensBlockPlanAndRenderV2(input: {
             continue;
           }
           const msg = stockErr instanceof Error ? stockErr.message : "Erro stock";
-          if (visualModality === "stoic_patrol") {
+          if (visualModality === "stoic_patrol" && !stoicAllowAiMixEnabled()) {
             throw new Error(`Stock falhou ${scene.id} (stoic_patrol sem fallback IA): ${msg}`);
           }
           console.log(chalk.yellow(`  ${blockTag(bn, tb)} Stock falhou ${scene.id}: ${msg} — fallback IA`));
@@ -1472,11 +1586,57 @@ async function imagensBlockPlanAndRenderV2(input: {
       continue;
     }
 
-    if (visualModality === "stoic_patrol") {
+    if (visualModality === "stoic_patrol" && effectiveSource !== "ai_generated") {
       throw new Error(`Cena ${scene.id}: source ${effectiveSource} nao renderizado em stoic_patrol`);
     }
 
     if (effectiveSource !== "ai_generated") continue;
+
+    if (visualModality === "stoic_patrol" && stoicPatrolAiImagesOnly()) {
+      const renderPrepStoic = prepareSceneVisualRender(v, scene.narration_text, visualModality, avatarRef);
+      if (v.type === "video") {
+        console.log(
+          chalk.yellow(
+            `  ${blockTag(bn, tb)} ${scene.id}: ai_generated video no plano → render como imagem (stoic_patrol)`,
+          ),
+        );
+      }
+      const imgResult = await renderSceneImage(
+        {
+          projectId: input.projectId,
+          blockNumber: bn,
+          shotId: scene.id,
+          prompt: renderPrepStoic.hfPrompt,
+          outPathNoExt: path.join(input.rendersDir, scene.id),
+          referenceImageUrl: renderPrepStoic.referenceImageUrl,
+          flags: input.imageFlags,
+        },
+        blockBatchId,
+      );
+      if (imgResult.queued) {
+        hfJobTotal += 1;
+        console.log(
+          chalk.dim(`  ${blockTag(bn, tb)} Imagem IA enfileirada (google_batch): ${scene.id} (${imgResult.provider})`),
+        );
+        addProjectLog(input.projectId, "imagens_videos", "info", `Job imagem IA bloco ${bn} cena ${scene.id}`, {
+          provider: imgResult.provider,
+          batchId: imgResult.batchId,
+        });
+      } else if (imgResult.localPath) {
+        done += 1;
+        console.log(
+          chalk.green(
+            `  ${blockTag(bn, tb)} ${scene.id} (imagem IA) → ${path.basename(imgResult.localPath)} (${done}/${plan.scenes.length})`,
+          ),
+        );
+        addProjectLog(input.projectId, "imagens_videos", "info", `Render imagem IA bloco ${bn} cena ${scene.id}`, {
+          mediaPath: imgResult.localPath,
+          provider: imgResult.provider,
+        });
+        upsertMediaBlock(input.projectId, bn, { renders_done_count: done });
+      }
+      continue;
+    }
 
     const renderPrep = prepareSceneVisualRender(v, scene.narration_text, visualModality, avatarRef);
     const hfPrompt = renderPrep.hfPrompt;

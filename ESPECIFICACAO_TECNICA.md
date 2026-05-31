@@ -747,7 +747,7 @@ Gravado ao falhar parse/validacao em segmentacao ou visualizacao (`writePlanPars
 
 **Documento mestre:** [stoic-patrol.md](stoic-patrol.md).
 
-**Objetivo:** canais de filosofia / estoicismo / fe (ex. **Stoic Patrol**, publico EUA 30+): plano v2 com **stock** na maior parte dos beats e **cartoes de citacao** (fundo preto, texto branco Montserrat, animacao typing) quando o roteiro traz citacao **explicita**. Cadeia recomendada: biblioteca local -> Pexels -> fallback configuravel (Magnific e/ou Google Batch em split para imagens).
+**Objetivo:** canais de filosofia / estoicismo / fe (ex. **Stoic Patrol**, publico EUA 30+): plano v2 com **stock** em todos os beats; citacoes/referencias biblicas e frases de impacto sao exibidas como **overlays animados** sobre as cenas stock, sincronizados com a narracao via timestamps ElevenLabs. Cadeia recomendada: biblioteca local -> Pexels -> fallback configuravel (Magnific e/ou Google Batch em split para imagens).
 
 **Criar projeto (CLI — preferir a scripts ad-hoc):**
 
@@ -767,7 +767,17 @@ Grava `05 - Modelagem/transcript.txt` e regista o texto no SQLite (`video_projec
 
 **Ativacao:** `GENTUBE_VISUAL_MODALITY=stoic_patrol` (alias aceite: `stoic-patrol`, `religious`). Corrida recomendada: `GENTUBE_SCENE_PLAN_V2=1`, `GENTUBE_STOCK_RATIO_BLOCK1=100`, `GENTUBE_STOCK_RATIO_OTHER=100`, `GENTUBE_STOCK_PROVIDER=local_then_pexels_then_split`, `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT=50`, `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT=50`, `PEXELS_API_KEY` no `.env`.
 
-**Plano v2:** `stock_ratio` efetivo **100** entre cenas nao-quote (`resolveStockRatioForBlock`). Nova fonte `source: "quote_card"` com `quote_text`, `quote_attribution?`, `animation_type: "typing"`, `render_engine: "hyperframes"`. Validacao: `assertStoicPatrolBlockPlan` em `src/utils/stoic-patrol-prompt.ts`.
+**Nova arquitetura de segmentacao (ancoras + quotizador — a partir de 2026-05):**
+
+O pipeline Stoic Patrol elimina a necessidade de Claude copiar texto verbatim. Em vez disso, opera em tres camadas independentes:
+
+1. **Quotizador** (novo agent, `Prompts/quotizador.md`): detecta citacoes biblicas/filosoficas, frases de impacto e perguntas retorica com ancoras `starts_with`/`ends_with` → salva `03 - Imagens e Videos/blockNN.quotes.json`.
+2. **Segmentador** (addon `Prompts/segmenta_stoic_patrol.md`): recebe `blockNN.quotes.json` como contexto; identifica os N beats semanticos com ancoras `starts_with`/`ends_with` — **nunca copia texto**; o codigo extrai o texto verbatim localizando as ancoras no bloco original.
+3. **Montagem** (secao 23.12): para cada cena com quotes mapeadas, carrega `scXX.alignment.json` (alinhamento caracter-a-caracter ElevenLabs), calcula `start_time_seconds`/`end_time_seconds` da quote dentro do audio da cena, e aplica overlay animado (HyperFrames ou FFmpeg ASS) sincronizado com a narracao.
+
+Quotizador e Segmentador **nao se injetam mutuamente** — convergem apenas na fase de Montagem via `quote_overlays[]` em `blockNN.assets.json`.
+
+**Plano v2:** `stock_ratio` efetivo **100** em todas as cenas (`resolveStockRatioForBlock`). Sem fonte `quote_card` — citacoes nao sao cenas separadas; sao **overlays** registados em `quote_overlays[]` dentro de cada cena do `blockNN.assets.json`. Validacao: `assertStoicPatrolBlockPlan` em `src/utils/stoic-patrol-prompt.ts`.
 
 **Prompts:**
 
@@ -775,7 +785,8 @@ Grava `05 - Modelagem/transcript.txt` e regista o texto no SQLite (`video_projec
 |-------|-----------|
 | Roteiro | `Prompts/matriz_stoic_patrol.md` (default se modality ativa e sem `GENTUBE_PROMPT_MATRIX`) |
 | Voz bloco 1 | `Prompts/canal_voice_stoic_patrol.md` (default analogo) |
-| Segmentacao | `segmenta01.md` + `Prompts/segmenta_stoic_patrol.md` (`quote_hint`) |
+| **Quotizador** | `Prompts/quotizador.md` — detecta citacoes/frases → `blockNN.quotes.json` |
+| Segmentacao | `segmenta01.md` + `Prompts/segmenta_stoic_patrol.md` (modo ancora; recebe quotes como contexto) |
 | Visualizacao | `visualiza01.md` + `Prompts/visualiza_stoic_patrol.md` |
 
 **Render:**
@@ -783,30 +794,88 @@ Grava `05 - Modelagem/transcript.txt` e regista o texto no SQLite (`video_projec
 | `source` | Comportamento |
 |----------|----------------|
 | `stock` | local (`data/stock_library/`) -> Pexels -> fallback (`Magnific` ou split `X/Y` com Google Batch para imagens sem avatar); **sem** fallback IA em `stoic_patrol` |
-| `quote_card` | `renderQuoteCardMp4` → `scXX.mp4` (Hyperframes template em `src/assets/stoic-patrol/hyperframes-quote/` ou FFmpeg ASS); cache `data/quote_cache/` |
-| `ai_generated` / `manual_capture` | Proibidos no plano |
+| `ai_generated` / `manual_capture` / `quote_card` | Proibidos no plano |
 
 **CLI:** `quote:render --project <slug> [--block N] [--force]` · `run-pipeline --profile stoic-patrol-stock` · `--verbose` em `run-step` / `run-pipeline`
 
 **Ordem recomendada (manual, por etapas):**
 
 1. `run-step --step roteiro`
-2. `run-step --step imagens --scene-plan-v2 --enqueue-only`
-3. `image:sync --watch`
-4. `run-step --step narracao`
-5. `run-step --step montagem`
+2. `run-step --step quotizador` ← novo (gera `blockNN.quotes.json`)
+3. `run-step --step imagens --scene-plan-v2 --enqueue-only` (segmentador recebe quotes como contexto)
+4. `image:sync --watch`
+5. `run-step --step narracao` (com `GENTUBE_TTS_WITH_TIMESTAMPS=1` → salva `scXX.alignment.json`)
+6. `run-step --step montagem` (resolve `quote_overlays` e aplica overlay)
 
-**Env:** `GENTUBE_QUOTE_RENDER=auto|hyperframes|ffmpeg` · `GENTUBE_STOCK_PROVIDER=local_then_pexels_then_split` · `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT` · `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT` · `PEXELS_API_KEY` · `GENTUBE_VERBOSE=1`
+**Env:** `GENTUBE_QUOTE_RENDER=auto|hyperframes|ffmpeg` · `GENTUBE_TTS_WITH_TIMESTAMPS=1` · `GENTUBE_STOCK_PROVIDER=local_then_pexels_then_split` · `GENTUBE_STOCK_SPLIT_MAGNIFIC_PERCENT` · `GENTUBE_STOCK_SPLIT_GOOGLE_BATCH_PERCENT` · `PEXELS_API_KEY` · `GENTUBE_VERBOSE=1`
 
-**Quote cards (layout):** duracao ate 30s proporcional ao texto; `data-duration` injetado antes do Hyperframes render; fonte com auto-fit no DOM (`quote-card-layout.ts`, cache `QUOTE_CARD_LAYOUT_VERSION`). Citacoes **> ~150 caracteres** no ecra: duas cenas `quote_card` consecutivas (prompts segmenta/visualiza).
+**Schema `blockNN.quotes.json`** (saida do Quotizador):
 
-**Montagem:** `scXX.mp3` sincronizado com `scXX.mp4`; se narracao > video em `quote_card`, **ultimo frame estatico** (`holdLastFrame` / `tpad=stop_mode=clone`). Apos quote, cena seguinte stock.
+```json
+{
+  "schema_version": "1.0-quotes",
+  "stage": "quotizador",
+  "block_number": 3,
+  "total_blocks": 8,
+  "quotes": [
+    {
+      "id": "q01",
+      "type": "biblical",
+      "starts_with": "\"The wise woman builds her house,",
+      "ends_with": "with her own hands.\"",
+      "reference": "Proverbs 14:1",
+      "overlay_style": "quote_card"
+    },
+    {
+      "id": "q02",
+      "type": "impact_phrase",
+      "starts_with": "Every household rises or falls",
+      "ends_with": "with the woman at the center.",
+      "overlay_style": "impact"
+    }
+  ]
+}
+```
+
+**Schema `scXX.alignment.json`** (saida ElevenLabs `with_timestamps`, por cena):
+
+```json
+{
+  "alignment": {
+    "characters": ["T", "h", "e", " ", "w", "i", "s", "e", ...],
+    "character_start_times_seconds": [0.0, 0.06, 0.12, 0.18, ...],
+    "character_end_times_seconds":   [0.06, 0.12, 0.18, 0.24, ...]
+  }
+}
+```
+
+**Schema `quote_overlays` em `blockNN.assets.json`** (preenchido na etapa de montagem prep, por cena):
+
+```json
+{
+  "id": "sc03",
+  "source": "stock",
+  "narration_text": "...",
+  "quote_overlays": [
+    {
+      "quote_id": "q01",
+      "text": "\"The wise woman builds her house, but the foolish one tears it down with her own hands.\"",
+      "reference": "Proverbs 14:1",
+      "start_time_seconds": 1.82,
+      "end_time_seconds": 5.64,
+      "overlay_style": "quote_card"
+    }
+  ]
+}
+```
+
+**Quote overlays — logica de montagem (ver secao 23.12):** para cada cena com `quote_overlays[]`, o step de montagem (1) carrega `scXX.alignment.json`; (2) localiza o indice do primeiro caractere de `starts_with` e o ultimo de `ends_with`; (3) le os timestamps correspondentes; (4) aplica overlay animado desde `scene_start_in_timeline + start_time_seconds` ate `scene_start_in_timeline + end_time_seconds`. Estilos: `quote_card` → card preto semi-transparente + texto Montserrat centralizado (typing); `impact` → texto grande fade-in; `attribution` → fonte menor canto inferior direito.
 
 **video-use:** nao integrado no pipeline (edicao conversacional de footage bruto; ver `stoic-patrol.md`).
 
 **Pre-requisito:** plano v2 (`--scene-plan-v2` / `GENTUBE_SCENE_PLAN_V2=1`).
 
-**Ficheiros:** `stoic-patrol.md`, `Prompts/*_stoic_patrol.md`, `src/config.ts`, `src/utils/stoic-patrol-prompt.ts`, `src/types/scenes-plan.ts`, `src/utils/scenes-plan.ts`, `src/integrations/claude.ts`, `src/services/pipeline.ts`.
+**Ficheiros:** `stoic-patrol.md`, `Prompts/*_stoic_patrol.md`, `Prompts/quotizador.md`, `src/config.ts`, `src/utils/stoic-patrol-prompt.ts`, `src/types/scenes-plan.ts`, `src/utils/scenes-plan.ts`, `src/integrations/claude.ts`, `src/services/pipeline.ts`, `02 - Narracao/blockNN/scXX.alignment.json`, `03 - Imagens e Videos/blockNN.quotes.json`.
 
 ## 19) Politica aprovada — Step 4 (Thumbnails)
 
@@ -1370,6 +1439,46 @@ npm run gentube -- sync-from-disk --project <id> --only montagem
 ./experiments/ffmpeg-scene-tests/run-tests.sh
 ```
 
+### 23.12 Quote overlays — Stoic Patrol (montagem prep)
+
+Aplicavel apenas quando `GENTUBE_VISUAL_MODALITY=stoic_patrol` e `blockNN.quotes.json` existe.
+
+**Objetivo:** para cada quote em `blockNN.quotes.json`, determinar em qual cena ela reside e qual o timestamp exato dentro do audio da cena, preenchendo `quote_overlays[]` em `blockNN.assets.json` antes de iniciar o encode FFmpeg.
+
+**Algoritmo (montagem prep):**
+
+1. Para cada `quote q` em `blockNN.quotes.json`:
+   a. Encontrar a cena `sc` cujo `narration_text` contém o inicio de `q.starts_with` (substring search normalizado).
+   b. Carregar `02 - Narracao/blockNN/scXX.alignment.json` dessa cena.
+   c. Localizar o **indice de caractere** `i_start` onde `q.starts_with` comeca em `narration_text` e o indice `i_end` onde `q.ends_with` termina.
+   d. Ler `alignment.character_start_times_seconds[i_start]` → `start_time_seconds`.
+   e. Ler `alignment.character_end_times_seconds[i_end]` → `end_time_seconds`.
+   f. Adicionar entrada em `sc.quote_overlays[]` com `{ quote_id, text, reference?, start_time_seconds, end_time_seconds, overlay_style }`.
+2. Persistir `blockNN.assets.json` atualizado antes de iniciar o encode.
+
+**Encode overlay (por cena, por quote_overlay):**
+
+```
+scene_mp4  ←  video + audio (scXX.mp3)
+overlay    ←  HyperFrames render (quote_card / impact) OU FFmpeg ASS drawtext
+start_pts  ←  start_time_seconds × fps
+end_pts    ←  end_time_seconds   × fps
+```
+
+- `overlay_style: "quote_card"` → HyperFrames template `src/assets/stoic-patrol/hyperframes-quote/`; injetar `data-text`, `data-reference`, `data-start`, `data-end`; renderizar para PNG/webm semi-transparente; compositar via FFmpeg `overlay` com `enable='between(t,start,end)'`.
+- `overlay_style: "impact"` → FFmpeg `drawtext` ou ASS com fade-in/fade-out nos limites `start_time_seconds`/`end_time_seconds`.
+- `overlay_style: "attribution"` → idem, fonte menor, posicao `x=(w-text_w-40):y=(h-text_h-40)`.
+
+**Prerequisito:** `scXX.alignment.json` deve existir (gerado por `run-step --step narracao` com `GENTUBE_TTS_WITH_TIMESTAMPS=1`). Se ausente para uma cena, logar aviso e pular overlay dessa cena (nao bloquear montagem).
+
+**Variaveis de ambiente:**
+
+| Variavel | Default | Descricao |
+|----------|---------|-----------|
+| `GENTUBE_TTS_WITH_TIMESTAMPS` | `0` | `1` → ElevenLabs chamado com `with_timestamps: true`; salva `scXX.alignment.json` |
+| `GENTUBE_QUOTE_RENDER` | `auto` | `hyperframes` / `ffmpeg` / `auto` |
+| `GENTUBE_OVERLAY_FADE_DURATION` | `0.15` | Duracao do fade de entrada/saida do overlay (segundos) |
+
 ---
 
 ## 24) Claude Message Batches API (roteiro + planos v2)
@@ -1408,7 +1517,7 @@ Implementacao: `runClaudeUserPrompt` em `src/integrations/claude.ts` — se `GEN
 | Variavel | Default | Uso |
 |----------|---------|-----|
 | `GENTUBE_CLAUDE_DELIVERY` | `batch` | `batch` \| `sync` (debug) |
-| `GENTUBE_CLAUDE_BATCH_POLL_INTERVAL` | `60s` | Poll batch / `claude:sync --watch` |
+| `GENTUBE_CLAUDE_BATCH_POLL_INTERVAL` | `20s` | Poll batch / `claude:sync --watch` |
 | `GENTUBE_CLAUDE_MODEL_ROTEIRO` | (fallback `CLAUDE_MODEL`) | Roteiro |
 | `GENTUBE_CLAUDE_MODEL_SEGMENTATION` | (fallback) | Segmentacao |
 | `GENTUBE_CLAUDE_MODEL_VISUALIZATION` | (fallback) | Visualizacao |

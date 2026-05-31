@@ -211,7 +211,7 @@ Variáveis principais (detalhes no [`.env.example`](.env.example)):
 | `GENTUBE_MAX_SCENES_WORDS_DIVISOR` | Opcional | Divisor da fórmula (default `22`) |
 | `GENTUBE_MAX_SCENES_CAP` | Opcional | Teto de cenas por bloco (default `100`) |
 | `GENTUBE_MAX_WORDS_PER_SCENE` | Opcional | Rejeita cenas > N palavras na segmentação (default `120`) |
-| `GENTUBE_CLAUDE_BATCH_POLL_INTERVAL` | Opcional | Poll `claude:sync --watch` (default `60s`) |
+| `GENTUBE_CLAUDE_BATCH_POLL_INTERVAL` | Opcional | Poll `claude:sync --watch` (default `20s`) |
 | `GENTUBE_REMOTE_HOST` | Opcional | Host SSH remoto para `copy-cmd` (ex.: `dev-development`); evita `--remote-host` toda vez |
 | `GENTUBE_HF_ASYNC` | Opcional | `1`, `true` ou `yes`: no step **imagens**, enfileira jobs no Higgsfield sem esperar no mesmo comando; use `image:sync` / `higgsfield:sync` (ou `--watch`) para baixar resultados |
 | `HIGGSFIELD_CLI_PATH`, `HIGGSFIELD_CREDENTIALS_PATH`, `HIGGSFIELD_CLI_WAIT_TIMEOUT`, `HIGGSFIELD_API_URL` | Opcionais | Caminho do binário `hf`, credenciais, timeout de `--wait` (modo síncrono), base da API de agents; ver [`.env.example`](.env.example) |
@@ -387,12 +387,17 @@ npm run gentube -- retry --project 1 --stage narracao --block 2
 
 # 10) Copiar arquivos do servidor remoto para a máquina local (rsync)
 npm run gentube -- copy-cmd --project 1 --remote-host dev-development
+# Copiar apenas a subpasta de montagem
+npm run gentube -- copy-cmd --project 1 --remote-host dev-development --montagem-only
 # Com destino local customizado
 npm run gentube -- copy-cmd --project 1 --remote-host dev-development --local-dir ~/Downloads/video1/
 # Simulação (dry-run)
 npm run gentube -- copy-cmd --project 1 --remote-host dev-development --dry-run
 # Ou defina GENTUBE_REMOTE_HOST no .env para omitir --remote-host
 npm run gentube -- copy-cmd --project 1
+
+# Padrão local agora começa em ./<slug-do-projeto>/ (sem ./Videos/<canal>/...)
+# Ex.: ./20260527-7-Evident-Signs-That-Something-Evil-Is-Dragging-You-Down/
 ```
 
 ### Artefactos criados fora do GenTube (`sync-from-disk`)

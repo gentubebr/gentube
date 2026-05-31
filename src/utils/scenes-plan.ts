@@ -10,6 +10,7 @@ import {
   validateSceneTextsCoverBlock,
   wordCountForCoverage,
 } from "./text-coverage.js";
+import { extractScenesFromAnchorSegmentation } from "./text-anchors.js";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -96,15 +97,43 @@ export async function loadSegmentationErrorResume(
     const blockNumber = typeof parsed.block_number === "number" ? parsed.block_number : 0;
     const totalBlocks = typeof parsed.total_blocks === "number" ? parsed.total_blocks : 0;
     let scenes: SegmentationPlanV2["scenes"] = [];
-    for (let i = 0; i < parsed.scenes.length; i += 1) {
-      const s = parsed.scenes[i];
-      if (!isObject(s) || typeof s.id !== "string" || typeof s.narration_text !== "string") return null;
-      scenes.push({
-        id: s.id.trim(),
-        narration_text: s.narration_text,
-        narration_word_count: wordCountForCoverage(s.narration_text),
-        ...(s.quote_hint === true ? { quote_hint: true as const } : {}),
+    const anchorOnly =
+      parsed.scenes.length > 0 &&
+      parsed.scenes.every(
+        (s) =>
+          isObject(s) &&
+          typeof s.starts_with === "string" &&
+          typeof s.ends_with === "string" &&
+          typeof s.narration_text !== "string",
+      );
+    if (anchorOnly && blockText) {
+      const anchorScenes = parsed.scenes.map((s) => {
+        const o = s as Record<string, unknown>;
+        return {
+          id: String(o.id).trim(),
+          starts_with: String(o.starts_with),
+          ends_with: String(o.ends_with),
+        };
       });
+      const extracted = extractScenesFromAnchorSegmentation(blockText, anchorScenes);
+      scenes = anchorScenes.map((a, idx) => ({
+        id: a.id,
+        narration_text: extracted[idx]!.narration_text,
+        narration_word_count: wordCountForCoverage(extracted[idx]!.narration_text),
+        starts_with: a.starts_with,
+        ends_with: a.ends_with,
+      }));
+    } else {
+      for (let i = 0; i < parsed.scenes.length; i += 1) {
+        const s = parsed.scenes[i];
+        if (!isObject(s) || typeof s.id !== "string" || typeof s.narration_text !== "string") return null;
+        scenes.push({
+          id: s.id.trim(),
+          narration_text: s.narration_text,
+          narration_word_count: wordCountForCoverage(s.narration_text),
+          ...(s.quote_hint === true ? { quote_hint: true as const } : {}),
+        });
+      }
     }
     scenes = repairSegmentationCoverageTail(blockText, scenes).map((s) => ({
       ...s,
@@ -158,6 +187,8 @@ export async function loadVisualizationErrorResume(
 export type ParseSegmentationOptions = {
   /** Maximo de cenas (normalmente max_images + max_videos do bloco). */
   maxScenes?: number;
+  /** Stoic Patrol overlay: cenas com starts_with/ends_with; codigo extrai narration_text. */
+  anchorMode?: boolean;
 };
 
 export function parseSegmentationJson(
@@ -189,32 +220,61 @@ export function parseSegmentationJson(
   if (!Array.isArray(parsed.scenes) || parsed.scenes.length === 0) {
     throw new Error("Segmentacao: scenes vazio");
   }
+  const anchorMode = Boolean(opts?.anchorMode);
   let scenes: SegmentationPlanV2["scenes"] = [];
-  for (let i = 0; i < parsed.scenes.length; i += 1) {
-    const s = parsed.scenes[i];
-    if (!isObject(s)) throw new Error(`Segmentacao: cena ${i + 1} invalida`);
-    if (typeof s.id !== "string" || !s.id.trim()) throw new Error(`Segmentacao: cena ${i + 1} sem id`);
-    if (typeof s.narration_text !== "string") throw new Error(`Segmentacao: ${s.id} sem narration_text`);
-    if (typeof s.narration_word_count !== "number" || s.narration_word_count < 0) {
-      throw new Error(`Segmentacao: ${s.id} narration_word_count invalido`);
+
+  if (anchorMode) {
+    const anchorScenes: Array<{ id: string; starts_with: string; ends_with: string }> = [];
+    for (let i = 0; i < parsed.scenes.length; i += 1) {
+      const s = parsed.scenes[i];
+      if (!isObject(s)) throw new Error(`Segmentacao: cena ${i + 1} invalida`);
+      if (typeof s.id !== "string" || !s.id.trim()) throw new Error(`Segmentacao: cena ${i + 1} sem id`);
+      const starts_with = typeof s.starts_with === "string" ? s.starts_with : "";
+      const ends_with = typeof s.ends_with === "string" ? s.ends_with : "";
+      if (!starts_with.trim() || !ends_with.trim()) {
+        throw new Error(`Segmentacao: ${s.id} exige starts_with e ends_with em modo ancora`);
+      }
+      anchorScenes.push({ id: s.id.trim(), starts_with, ends_with });
     }
-    const quoteHint =
-      s.quote_hint === true || s.quote_hint === "true"
-        ? true
-        : s.quote_hint === false || s.quote_hint === "false"
-          ? false
-          : undefined;
-    scenes.push({
-      id: s.id.trim(),
-      narration_text: s.narration_text,
+    const extracted = extractScenesFromAnchorSegmentation(blockText, anchorScenes);
+    scenes = anchorScenes.map((a, idx) => ({
+      id: a.id,
+      narration_text: extracted[idx]!.narration_text,
+      narration_word_count: wordCountForCoverage(extracted[idx]!.narration_text),
+      starts_with: a.starts_with,
+      ends_with: a.ends_with,
+    }));
+    scenes = repairSegmentationCoverageTail(blockText, scenes).map((s) => ({
+      ...s,
       narration_word_count: wordCountForCoverage(s.narration_text),
-      ...(quoteHint !== undefined ? { quote_hint: quoteHint } : {}),
-    });
+    }));
+  } else {
+    for (let i = 0; i < parsed.scenes.length; i += 1) {
+      const s = parsed.scenes[i];
+      if (!isObject(s)) throw new Error(`Segmentacao: cena ${i + 1} invalida`);
+      if (typeof s.id !== "string" || !s.id.trim()) throw new Error(`Segmentacao: cena ${i + 1} sem id`);
+      if (typeof s.narration_text !== "string") throw new Error(`Segmentacao: ${s.id} sem narration_text`);
+      if (typeof s.narration_word_count !== "number" || s.narration_word_count < 0) {
+        throw new Error(`Segmentacao: ${s.id} narration_word_count invalido`);
+      }
+      const quoteHint =
+        s.quote_hint === true || s.quote_hint === "true"
+          ? true
+          : s.quote_hint === false || s.quote_hint === "false"
+            ? false
+            : undefined;
+      scenes.push({
+        id: s.id.trim(),
+        narration_text: s.narration_text,
+        narration_word_count: wordCountForCoverage(s.narration_text),
+        ...(quoteHint !== undefined ? { quote_hint: quoteHint } : {}),
+      });
+    }
+    scenes = repairSegmentationCoverageTail(blockText, scenes).map((s) => ({
+      ...s,
+      narration_word_count: wordCountForCoverage(s.narration_text),
+    }));
   }
-  scenes = repairSegmentationCoverageTail(blockText, scenes).map((s) => ({
-    ...s,
-    narration_word_count: wordCountForCoverage(s.narration_text),
-  }));
   validateSceneTextsCoverBlock(blockText, scenes.map((x) => x.narration_text));
   const maxWordsPerScene = Math.max(
     40,
